@@ -33,8 +33,8 @@ a:hover { text-decoration: underline; }
 .brand span { font-size: 17px; }
 .nav-links { display: flex; gap: 22px; align-items: center; font-size: 14px; color: var(--muted); font-weight: 500; }
 .nav-links a { color: var(--muted); }
-.nav-cta { background: var(--text); color: #fff; padding: 8px 14px; border-radius: 8px; font-weight: 600; }
-.nav-cta:hover { text-decoration: none; background: #000; }
+.nav-cta { background: var(--accent); color: #fff; padding: 8px 14px; border-radius: 8px; font-weight: 600; }
+.nav-cta:hover { text-decoration: none; background: #1d4ed8; }
 
 /* Hero */
 .hero { padding: 88px 0 72px; border-bottom: 1px solid var(--border); }
@@ -75,6 +75,19 @@ section { padding: 72px 0; border-bottom: 1px solid var(--border); }
 .code .c-key { color: #93c5fd; }
 .code .c-val { color: #86efac; }
 
+/* Download */
+.downloads { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 36px; }
+.dl { background: #fff; border: 1px solid var(--border); border-radius: 14px; padding: 24px; display: flex; flex-direction: column; gap: 14px; position: relative; }
+.dl-header { display: flex; align-items: center; gap: 12px; }
+.dl-logo { width: 44px; height: 44px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); display: flex; align-items: center; justify-content: center; font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 17px; }
+.dl h3 { font-size: 16px; font-weight: 700; }
+.dl p { color: var(--muted); font-size: 13px; line-height: 1.6; flex: 1; }
+.pill { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase; }
+.pill-soon { background: #fff7e6; color: #b45309; border: 1px solid #fde2b3; }
+.pill-live { background: #ecfdf5; color: var(--green); border: 1px solid #bbf7d0; }
+.dl .btn { width: 100%; justify-content: center; }
+.btn[disabled], .btn.is-disabled { background: #f3f4f6; color: #9ca3af; cursor: not-allowed; pointer-events: none; border: 1px solid var(--border); }
+
 /* Verify CTA */
 .verify-cta { background: linear-gradient(180deg, #f7f9ff, #ffffff); border: 1px solid var(--border); border-radius: 14px; padding: 32px; display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-top: 36px; }
 .verify-cta h3 { font-size: 20px; font-weight: 700; }
@@ -97,7 +110,7 @@ footer { padding: 40px 0; color: var(--muted); font-size: 13px; }
 .foot-inner a { color: var(--muted); margin-right: 18px; }
 
 @media (max-width: 760px) {
-  .features, .steps { grid-template-columns: 1fr; }
+  .features, .steps, .downloads { grid-template-columns: 1fr; }
   .biz-inner { grid-template-columns: 1fr; }
   .verify-cta { flex-direction: column; align-items: stretch; text-align: left; }
   .nav-links { display: none; }
@@ -114,6 +127,7 @@ footer { padding: 40px 0; color: var(--muted); font-size: 13px; }
     </a>
     <div class="nav-links">
       <a href="#how">How it works</a>
+      <a href="#download">Download</a>
       <a href="#business">For business</a>
       <a href="/guide">User guide</a>
       <a class="nav-cta" href="/check">Verify a receipt</a>
@@ -212,6 +226,52 @@ footer { padding: 40px 0; color: var(--muted); font-size: 13px; }
   </div>
 </section>
 
+<section id="download">
+  <div class="container">
+    <div class="section-label">Get AIAuth</div>
+    <h2 class="section-title">Install it where you work.</h2>
+    <p class="section-sub">AIAuth is launching across Chrome, Windows, and macOS. Join the launch list and we'll let you know the moment each one is live in its store.</p>
+
+    <div class="downloads">
+      <div class="dl">
+        <div class="dl-header">
+          <div class="dl-logo">Cr</div>
+          <div>
+            <h3>Chrome extension</h3>
+            <span class="pill pill-soon">Coming soon</span>
+          </div>
+        </div>
+        <p>One-click attestation on ChatGPT, Claude, Gemini, Copilot, and more. <code>Ctrl+Shift+A</code> anywhere in the browser.</p>
+        <a class="btn is-disabled" href="#" aria-disabled="true">Chrome Web Store →</a>
+      </div>
+
+      <div class="dl">
+        <div class="dl-header">
+          <div class="dl-logo">Win</div>
+          <div>
+            <h3>Windows desktop app</h3>
+            <span class="pill pill-soon">Coming soon</span>
+          </div>
+        </div>
+        <p>System tray app. Works with any AI tool, any document. Select, press <code>Ctrl+Shift+A</code>, keep working.</p>
+        <a class="btn is-disabled" href="#" aria-disabled="true">Microsoft Store →</a>
+      </div>
+
+      <div class="dl">
+        <div class="dl-header">
+          <div class="dl-logo">Mac</div>
+          <div>
+            <h3>macOS desktop app</h3>
+            <span class="pill pill-soon">Coming soon</span>
+          </div>
+        </div>
+        <p>Menu bar app. Same workflow, same receipts. Universal binary for Apple Silicon and Intel.</p>
+        <a class="btn is-disabled" href="#" aria-disabled="true">Mac App Store →</a>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section class="biz" id="business">
   <div class="container biz-inner">
     <div>
@@ -239,8 +299,7 @@ footer { padding: 40px 0; color: var(--muted); font-size: 13px; }
     <div>
       <a href="/check">Verify</a>
       <a href="/guide">User guide</a>
-      <a href="/.well-known/aiauth-public-key">Public key</a>
-      <a href="/docs">API</a>
+      <a href="/public-key">Public key</a>
     </div>
   </div>
 </footer>

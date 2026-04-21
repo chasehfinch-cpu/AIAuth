@@ -759,22 +759,126 @@ def verification_page():
         return HTMLResponse(verify_path.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>AIAuth</h1><p>Verification page not found. Place verify.html alongside server.py.</p>")
 
+def _page_shell(title: str, body_html: str, active: str = "") -> str:
+    """Shared page chrome matching index.html."""
+    def active_cls(key): return ' style="color:var(--text)"' if active == key else ""
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} — AIAuth</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {{ --bg:#fff; --panel:#f7f8fa; --border:#e5e7eb; --text:#0b1220; --muted:#5b6573; --accent:#2563eb; --accent-soft:#eff4ff; --code-bg:#0b1220; --code-fg:#e6edf6; }}
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ background:var(--bg); color:var(--text); font-family:'Inter',system-ui,sans-serif; -webkit-font-smoothing:antialiased; }}
+a {{ color:var(--accent); text-decoration:none; }}
+a:hover {{ text-decoration:underline; }}
+.container {{ max-width:820px; margin:0 auto; padding:0 24px; }}
+.container-wide {{ max-width:1080px; margin:0 auto; padding:0 24px; }}
+.nav {{ position:sticky; top:0; z-index:10; background:rgba(255,255,255,0.85); backdrop-filter:saturate(140%) blur(10px); border-bottom:1px solid var(--border); }}
+.nav-inner {{ display:flex; align-items:center; justify-content:space-between; padding:14px 0; }}
+.brand {{ display:flex; align-items:center; gap:10px; font-weight:700; letter-spacing:-0.01em; }}
+.brand img {{ width:32px; height:32px; border-radius:8px; display:block; }}
+.brand span {{ font-size:17px; color:var(--text); }}
+.nav-links {{ display:flex; gap:22px; align-items:center; font-size:14px; color:var(--muted); font-weight:500; }}
+.nav-links a {{ color:var(--muted); }}
+.nav-cta {{ background:var(--accent); color:#fff !important; padding:8px 14px; border-radius:8px; font-weight:600; }}
+.nav-cta:hover {{ text-decoration:none; background:#1d4ed8; }}
+.page {{ padding:64px 0 96px; }}
+.eyebrow {{ display:inline-flex; padding:6px 12px; background:var(--accent-soft); color:var(--accent); border-radius:999px; font-size:12px; font-weight:600; letter-spacing:0.02em; text-transform:uppercase; }}
+h1.page-title {{ font-size:clamp(30px,4vw,46px); line-height:1.1; font-weight:800; letter-spacing:-0.02em; margin-top:18px; }}
+.lead {{ font-size:17px; color:var(--muted); margin-top:14px; line-height:1.6; }}
+.prose {{ margin-top:40px; font-size:16px; line-height:1.75; color:var(--text); }}
+.prose h1 {{ font-size:28px; font-weight:700; letter-spacing:-0.02em; margin:40px 0 14px; border-bottom:1px solid var(--border); padding-bottom:10px; }}
+.prose h2 {{ font-size:22px; font-weight:700; letter-spacing:-0.01em; margin:36px 0 12px; }}
+.prose h3 {{ font-size:17px; font-weight:700; margin:26px 0 8px; }}
+.prose p {{ margin:12px 0; color:#1f2937; }}
+.prose ul, .prose ol {{ margin:12px 0 12px 22px; }}
+.prose li {{ margin:6px 0; color:#1f2937; }}
+.prose code {{ background:var(--panel); border:1px solid var(--border); padding:1px 6px; border-radius:5px; font-family:'JetBrains Mono',monospace; font-size:13px; color:#0b1220; }}
+.prose pre {{ background:var(--code-bg); color:var(--code-fg); padding:18px 20px; border-radius:10px; overflow-x:auto; font-family:'JetBrains Mono',monospace; font-size:13px; line-height:1.65; margin:16px 0; }}
+.prose pre code {{ background:transparent; border:0; padding:0; color:inherit; font-size:inherit; }}
+.prose blockquote {{ border-left:3px solid var(--accent); padding:6px 16px; color:var(--muted); background:var(--accent-soft); border-radius:0 6px 6px 0; margin:16px 0; }}
+.prose table {{ border-collapse:collapse; width:100%; margin:16px 0; font-size:14px; }}
+.prose th, .prose td {{ border:1px solid var(--border); padding:8px 12px; text-align:left; }}
+.prose th {{ background:var(--panel); font-weight:600; }}
+.prose a {{ color:var(--accent); }}
+.card {{ background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:24px; margin-top:20px; }}
+.key-block {{ background:var(--code-bg); color:var(--code-fg); padding:20px; border-radius:10px; font-family:'JetBrains Mono',monospace; font-size:12px; white-space:pre-wrap; word-break:break-all; line-height:1.6; }}
+.copy-btn {{ display:inline-flex; align-items:center; gap:6px; padding:6px 10px; background:var(--accent-soft); color:var(--accent); border:0; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; margin-top:10px; font-family:inherit; }}
+.copy-btn:hover {{ background:#e0eaff; }}
+footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px solid var(--border); }}
+.foot-inner {{ display:flex; justify-content:space-between; flex-wrap:wrap; gap:16px; }}
+.foot-inner a {{ color:var(--muted); margin-right:18px; }}
+@media (max-width:760px) {{ .nav-links {{ display:none; }} }}
+</style>
+</head><body>
+<nav class="nav"><div class="container-wide nav-inner">
+  <a class="brand" href="/"><img src="/logo.png" alt="AIAuth"><span>AIAuth</span></a>
+  <div class="nav-links">
+    <a href="/#how"{active_cls('how')}>How it works</a>
+    <a href="/#download"{active_cls('download')}>Download</a>
+    <a href="/guide"{active_cls('guide')}>User guide</a>
+    <a class="nav-cta" href="/check">Verify a receipt</a>
+  </div>
+</div></nav>
+<main class="page"><div class="container">
+{body_html}
+</div></main>
+<footer><div class="container-wide foot-inner">
+  <div>&copy; 2026 Finch Business Services LLC · AIAuth</div>
+  <div><a href="/check">Verify</a><a href="/guide">User guide</a><a href="/public-key">Public key</a></div>
+</div></footer>
+</body></html>"""
+
+
 @app.get("/guide", response_class=HTMLResponse)
-def user_guide_redirect():
-    """Redirect to user guide."""
+def user_guide():
+    """Public user guide rendered from Markdown into the site theme."""
     guide_path = Path(__file__).parent / "docs" / "USER_GUIDE.md"
-    if guide_path.exists():
-        content = guide_path.read_text(encoding="utf-8")
-        # Wrap markdown in basic HTML for readability
-        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-        <title>AIAuth User Guide</title>
-        <style>body{{max-width:720px;margin:40px auto;padding:0 20px;font-family:system-ui,sans-serif;line-height:1.7;color:#e8e9eb;background:#08090a}}
-        h1,h2,h3{{margin-top:32px}}a{{color:#2563eb}}code{{background:#1e2023;padding:2px 6px;border-radius:4px;font-size:14px}}
-        pre{{background:#111214;padding:16px;border-radius:8px;overflow-x:auto}}table{{border-collapse:collapse;width:100%}}
-        th,td{{border:1px solid #1e2023;padding:8px 12px;text-align:left}}</style></head>
-        <body><pre style="white-space:pre-wrap;background:none;font-family:inherit">{content}</pre></body></html>"""
-        return HTMLResponse(html)
-    return HTMLResponse("<h1>AIAuth</h1><p>User guide not found.</p>")
+    if not guide_path.exists():
+        return HTMLResponse(_page_shell("User guide", '<h1 class="page-title">User guide not found</h1><p class="lead">The guide has not been uploaded to the server yet.</p>', active="guide"))
+    md_text = guide_path.read_text(encoding="utf-8")
+    try:
+        import markdown  # type: ignore
+        body = markdown.markdown(md_text, extensions=["fenced_code", "tables", "toc"])
+    except Exception:
+        # Fallback if python-markdown not installed: render as preformatted text
+        from html import escape
+        body = f'<pre style="white-space:pre-wrap;font-family:inherit;background:none;color:inherit;padding:0">{escape(md_text)}</pre>'
+    html = f"""<span class="eyebrow">User guide</span>
+<h1 class="page-title">AIAuth — what it does and how to use it</h1>
+<p class="lead">The plain-English guide to signing, sharing, and verifying AI-work receipts.</p>
+<div class="prose">{body}</div>"""
+    return HTMLResponse(_page_shell("User guide", html, active="guide"))
+
+
+@app.get("/public-key", response_class=HTMLResponse)
+def public_key_page():
+    """Human-readable public key page — developers can still hit /v1/public-key or /.well-known/aiauth-public-key."""
+    body = f"""<span class="eyebrow">Verification key</span>
+<h1 class="page-title">AIAuth public key</h1>
+<p class="lead">This is the Ed25519 public key used to verify every AIAuth receipt. Anyone can use it to check that a receipt was signed by the AIAuth service and has not been altered.</p>
+
+<h2 style="margin-top:32px;font-size:18px;font-weight:700">Algorithm</h2>
+<p>Ed25519 — a modern elliptic-curve signature scheme (RFC 8032). Fast, small signatures, widely supported.</p>
+
+<h2 style="margin-top:24px;font-size:18px;font-weight:700">Key (PEM format)</h2>
+<div class="key-block" id="pem">{PUB_PEM.strip()}</div>
+<button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('pem').innerText);this.textContent='Copied ✓'">Copy key</button>
+
+<h2 style="margin-top:32px;font-size:18px;font-weight:700">Developer endpoints</h2>
+<div class="card" style="margin-top:12px">
+  <div style="font-family:'JetBrains Mono',monospace;font-size:13px">GET <a href="/v1/public-key">/v1/public-key</a></div>
+  <p style="color:var(--muted);margin-top:6px;font-size:13px">Returns the same key as a JSON object. Use this from code.</p>
+</div>
+<div class="card" style="margin-top:12px">
+  <div style="font-family:'JetBrains Mono',monospace;font-size:13px">GET <a href="/.well-known/aiauth-public-key">/.well-known/aiauth-public-key</a></div>
+  <p style="color:var(--muted);margin-top:6px;font-size:13px">Standard well-known path for key discovery.</p>
+</div>
+
+<p class="lead" style="margin-top:32px">Version: <code style="background:var(--panel);padding:2px 8px;border-radius:5px;border:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:13px">{VERSION}</code></p>"""
+    return HTMLResponse(_page_shell("Public key", body, active=""))
 
 
 # ===================================================================
