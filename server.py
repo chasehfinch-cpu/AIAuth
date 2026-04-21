@@ -853,6 +853,84 @@ def user_guide():
     return HTMLResponse(_page_shell("User guide", html, active="guide"))
 
 
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page():
+    body = """<span class="eyebrow">Privacy policy</span>
+<h1 class="page-title">AIAuth privacy policy</h1>
+<p class="lead">Short version: your content never leaves your device. AIAuth only sees a one-way cryptographic fingerprint (SHA-256 hash) of what you attest, and that fingerprint cannot be reversed into your original content.</p>
+
+<div class="prose">
+<p style="color:var(--muted);font-size:13px">Last updated: April 21, 2026 · Operator: Finch Business Services LLC</p>
+
+<h2>What AIAuth does</h2>
+<p>AIAuth is a cryptographic attestation service. It lets you create tamper-evident receipts for AI-generated content that you produce or review. You interact with it through the AIAuth Chrome extension, a desktop app, or direct API calls.</p>
+
+<h2>What data AIAuth processes</h2>
+<h3>1. On your device (the Chrome extension)</h3>
+<p>The extension stores, locally in Chrome's <code>chrome.storage.local</code>, only what you explicitly enter or create:</p>
+<ul>
+  <li>An identifier you enter (email address or name). Used inside your receipts so you can later prove you attested something. Never sent to AIAuth servers as a standalone record.</li>
+  <li>The server URL you configure (default <code>https://aiauth.app</code>).</li>
+  <li>Your receipts — the signed JSON for each attestation you create, kept so you can share or verify them later.</li>
+</ul>
+<p>This local data stays on your machine. Uninstalling the extension removes it.</p>
+
+<h3>2. What the extension sends to the AIAuth server</h3>
+<p>When you attest content, the extension computes a SHA-256 hash of that content <em>in your browser</em>, then sends the following to the server's <code>/v1/sign</code> endpoint over HTTPS:</p>
+<ul>
+  <li>The SHA-256 hash (a 64-character hex string).</li>
+  <li>The identifier you entered (email or name).</li>
+  <li>A source string (for example <code>chrome-extension</code> or <code>file:yourfile.xlsx</code>).</li>
+  <li>For file attestations, an optional note containing filename, size, and MIME type so you can tell receipts apart in your own list.</li>
+</ul>
+<p><strong>The original content is never transmitted.</strong> A SHA-256 hash is a one-way fingerprint — it cannot be reversed to recover your content.</p>
+
+<h3>3. What the AIAuth server stores</h3>
+<p>In public mode (the default mode at <code>aiauth.app</code>), the server stores only:</p>
+<ul>
+  <li>A minimal <em>hash registry</em>: the content hash, the receipt ID, an optional parent hash, and a timestamp. No user identifier, no content, no IP address, no session data.</li>
+</ul>
+<p>The registry exists so that anyone holding the same content or a receipt code can confirm a receipt exists. It contains nothing that can identify a person.</p>
+<p>The full signed receipt (which <em>does</em> contain your identifier) is returned to your device and never persisted on the server.</p>
+
+<h2>What AIAuth does not do</h2>
+<ul>
+  <li>AIAuth does not read, store, or transmit the text or files you attest.</li>
+  <li>AIAuth does not track you across sites, log your browsing, or profile your activity.</li>
+  <li>AIAuth does not use analytics, cookies, trackers, or third-party SDKs in the extension.</li>
+  <li>AIAuth does not sell, rent, or share your data with any third party.</li>
+  <li>AIAuth does not use your data for advertising, credit scoring, or any purpose unrelated to producing and verifying the receipts you ask for.</li>
+</ul>
+
+<h2>Server logs</h2>
+<p>The AIAuth web server (nginx + uvicorn) may write standard HTTP access logs containing request timestamps, paths, status codes, and IP addresses, for operational reliability and abuse prevention. These logs are rotated and are not used for marketing, analytics, or resale. They are not tied to any stored user profile because AIAuth does not maintain user profiles.</p>
+
+<h2>Third-party services</h2>
+<p>The AIAuth website loads fonts from Google Fonts for typography. When you visit a page on aiauth.app, your browser fetches these font files from Google's CDN; this is subject to Google's own privacy terms. No AIAuth data is transmitted to Google.</p>
+<p>The AIAuth Chrome extension itself does not load any third-party resources.</p>
+
+<h2>Enterprise / self-hosted deployments</h2>
+<p>Organizations running AIAuth in <code>enterprise</code> mode on their own infrastructure may configure the server to store full attestation records, including content hashes, user identifiers, review status, and timestamps, inside their own database. In that case, the operating organization — not Finch Business Services LLC — is the data controller, and their own privacy policy governs that data.</p>
+
+<h2>Your rights</h2>
+<ul>
+  <li>Your local data: you can delete it by clearing the extension's storage from <code>chrome://extensions</code> or by uninstalling the extension.</li>
+  <li>Registered hashes: because the hash registry contains no identifying information, there is no personal data to access, correct, or delete. A hash cannot be traced to you.</li>
+  <li>If you contact us with a specific request, we will respond within 30 days.</li>
+</ul>
+
+<h2>Children</h2>
+<p>AIAuth is not directed to children under 13 and does not knowingly collect information from them.</p>
+
+<h2>Changes to this policy</h2>
+<p>Material changes will be announced on this page, and the "last updated" date above will change. The public-mode data practices described here (content never transmitted, no identifying data stored server-side) are core to the product and will not change without a new major version.</p>
+
+<h2>Contact</h2>
+<p>Questions, requests, or concerns: <a href="mailto:chase@finchbusinessserv.com">chase@finchbusinessserv.com</a>.</p>
+</div>"""
+    return HTMLResponse(_page_shell("Privacy", body, active=""))
+
+
 @app.get("/public-key", response_class=HTMLResponse)
 def public_key_page():
     """Human-readable public key page — developers can still hit /v1/public-key or /.well-known/aiauth-public-key."""

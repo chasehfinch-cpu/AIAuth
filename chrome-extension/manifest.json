@@ -8,12 +8,10 @@
     "activeTab",
     "storage",
     "notifications",
-    "clipboardRead",
     "clipboardWrite",
     "contextMenus"
   ],
   "host_permissions": [
-    "https://chat.openai.com/*",
     "https://chatgpt.com/*",
     "https://claude.ai/*",
     "https://gemini.google.com/*",
@@ -38,7 +36,6 @@
   "content_scripts": [
     {
       "matches": [
-        "https://chat.openai.com/*",
         "https://chatgpt.com/*",
         "https://claude.ai/*",
         "https://gemini.google.com/*",
@@ -54,7 +51,7 @@
         "default": "Ctrl+Shift+A",
         "mac": "Command+Shift+A"
       },
-      "description": "Attest selected text or clipboard"
+      "description": "Attest selected text on a supported AI site"
     }
   }
 }
