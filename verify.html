@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIAuth — Verify a Receipt</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root { --bg:#08090a; --surface:#111214; --border:#1e2023; --text:#e8e9eb; --muted:#6b7075; --accent:#2563eb; --green:#22c55e; --red:#ef4444; --amber:#eab308; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; }
+.container { width:100%; max-width:640px; padding:48px 24px; }
+.logo { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
+.logo-mark { width:40px; height:40px; background:var(--accent); border-radius:10px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:20px; color:white; }
+.logo-text { font-size:24px; font-weight:700; letter-spacing:-0.5px; }
+.subtitle { color:var(--muted); font-size:15px; margin-bottom:40px; }
+textarea { width:100%; min-height:180px; padding:16px; background:var(--surface); border:1px solid var(--border); border-radius:10px; color:var(--text); font-family:'DM Mono',monospace; font-size:13px; line-height:1.6; resize:vertical; outline:none; }
+textarea:focus { border-color:var(--accent); }
+textarea::placeholder { color:#3a3d42; }
+.hint { color:var(--muted); font-size:12px; margin-top:8px; }
+.btn { width:100%; padding:14px; background:var(--accent); color:white; border:none; border-radius:10px; font-size:15px; font-weight:600; font-family:inherit; cursor:pointer; margin-top:16px; }
+.btn:hover { background:#1d4ed8; }
+.btn:disabled { background:#1e2023; color:#3a3d42; cursor:default; }
+#result { display:none; margin-top:32px; animation:fadeIn .3s ease; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+.r-header { display:flex; align-items:center; gap:12px; padding:20px; border-radius:10px 10px 0 0; }
+.r-valid { background:#22c55e12; border:1px solid #22c55e25; }
+.r-invalid { background:#ef444412; border:1px solid #ef444425; }
+.r-icon { width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:700; flex-shrink:0; }
+.r-valid .r-icon { background:#22c55e20; color:var(--green); }
+.r-invalid .r-icon { background:#ef444420; color:var(--red); }
+.r-title { font-size:17px; font-weight:600; }
+.r-sub { font-size:13px; color:var(--muted); margin-top:2px; }
+.r-body { background:var(--surface); border:1px solid var(--border); border-top:none; border-radius:0 0 10px 10px; padding:20px; }
+.r-row { display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid var(--border); font-size:14px; }
+.r-row:last-child { border-bottom:none; }
+.r-label { color:var(--muted); font-weight:500; }
+.r-val { text-align:right; font-family:'DM Mono',monospace; font-size:13px; max-width:55%; word-break:break-all; }
+.good { color:var(--green); }
+.bad { color:var(--red); }
+.chain-section { margin-top:20px; padding-top:20px; border-top:1px solid var(--border); }
+.chain-title { font-size:13px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-bottom:12px; }
+.chain-link { display:flex; gap:14px; padding:10px 0; }
+.chain-line { display:flex; flex-direction:column; align-items:center; width:20px; }
+.chain-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+.chain-dot.ok { background:var(--green); }
+.chain-dot.fail { background:var(--red); }
+.chain-conn { width:2px; flex:1; background:var(--border); min-height:8px; }
+.chain-detail { flex:1; font-size:13px; line-height:1.5; }
+.chain-user { font-weight:600; }
+.chain-meta { color:var(--muted); font-size:12px; }
+.chain-model { display:inline-block; background:var(--border); padding:1px 8px; border-radius:4px; font-family:'DM Mono',monospace; font-size:11px; }
+.how { margin-top:56px; padding-top:32px; border-top:1px solid var(--border); }
+.how h2 { font-size:16px; font-weight:600; margin-bottom:20px; }
+.step { display:flex; gap:14px; margin-bottom:16px; }
+.step-n { width:28px; height:28px; background:var(--surface); border:1px solid var(--border); border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; color:var(--accent); flex-shrink:0; }
+.step-t { font-size:14px; line-height:1.6; color:var(--muted); padding-top:3px; }
+.footer { margin-top:56px; text-align:center; font-size:12px; color:#3a3d42; padding-bottom:32px; }
+.footer a { color:var(--muted); text-decoration:none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="logo">
+    <div class="logo-mark">A</div>
+    <div class="logo-text">AIAuth</div>
+  </div>
+  <p class="subtitle">Verify an AI attestation receipt</p>
+
+  <div>
+    <textarea id="input" placeholder='Paste either:
+
+1. A short receipt code, e.g. [AIAuth:a1b2c3d4e5f6] — we confirm it exists in the registry.
+
+2. The full receipt JSON — we verify the cryptographic signature:
+{
+  "receipt": { "v": "0.4.0", "id": "...", "hash": "...", ... },
+  "signature": "..."
+}'></textarea>
+    <p class="hint">The short code confirms existence. The full JSON is needed to verify the signature. Ask the sender to share the full receipt (in the AIAuth extension popup, click "Share" next to a receipt).</p>
+
+    <div id="filedrop" style="margin-top:16px;padding:20px;border:2px dashed var(--border);border-radius:10px;text-align:center;cursor:pointer;transition:border-color .12s,background .12s;">
+      <div style="font-size:14px;font-weight:600;color:var(--text)">Or drop a file here to verify by content</div>
+      <div style="font-size:12px;color:var(--muted);margin-top:4px;">Any file — Excel, PDF, image. Hashed in your browser, never uploaded.</div>
+      <input id="fileInput" type="file" style="display:none"/>
+    </div>
+    <button class="btn" id="verifyBtn" onclick="verify()">Verify Receipt</button>
+  </div>
+
+  <div id="result"></div>
+
+  <div class="footer">
+    <a href="/">← AIAuth home</a> — Notarize your AI work<br>
+    <a href="/guide">User Guide</a> · <a href="/docs">API Docs</a>
+  </div>
+</div>
+
+<script>
+const API = window.location.origin;
+
+async function verify() {
+  const input = document.getElementById('input').value.trim();
+  const resultEl = document.getElementById('result');
+  const btn = document.getElementById('verifyBtn');
+
+  if (!input) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Verifying...';
+
+  try {
+    // Short-code path: [AIAuth:xxxx] or a bare 8-12 hex prefix
+    const codeMatch = input.match(/\[AIAuth:([0-9a-f-]{8,})\]/i) || input.match(/^[0-9a-f]{8,12}$/i);
+    if (codeMatch && input.length < 80) {
+      const code = codeMatch[1] || codeMatch[0];
+      await lookupByCode(code);
+      return;
+    }
+
+    let data;
+    try { data = JSON.parse(input); } catch(e) {
+      showError('Could not read the input. Paste either a receipt code (e.g. [AIAuth:a1b2c3d4e5f6]) or the full receipt JSON.');
+      return;
+    }
+
+    // Detect: single receipt or chain (array)
+    if (Array.isArray(data)) {
+      await verifyChain(data);
+    } else if (data.receipt && data.signature) {
+      await verifySingle(data);
+    } else if (data.v && data.id && data.hash) {
+      showError('This looks like a receipt but is missing the signature. Make sure you paste the full file content (both "receipt" and "signature" fields).');
+    } else {
+      showError('This doesn\'t look like an AIAuth receipt. Paste a receipt code or the full JSON.');
+    }
+  } catch(e) {
+    showError('Could not connect to the verification server. Please try again.');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Verify Receipt';
+  }
+}
+
+async function lookupByCode(code) {
+  const resp = await fetch(API + '/v1/lookup/' + encodeURIComponent(code));
+  const result = await resp.json();
+  const resultEl = document.getElementById('result');
+
+  if (!result.found) {
+    resultEl.innerHTML = `
+      <div class="r-header r-invalid">
+        <div class="r-icon">✕</div>
+        <div>
+          <div class="r-title">No receipt found for this code</div>
+          <div class="r-sub">The code is not in the public registry. It may be invalid, or the sender chose not to register it.</div>
+        </div>
+      </div>`;
+    resultEl.style.display = 'block';
+    return;
+  }
+
+  const match = result.matches[0];
+  resultEl.innerHTML = `
+    <div class="r-header r-valid">
+      <div class="r-icon">✓</div>
+      <div>
+        <div class="r-title">Receipt exists in the registry</div>
+        <div class="r-sub">Existence confirmed. Signature not yet verified — ask the sender for the full JSON to complete verification.</div>
+      </div>
+    </div>
+    <div class="r-body">
+      <div class="r-row"><span class="r-label">Receipt ID</span><span class="r-val">${match.receipt_id.substring(0,12)}…</span></div>
+      <div class="r-row"><span class="r-label">Registered</span><span class="r-val">${formatDate(match.registered_at)}</span></div>
+      <div class="r-row"><span class="r-label">Signature check</span><span class="r-val" style="color:var(--amber)">Pending — paste full JSON</span></div>
+      ${result.matches.length > 1 ? `<div class="r-row"><span class="r-label">Also matched</span><span class="r-val">${result.matches.length - 1} other receipt(s) with this prefix</span></div>` : ''}
+    </div>
+    <div style="margin-top:12px;color:var(--muted);font-size:13px;line-height:1.5;">
+      To see who attested this content, when, and confirm the signature is valid, ask the sender to open the AIAuth extension, click <b>Share</b> next to the matching receipt, and paste the JSON they send here.
+    </div>`;
+  resultEl.style.display = 'block';
+}
+
+async function verifySingle(data) {
+  const resp = await fetch(API + '/v1/verify', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ receipt: data.receipt, signature: data.signature })
+  });
+  const result = await resp.json();
+  const r = data.receipt;
+  const review = r.review || {};
+
+  const cls = result.valid ? 'r-valid' : 'r-invalid';
+  const icon = result.valid ? '✓' : '✕';
+  const title = result.valid ? 'Receipt is authentic' : 'Receipt is NOT valid';
+  const sub = result.valid
+    ? 'The digital seal is intact — this receipt has not been tampered with.'
+    : 'The digital seal is broken — this receipt may have been modified.';
+
+  let html = `
+    <div class="r-header ${cls}">
+      <div class="r-icon">${icon}</div>
+      <div><div class="r-title">${title}</div><div class="r-sub">${sub}</div></div>
+    </div>
+    <div class="r-body">
+      <div class="r-row"><span class="r-label">Reviewed by</span><span class="r-val">${r.uid || 'Unknown'}</span></div>
+      <div class="r-row"><span class="r-label">When</span><span class="r-val">${formatDate(r.ts)}</span></div>
+      ${r.model ? `<div class="r-row"><span class="r-label">AI model</span><span class="r-val">${r.model}</span></div>` : ''}
+      ${r.provider ? `<div class="r-row"><span class="r-label">AI provider</span><span class="r-val">${r.provider}</span></div>` : ''}
+      ${review.status ? `<div class="r-row"><span class="r-label">Review decision</span><span class="r-val ${review.status === 'approved' ? 'good' : ''}">${review.status}</span></div>` : ''}
+      ${review.by ? `<div class="r-row"><span class="r-label">Reviewed by</span><span class="r-val">${review.by}</span></div>` : ''}
+      ${review.note ? `<div class="r-row"><span class="r-label">Note</span><span class="r-val">${escHtml(review.note)}</span></div>` : ''}
+      <div class="r-row"><span class="r-label">Content fingerprint</span><span class="r-val">${r.hash ? r.hash.substring(0,16) + '...' : 'N/A'}</span></div>
+      <div class="r-row"><span class="r-label">Receipt ID</span><span class="r-val">${r.id ? r.id.substring(0,12) : 'N/A'}</span></div>
+      ${r.parent ? `<div class="r-row"><span class="r-label">Previous version</span><span class="r-val">${r.parent.substring(0,16)}...</span></div>` : ''}
+      <div class="r-row"><span class="r-label">Signature valid</span><span class="r-val ${result.valid ? 'good' : 'bad'}">${result.valid ? 'Yes' : 'No'}</span></div>
+    </div>`;
+
+  // Chain discovery — check the registry for related receipts
+  const cd = result.chain_discovery;
+  if (cd) {
+    let discoveryHtml = '<div class="chain-section"><div class="chain-title">Chain Discovery</div>';
+
+    if (cd.parents && cd.parents.length > 0) {
+      discoveryHtml += cd.parents.map(p => `
+        <div class="chain-link">
+          <div class="chain-line"><div class="chain-dot ok"></div><div class="chain-conn"></div></div>
+          <div class="chain-detail">
+            <div class="chain-user">↑ Prior version exists</div>
+            <div class="chain-meta">Receipt ID: <code>${p.receipt_id.substring(0,12)}...</code></div>
+            <div class="chain-meta" style="color:var(--muted)">Details held by its owner. Request the receipt to see who attested it.</div>
+          </div>
+        </div>`).join('');
+    } else if (r.parent) {
+      discoveryHtml += `
+        <div class="chain-link">
+          <div class="chain-line"><div class="chain-dot fail"></div><div class="chain-conn"></div></div>
+          <div class="chain-detail">
+            <div class="chain-user">↑ Prior version referenced</div>
+            <div class="chain-meta" style="color:var(--amber)">This receipt references a parent, but no matching receipt was found in the registry.</div>
+          </div>
+        </div>`;
+    }
+
+    // Current receipt
+    discoveryHtml += `
+      <div class="chain-link">
+        <div class="chain-line"><div class="chain-dot ${result.valid ? 'ok' : 'fail'}"></div><div class="chain-conn"></div></div>
+        <div class="chain-detail">
+          <div class="chain-user">● This receipt</div>
+          <div class="chain-meta">${escHtml(r.uid)} · ${formatDate(r.ts)}</div>
+        </div>
+      </div>`;
+
+    if (cd.children && cd.children.length > 0) {
+      discoveryHtml += cd.children.map(c => `
+        <div class="chain-link">
+          <div class="chain-line"><div class="chain-dot ok"></div></div>
+          <div class="chain-detail">
+            <div class="chain-user">↓ Later version exists</div>
+            <div class="chain-meta">Receipt ID: <code>${c.receipt_id.substring(0,12)}...</code></div>
+            <div class="chain-meta" style="color:var(--muted)">Details held by its owner. Request the receipt to see who attested it.</div>
+          </div>
+        </div>`).join('');
+    }
+
+    if (!cd.parents?.length && !cd.children?.length && !r.parent) {
+      discoveryHtml += `<div style="color:var(--muted);font-size:13px;padding:8px 0;">No other versions found in the registry. This appears to be a standalone attestation.</div>`;
+    }
+
+    discoveryHtml += '</div>';
+    html += discoveryHtml;
+  }
+
+  html += '</div>';
+
+  document.getElementById('result').innerHTML = html;
+  document.getElementById('result').style.display = 'block';
+}
+
+async function verifyChain(data) {
+  // Expect array of {receipt, signature} objects
+  const chain = data.map(d => ({ receipt: d.receipt, signature: d.signature }));
+
+  const resp = await fetch(API + '/v1/verify/chain', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ chain })
+  });
+  const result = await resp.json();
+
+  const cls = result.valid ? 'r-valid' : 'r-invalid';
+  const icon = result.valid ? '✓' : '✕';
+  const title = result.valid ? 'Chain is intact' : 'Chain has broken links';
+  const sub = result.valid
+    ? `${result.length} steps from ${result.origin} to ${result.final} — all verified.`
+    : 'One or more links in the chain failed verification.';
+
+  let chainHtml = result.links.map((link, i) => {
+    const isLast = i === result.links.length - 1;
+    return `
+      <div class="chain-link">
+        <div class="chain-line">
+          <div class="chain-dot ${link.link_valid ? 'ok' : 'fail'}"></div>
+          ${!isLast ? '<div class="chain-conn"></div>' : ''}
+        </div>
+        <div class="chain-detail">
+          <div class="chain-user">${escHtml(link.user || 'Unknown')}</div>
+          <div class="chain-meta">
+            ${formatDate(link.timestamp)}
+            ${link.model ? ' · <span class="chain-model">' + escHtml(link.model) + '</span>' : ''}
+            ${link.review ? ' · ' + link.review : ''}
+          </div>
+          <div class="chain-meta ${link.link_valid ? 'good' : 'bad'}">
+            ${link.signature_valid ? '✓ Signature valid' : '✕ Signature invalid'}
+            ${link.parent_valid ? '' : ' · ✕ Parent link broken'}
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  let html = `
+    <div class="r-header ${cls}">
+      <div class="r-icon">${icon}</div>
+      <div><div class="r-title">${title}</div><div class="r-sub">${sub}</div></div>
+    </div>
+    <div class="r-body">
+      <div class="chain-section">
+        <div class="chain-title">Chain of custody (${result.length} steps)</div>
+        ${chainHtml}
+      </div>
+    </div>`;
+
+  document.getElementById('result').innerHTML = html;
+  document.getElementById('result').style.display = 'block';
+}
+
+function showError(msg) {
+  document.getElementById('result').innerHTML = `
+    <div class="r-header r-invalid">
+      <div class="r-icon">!</div>
+      <div><div class="r-title">Could not verify</div><div class="r-sub">${msg}</div></div>
+    </div>`;
+  document.getElementById('result').style.display = 'block';
+}
+
+function formatDate(iso) {
+  if (!iso) return 'Unknown';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-US', { month:'short', day:'numeric', year:'numeric' }) +
+           ' ' + d.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' });
+  } catch(e) { return iso; }
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
+// File-drop verification — hashes locally, looks up by content hash.
+async function sha256File(file) {
+  const buf = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function verifyFile(file) {
+  const btn = document.getElementById('verifyBtn');
+  btn.disabled = true;
+  btn.textContent = `Hashing ${file.name}…`;
+  try {
+    const hash = await sha256File(file);
+    btn.textContent = 'Checking registry…';
+    const resp = await fetch(API + '/v1/discover/' + hash);
+    const result = await resp.json();
+    const resultEl = document.getElementById('result');
+    if (!result.found) {
+      resultEl.innerHTML = `
+        <div class="r-header r-invalid">
+          <div class="r-icon">✕</div>
+          <div>
+            <div class="r-title">No receipt found for this file</div>
+            <div class="r-sub">The file's content fingerprint is not in the public registry. Either no one attested it, or the file has been modified since it was attested.</div>
+          </div>
+        </div>
+        <div class="r-body">
+          <div class="r-row"><span class="r-label">File</span><span class="r-val">${escHtml(file.name)}</span></div>
+          <div class="r-row"><span class="r-label">Size</span><span class="r-val">${file.size.toLocaleString()} bytes</span></div>
+          <div class="r-row"><span class="r-label">Fingerprint</span><span class="r-val">${hash.substring(0,16)}…</span></div>
+        </div>`;
+      resultEl.style.display = 'block';
+      return;
+    }
+    const rcpts = result.receipts || [];
+    resultEl.innerHTML = `
+      <div class="r-header r-valid">
+        <div class="r-icon">✓</div>
+        <div>
+          <div class="r-title">File is attested</div>
+          <div class="r-sub">A receipt exists for this exact file. Ask the sender for the full receipt JSON to verify the signature.</div>
+        </div>
+      </div>
+      <div class="r-body">
+        <div class="r-row"><span class="r-label">File</span><span class="r-val">${escHtml(file.name)}</span></div>
+        <div class="r-row"><span class="r-label">Size</span><span class="r-val">${file.size.toLocaleString()} bytes</span></div>
+        <div class="r-row"><span class="r-label">Fingerprint</span><span class="r-val">${hash.substring(0,16)}…</span></div>
+        <div class="r-row"><span class="r-label">Receipts found</span><span class="r-val good">${rcpts.length}</span></div>
+        ${rcpts.slice(0,3).map(r => `<div class="r-row"><span class="r-label">Receipt ID</span><span class="r-val">${r.receipt_id.substring(0,12)}…</span></div>`).join('')}
+        <div class="r-row"><span class="r-label">Signature check</span><span class="r-val" style="color:var(--amber)">Pending — paste full JSON</span></div>
+      </div>`;
+    resultEl.style.display = 'block';
+  } catch (e) {
+    showError('File verification failed: ' + (e.message || e));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Verify Receipt';
+  }
+}
+
+(function wireFileDrop(){
+  const zone = document.getElementById('filedrop');
+  const input = document.getElementById('fileInput');
+  if (!zone) return;
+  zone.addEventListener('click', () => input.click());
+  input.addEventListener('change', () => {
+    if (input.files && input.files[0]) verifyFile(input.files[0]);
+    input.value = '';
+  });
+  ['dragenter','dragover'].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation();
+    zone.style.borderColor = 'var(--accent)';
+    zone.style.background = '#0b1a3a';
+  }));
+  ['dragleave','drop'].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); e.stopPropagation();
+    zone.style.borderColor = 'var(--border)';
+    zone.style.background = '';
+  }));
+  zone.addEventListener('drop', e => {
+    const f = e.dataTransfer?.files?.[0];
+    if (f) verifyFile(f);
+  });
+})();
+</script>
+</body>
+</html>

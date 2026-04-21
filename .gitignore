@@ -1,0 +1,36 @@
+# Secrets — never commit
+.env
+*.pem
+aiauth_private.pem*
+aiauth_public.pem
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Claude local scratch
+.claude/
+
+# Logs & local state
+*.log
+receipts/
+
+# PyInstaller build
+build/
+dist/
+*.spec

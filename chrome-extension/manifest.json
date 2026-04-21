@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "AIAuth — Notarize Your AI Work",
+  "short_name": "AI Attest",
+  "version": "1.0.0",
+  "description": "One-click notarization for AI-generated content. Prove what AI produced and that you reviewed it. Works across ChatGPT, Claude, Gemini, Copilot, and any AI tool.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "notifications",
+    "clipboardRead",
+    "clipboardWrite",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "https://chat.openai.com/*",
+    "https://chatgpt.com/*",
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://copilot.microsoft.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*",
+        "https://copilot.microsoft.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"]
+    }
+  ],
+  "commands": {
+    "aiauth-attest": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+A",
+        "mac": "Command+Shift+A"
+      },
+      "description": "Attest selected text or clipboard"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+# LiteLLM Proxy Config with Attestation Layer
+# 
+# This is the only config file needed. Drop attestation_callback.py
+# alongside it and every AI call gets attested automatically.
+#
+# Run: litellm --config config.yaml
+
+model_list:
+  # Add your AI providers here — LiteLLM handles 100+
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-20250514
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gemini-pro
+    litellm_params:
+      model: vertex_ai/gemini-2.0-flash
+      api_key: os.environ/GOOGLE_API_KEY
+
+litellm_settings:
+  # This single line activates attestation for ALL providers
+  callbacks: attestation_callback.proxy_handler_instance
+
+  # Require user identification on every request
+  enforce_user_param: true
+
+general_settings:
+  # Master key for admin access
+  master_key: os.environ/LITELLM_MASTER_KEY
