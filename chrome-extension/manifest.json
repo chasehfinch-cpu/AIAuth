@@ -3,7 +3,7 @@
   "name": "AIAuth — Notarize Your AI Work",
   "short_name": "AI Attest",
   "version": "1.0.0",
-  "description": "One-click notarization for AI-generated content. Prove what AI produced and that you reviewed it. Works across ChatGPT, Claude, Gemini, Copilot, and any AI tool.",
+  "description": "Cryptographic receipts for AI-generated work. One keystroke proves what AI produced and that you reviewed it.",
   "permissions": [
     "activeTab",
     "storage",
