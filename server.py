@@ -19,6 +19,7 @@ Enterprise mode (adds storage, dashboard, review history):
   AIAUTH_MODE=enterprise uvicorn server:app --host 0.0.0.0 --port 8100
 """
 
+import hashlib
 import json
 import os
 import re
@@ -29,7 +30,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -48,7 +49,10 @@ MODE = os.getenv("AIAUTH_MODE", "public")
 KEY_DIR = Path(os.getenv("AIAUTH_KEY_DIR", "."))
 DB_PATH = os.getenv("AIAUTH_DB_PATH", "aiauth.db")
 LICENSE_KEY = os.getenv("AIAUTH_LICENSE_KEY", "")
-MASTER_KEY = os.getenv("AIAUTH_MASTER_KEY", "")  # Your admin key for issuing licenses
+MASTER_KEY = os.getenv("AIAUTH_MASTER_KEY", "")  # Admin key for license generation
+SERVER_SECRET = os.getenv("SERVER_SECRET", "")   # HMAC secret for magic-link + session tokens (v0.5.0+)
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")   # HMAC secret for extension client_integrity (Piece 9)
+PUBLIC_BASE_URL = os.getenv("AIAUTH_PUBLIC_URL", "https://aiauth.app")  # base URL for magic-link emails
 DEDUP_WINDOW = int(os.getenv("AIAUTH_DEDUP_WINDOW", "300"))  # seconds; 0 disables dedup
 
 # Regex for SHA-256 hex (lowercase or uppercase)
@@ -578,37 +582,247 @@ def find_recent_duplicate(content_hash: str, window_seconds: int) -> Optional[di
 
 
 # ===================================================================
-# ENTERPRISE DB (optional)
+# APPLICATION DB — accounts, orgs, tokens, consent, enterprise store
+# (aiauth.db)
+# Per CLAUDE.md "Database Architecture": two DBs total, not three.
+# This single database holds everything that isn't the anonymous
+# registry. Account/auth tables are always present (public account
+# system is available in free tier). Enterprise tables are created
+# regardless of MODE so that hosted enterprise ingest works without
+# restart when a license is activated.
 # ===================================================================
 
+import hmac
+import secrets
+
+
 def get_db():
-    if MODE != "enterprise": return None
+    """Connection to aiauth.db. Opened fresh per call — SQLite with WAL
+    handles concurrency."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
+
 def init_db():
-    if MODE != "enterprise": return
     conn = get_db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS attestations (
-        id TEXT PRIMARY KEY, created_at TEXT, output_hash TEXT,
-        user_id TEXT, model TEXT, provider TEXT, source TEXT,
-        review_status TEXT DEFAULT 'pending', reviewer_id TEXT,
-        reviewed_at TEXT, review_note TEXT,
-        parent_hash TEXT, chain_root TEXT,
-        signature TEXT, receipt TEXT
+
+    # ---------------- Accounts (always, all modes) ----------------
+    conn.execute("""CREATE TABLE IF NOT EXISTS accounts (
+        account_id    TEXT PRIMARY KEY,
+        primary_email TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
     )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS review_history (
-        id TEXT PRIMARY KEY, attestation_id TEXT, reviewer_id TEXT,
-        status TEXT, note TEXT, reviewed_at TEXT
+    conn.execute("""CREATE TABLE IF NOT EXISTS account_emails (
+        email         TEXT PRIMARY KEY,
+        account_id    TEXT NOT NULL REFERENCES accounts(account_id),
+        email_type    TEXT NOT NULL,
+        org_id        TEXT,
+        verified      INTEGER NOT NULL DEFAULT 0,
+        added_at      TEXT NOT NULL,
+        verified_at   TEXT
     )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_chain ON attestations(chain_root)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON attestations(user_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON attestations(output_hash)")
-    conn.commit(); conn.close()
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_account ON account_emails(account_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_org ON account_emails(org_id)")
+
+    # ---------------- Organizations + membership ----------------
+    conn.execute("""CREATE TABLE IF NOT EXISTS organizations (
+        org_id        TEXT PRIMARY KEY,
+        name          TEXT NOT NULL,
+        domains       TEXT NOT NULL,
+        license_key   TEXT NOT NULL,
+        license_tier  TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        active        INTEGER NOT NULL DEFAULT 1
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS org_members (
+        account_id    TEXT NOT NULL REFERENCES accounts(account_id),
+        org_id        TEXT NOT NULL REFERENCES organizations(org_id),
+        role          TEXT NOT NULL DEFAULT 'member',
+        department    TEXT,
+        joined_at     TEXT NOT NULL,
+        left_at       TEXT,
+        consent_personal_history INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (account_id, org_id)
+    )""")
+
+    # ---------------- Immutable consent audit log ----------------
+    conn.execute("""CREATE TABLE IF NOT EXISTS consent_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id    TEXT NOT NULL,
+        org_id        TEXT NOT NULL,
+        action        TEXT NOT NULL,
+        timestamp     TEXT NOT NULL,
+        details       TEXT
+    )""")
+
+    # ---------------- Magic-link / session tokens ----------------
+    conn.execute("""CREATE TABLE IF NOT EXISTS used_tokens (
+        nonce         TEXT PRIMARY KEY,
+        used_at       TEXT NOT NULL,
+        purpose       TEXT NOT NULL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS revoked_sessions (
+        session_id    TEXT PRIMARY KEY,
+        revoked_at    TEXT NOT NULL,
+        reason        TEXT
+    )""")
+
+    # ---------------- Legacy v0.4.0 attestations (enterprise only) ----------------
+    # Retained for backward compatibility. Piece 10 will introduce the
+    # new enterprise_attestations table with the full v0.5.0 schema.
+    if MODE == "enterprise":
+        conn.execute("""CREATE TABLE IF NOT EXISTS attestations (
+            id TEXT PRIMARY KEY, created_at TEXT, output_hash TEXT,
+            user_id TEXT, model TEXT, provider TEXT, source TEXT,
+            review_status TEXT DEFAULT 'pending', reviewer_id TEXT,
+            reviewed_at TEXT, review_note TEXT,
+            parent_hash TEXT, chain_root TEXT,
+            signature TEXT, receipt TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS review_history (
+            id TEXT PRIMARY KEY, attestation_id TEXT, reviewer_id TEXT,
+            status TEXT, note TEXT, reviewed_at TEXT
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chain ON attestations(chain_root)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON attestations(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON attestations(output_hash)")
+
+    conn.commit()
+    conn.close()
+
 
 init_db()
+
+
+# ===================================================================
+# MAGIC-LINK + SESSION TOKEN HELPERS (v0.5.0+)
+# HMAC-signed JWT-style tokens: base64url(json).base64url(hmac).
+# The server holds SERVER_SECRET; any tampering invalidates the MAC.
+# ===================================================================
+
+def _b64url_no_pad(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _sign_token(payload: dict) -> str:
+    if not SERVER_SECRET:
+        raise AIAuthError(
+            "SERVER_MISCONFIGURED",
+            "SERVER_SECRET env var is not set; magic-link auth is disabled",
+            500,
+        )
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    mac = hmac.new(SERVER_SECRET.encode(), canonical, hashlib.sha256).digest()
+    return f"{_b64url_no_pad(canonical)}.{_b64url_no_pad(mac)}"
+
+
+def _verify_token(token: str) -> Optional[dict]:
+    if not SERVER_SECRET or not token or "." not in token:
+        return None
+    try:
+        data_b64, sig_b64 = token.split(".", 1)
+        canonical = _b64url_decode(data_b64)
+        expected = hmac.new(SERVER_SECRET.encode(), canonical, hashlib.sha256).digest()
+        actual = _b64url_decode(sig_b64)
+        if not hmac.compare_digest(expected, actual):
+            return None
+        payload = json.loads(canonical)
+        exp = payload.get("expires_at")
+        if exp:
+            exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            if exp_dt < datetime.now(timezone.utc):
+                return None
+        return payload
+    except Exception:
+        return None
+
+
+def _make_magic_token(account_id: str, email: str, purpose: str, ttl_minutes: int = 15) -> tuple:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "account_id": account_id,
+        "email": email,
+        "issued_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=ttl_minutes)).isoformat(),
+        "nonce": secrets.token_hex(16),
+        "purpose": purpose,
+    }
+    return _sign_token(payload), payload
+
+
+def _make_session_token(account_id: str, email: str, ttl_hours: int = 24) -> tuple:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "account_id": account_id,
+        "email": email,
+        "issued_at": now.isoformat(),
+        "expires_at": (now + timedelta(hours=ttl_hours)).isoformat(),
+        "session_id": secrets.token_hex(16),
+        "kind": "session",
+    }
+    return _sign_token(payload), payload
+
+
+def _send_magic_link(email: str, token: str, purpose: str) -> None:
+    """Email delivery is intentionally stubbed in v0.5.0. The link is
+    logged to stdout and to KEY_DIR/magic_links.log so an admin can
+    wire in a transactional email provider (Resend, Postmark, SES)
+    without touching server code."""
+    link = f"{PUBLIC_BASE_URL}/auth?token={token}&p={purpose}"
+    msg = f"[AIAuth magic-link] to={email} purpose={purpose} link={link}"
+    print(msg)
+    try:
+        log_path = KEY_DIR / "magic_links.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
+    except Exception:
+        pass
+
+
+def _require_session(authorization: Optional[str]) -> dict:
+    """Resolve a Bearer session token into its payload. Raises AIAuthError
+    on missing/invalid/revoked sessions."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise AIAuthError("UNAUTHENTICATED", "Missing Authorization: Bearer <session_token>", 401)
+    token = authorization[7:].strip()
+    payload = _verify_token(token)
+    if payload is None or payload.get("kind") != "session":
+        raise AIAuthError("SESSION_INVALID", "Session token is invalid or expired", 401)
+    sid = payload.get("session_id")
+    if sid:
+        conn = get_db()
+        row = conn.execute("SELECT session_id FROM revoked_sessions WHERE session_id = ?", (sid,)).fetchone()
+        conn.close()
+        if row:
+            raise AIAuthError("SESSION_INVALID", "Session has been revoked", 401)
+    return payload
+
+
+def _find_account_by_email(email: str) -> Optional[sqlite3.Row]:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT ae.*, a.primary_email FROM account_emails ae "
+        "JOIN accounts a ON ae.account_id = a.account_id "
+        "WHERE ae.email = ?",
+        (email,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _valid_email(email: str) -> bool:
+    return bool(email) and bool(_EMAIL_RE.match(email.strip())) and len(email) <= 254
 
 
 # ===================================================================
@@ -797,6 +1011,334 @@ def sign_receipt(req: SignRequest):
         "short_id": receipt_id[:12],
         "receipt_code": f"[AIAuth:{receipt_id[:12]}]",
     }
+
+
+# ===================================================================
+# ACCOUNT SYSTEM — magic-link authentication (v0.5.0+)
+# Endpoints: /v1/account/create, /auth, /verify, /confirm, /link,
+#            /me, /consent, /export, /logout
+# See CLAUDE.md "Authentication Model" for the full design. All
+# enumeration-sensitive endpoints return 200 whether or not the email
+# exists — callers can't tell.
+# ===================================================================
+
+class AccountCreateRequest(BaseModel):
+    email: str
+
+
+class AccountAuthRequest(BaseModel):
+    email: str
+
+
+class AccountVerifyRequest(BaseModel):
+    token: str
+
+
+class AccountLinkRequest(BaseModel):
+    email: str
+    email_type: str = "corporate"   # "personal" | "corporate"
+
+
+class AccountConfirmRequest(BaseModel):
+    token: str
+
+
+class AccountConsentRequest(BaseModel):
+    org_id: str
+    consent_personal_history: bool
+
+
+def _standard_enum_safe_ok():
+    """Response returned by enumeration-sensitive endpoints regardless
+    of whether the email exists. Keep wording identical to avoid side
+    channels."""
+    return {"message": "If the email is valid, a magic link has been sent. Link expires in 15 minutes."}
+
+
+@app.post("/v1/account/create")
+def account_create(body: AccountCreateRequest):
+    """Create a new AIAuth account and send a magic link. Idempotent:
+    if the email already maps to an account, behaves identically to
+    /v1/account/auth (no enumeration signal)."""
+    email = (body.email or "").strip().lower()
+    if not _valid_email(email):
+        raise AIAuthError("INVALID_EMAIL", "Email format is invalid", 400)
+
+    existing = _find_account_by_email(email)
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        account_id = existing["account_id"]
+    else:
+        account_id = "ACC_" + uuid.uuid4().hex[:12]
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO accounts (account_id, primary_email, created_at, updated_at) VALUES (?,?,?,?)",
+            (account_id, email, now, now),
+        )
+        conn.execute(
+            "INSERT INTO account_emails (email, account_id, email_type, verified, added_at) VALUES (?,?,?,?,?)",
+            (email, account_id, "personal", 0, now),
+        )
+        conn.commit()
+        conn.close()
+
+    token, _ = _make_magic_token(account_id, email, "login")
+    _send_magic_link(email, token, "login")
+    return _standard_enum_safe_ok()
+
+
+@app.post("/v1/account/auth")
+def account_auth(body: AccountAuthRequest):
+    """Request a magic link for an existing account. Does NOT reveal
+    whether the email exists. Rate-limited by middleware
+    (10/hour per IP)."""
+    email = (body.email or "").strip().lower()
+    if not _valid_email(email):
+        # Silent success to avoid enumeration
+        return _standard_enum_safe_ok()
+    existing = _find_account_by_email(email)
+    if existing:
+        token, _ = _make_magic_token(existing["account_id"], email, "login")
+        _send_magic_link(email, token, "login")
+    # else: silently do nothing
+    return _standard_enum_safe_ok()
+
+
+@app.post("/v1/account/verify")
+def account_verify(body: AccountVerifyRequest):
+    """Validate a magic-link token and return a session token. Tokens
+    are single-use: the nonce is recorded in used_tokens so replays
+    fail with TOKEN_USED."""
+    payload = _verify_token(body.token)
+    if payload is None:
+        raise AIAuthError("TOKEN_INVALID", "Magic link is invalid or expired", 400)
+    if payload.get("purpose") not in ("login", "verify_email", "link_email"):
+        raise AIAuthError("TOKEN_INVALID", "Token has unexpected purpose", 400)
+
+    nonce = payload.get("nonce")
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO used_tokens (nonce, used_at, purpose) VALUES (?,?,?)",
+            (nonce, now, payload.get("purpose", "")),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise AIAuthError("TOKEN_USED", "Magic link has already been used", 400)
+
+    # Mark email as verified if this is a login/verify_email token
+    conn.execute(
+        "UPDATE account_emails SET verified = 1, verified_at = ? "
+        "WHERE email = ? AND verified = 0",
+        (now, payload["email"]),
+    )
+    conn.commit()
+    conn.close()
+
+    session_token, sess_payload = _make_session_token(payload["account_id"], payload["email"])
+    return {
+        "session_token": session_token,
+        "expires_in": 86400,
+        "expires_at": sess_payload["expires_at"],
+        "account_id": payload["account_id"],
+        "email": payload["email"],
+    }
+
+
+@app.get("/v1/account/me")
+def account_me(authorization: Optional[str] = Header(default=None)):
+    """Return the authenticated caller's account info: emails linked,
+    verification status, org memberships."""
+    session = _require_session(authorization)
+    account_id = session["account_id"]
+    conn = get_db()
+    emails = [dict(r) for r in conn.execute(
+        "SELECT email, email_type, org_id, verified, added_at, verified_at "
+        "FROM account_emails WHERE account_id = ?",
+        (account_id,),
+    ).fetchall()]
+    orgs = [dict(r) for r in conn.execute(
+        "SELECT om.org_id, o.name, om.role, om.department, om.joined_at, "
+        "       om.left_at, om.consent_personal_history "
+        "FROM org_members om JOIN organizations o ON om.org_id = o.org_id "
+        "WHERE om.account_id = ?",
+        (account_id,),
+    ).fetchall()]
+    conn.close()
+    return {
+        "account_id": account_id,
+        "current_email": session["email"],
+        "emails": emails,
+        "organizations": orgs,
+    }
+
+
+@app.post("/v1/account/link")
+def account_link(body: AccountLinkRequest, authorization: Optional[str] = Header(default=None)):
+    """Link an additional email to the authenticated account. Sends a
+    magic link to the new email; completion happens via /v1/account/confirm."""
+    session = _require_session(authorization)
+    new_email = (body.email or "").strip().lower()
+    if not _valid_email(new_email):
+        raise AIAuthError("INVALID_EMAIL", "Email format is invalid", 400)
+    if body.email_type not in ("personal", "corporate"):
+        raise AIAuthError("INVALID_RECEIPT", "email_type must be personal or corporate", 400)
+
+    # If email already belongs to a DIFFERENT account, reject (enumeration-
+    # safe because the caller already has a session — no blind lookup).
+    existing = _find_account_by_email(new_email)
+    if existing and existing["account_id"] != session["account_id"]:
+        raise AIAuthError(
+            "EMAIL_ALREADY_LINKED",
+            "This email is already linked to another account",
+            409,
+        )
+    # The token carries target account_id; confirmation writes the link.
+    # We pre-encode email_type in purpose to avoid needing a state row.
+    token, _ = _make_magic_token(
+        session["account_id"], new_email,
+        purpose=f"link_email:{body.email_type}",
+    )
+    _send_magic_link(new_email, token, f"link_email:{body.email_type}")
+    return {"message": f"Magic link sent to {new_email}. Click it to confirm the link."}
+
+
+@app.post("/v1/account/confirm")
+def account_confirm(body: AccountConfirmRequest):
+    """Confirm an email-link token (sent via /v1/account/link). Adds
+    the new email to account_emails. Does not require a session — the
+    signed token is the proof of possession."""
+    payload = _verify_token(body.token)
+    if payload is None:
+        raise AIAuthError("TOKEN_INVALID", "Link-confirmation token is invalid or expired", 400)
+    purpose = payload.get("purpose", "")
+    if not purpose.startswith("link_email"):
+        raise AIAuthError("TOKEN_INVALID", "Token is not a link-email token", 400)
+
+    nonce = payload.get("nonce")
+    now = datetime.now(timezone.utc).isoformat()
+    email_type = "corporate"
+    if ":" in purpose:
+        email_type = purpose.split(":", 1)[1] or "corporate"
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO used_tokens (nonce, used_at, purpose) VALUES (?,?,?)",
+            (nonce, now, purpose),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise AIAuthError("TOKEN_USED", "Token has already been used", 400)
+
+    # Insert or update the email
+    try:
+        conn.execute(
+            "INSERT INTO account_emails (email, account_id, email_type, verified, added_at, verified_at) "
+            "VALUES (?,?,?,1,?,?)",
+            (payload["email"], payload["account_id"], email_type, now, now),
+        )
+    except sqlite3.IntegrityError:
+        # Already linked to same account — just ensure verified
+        conn.execute(
+            "UPDATE account_emails SET verified = 1, verified_at = ? "
+            "WHERE email = ? AND account_id = ?",
+            (now, payload["email"], payload["account_id"]),
+        )
+    conn.commit()
+    conn.close()
+    return {"linked": True, "email": payload["email"], "email_type": email_type}
+
+
+@app.post("/v1/account/consent")
+def account_consent(body: AccountConsentRequest, authorization: Optional[str] = Header(default=None)):
+    """Grant or revoke the authenticated account's consent for an
+    organization to see their PERSONAL-email attestations. Corporate-
+    email attestations are always visible to the org (that's the point
+    of having a corporate email) — this flag only controls the
+    personal-history sharing in the enterprise dashboard."""
+    session = _require_session(authorization)
+    account_id = session["account_id"]
+    conn = get_db()
+    # Must already be an org member
+    member = conn.execute(
+        "SELECT * FROM org_members WHERE account_id = ? AND org_id = ?",
+        (account_id, body.org_id),
+    ).fetchone()
+    if member is None:
+        conn.close()
+        raise AIAuthError("NOT_MEMBER", "You are not a member of that organization", 403)
+    new_val = 1 if body.consent_personal_history else 0
+    conn.execute(
+        "UPDATE org_members SET consent_personal_history = ? "
+        "WHERE account_id = ? AND org_id = ?",
+        (new_val, account_id, body.org_id),
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    action = "grant_personal" if new_val else "revoke_personal"
+    conn.execute(
+        "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
+        (account_id, body.org_id, action, now, json.dumps({"email": session["email"]})),
+    )
+    conn.commit()
+    conn.close()
+    return {"account_id": account_id, "org_id": body.org_id,
+            "consent_personal_history": bool(new_val)}
+
+
+@app.post("/v1/account/export")
+def account_export(authorization: Optional[str] = Header(default=None)):
+    """Export the authenticated account's data bundle. In v0.5.0 this
+    returns account metadata + org memberships + consent history.
+    Attestation receipts live on the user's device (free tier) and
+    under enterprise contract (enterprise tier) — we do not hold
+    personal-tier receipts to export."""
+    session = _require_session(authorization)
+    account_id = session["account_id"]
+    conn = get_db()
+    account = dict(conn.execute(
+        "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
+    ).fetchone() or {})
+    emails = [dict(r) for r in conn.execute(
+        "SELECT * FROM account_emails WHERE account_id = ?", (account_id,)
+    ).fetchall()]
+    orgs = [dict(r) for r in conn.execute(
+        "SELECT * FROM org_members WHERE account_id = ?", (account_id,)
+    ).fetchall()]
+    consent = [dict(r) for r in conn.execute(
+        "SELECT * FROM consent_log WHERE account_id = ? ORDER BY timestamp DESC",
+        (account_id,),
+    ).fetchall()]
+    conn.close()
+    return {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "account": account,
+        "emails": emails,
+        "organizations": orgs,
+        "consent_history": consent,
+        "note": "Free-tier attestation receipts are stored on your device, not on our server.",
+    }
+
+
+@app.post("/v1/account/logout")
+def account_logout(authorization: Optional[str] = Header(default=None)):
+    """Revoke the current session by adding its session_id to
+    revoked_sessions. Rate-limited by middleware via the auth path."""
+    session = _require_session(authorization)
+    sid = session.get("session_id")
+    if sid:
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT INTO revoked_sessions (session_id, revoked_at, reason) VALUES (?,?,?)",
+                (sid, datetime.now(timezone.utc).isoformat(), "logout"),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass  # already revoked
+        conn.close()
+    return {"logged_out": True}
 
 
 # ===================================================================
