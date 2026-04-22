@@ -3353,6 +3353,72 @@ def demo_dashboard():
     return HTMLResponse("<h1>AIAuth Demo</h1><p>Demo template not found.</p>", status_code=404)
 
 
+@app.get("/enterprise-guide", response_class=HTMLResponse)
+def enterprise_guide():
+    """Two-part enterprise documentation: Admin Guide | User Guide (Phase B.11).
+    Tabbed navigation wrapped in _site_shell. Markdown rendered via `markdown` lib."""
+    admin_path = Path(__file__).parent / "docs" / "ENTERPRISE_ADMIN_GUIDE.md"
+    user_path  = Path(__file__).parent / "docs" / "ENTERPRISE_USER_GUIDE.md"
+
+    try:
+        import markdown as _md
+    except ImportError:
+        return HTMLResponse(_site_shell(
+            "Enterprise Guide",
+            "<h1 class='page-title'>Enterprise Guide</h1>"
+            "<p class='lead'>The markdown renderer isn't installed on this server. "
+            "Install the <code>markdown</code> package.</p>",
+            active="enterprise"))
+
+    def render_md(path: Path) -> str:
+        if not path.exists():
+            return "<p>Guide not deployed yet.</p>"
+        txt = path.read_text(encoding="utf-8")
+        return _md.markdown(
+            txt,
+            extensions=["fenced_code", "tables", "sane_lists", "toc"],
+        )
+
+    admin_html = render_md(admin_path)
+    user_html  = render_md(user_path)
+
+    body = f"""<span class="eyebrow">Enterprise Documentation</span>
+<h1 class="page-title">Enterprise Guide</h1>
+<p class="lead">Deployment, operation, and end-user documentation for AIAuth Enterprise (self-hosted).</p>
+
+<div style="margin-top:24px; border-bottom:1px solid var(--border);">
+  <button id="tab-admin" class="eg-tab eg-active" onclick="pickTab('admin')">Admin Guide</button>
+  <button id="tab-user"  class="eg-tab" onclick="pickTab('user')">User Guide</button>
+</div>
+
+<style>
+  .eg-tab {{ background: transparent; border: none; padding: 10px 18px; font-family: inherit; font-size: 14px;
+             font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent;
+             margin-bottom: -1px; }}
+  .eg-tab:hover {{ color: var(--text); }}
+  .eg-active {{ color: var(--accent) !important; border-bottom-color: var(--accent) !important; }}
+  .eg-pane {{ display: none; }}
+  .eg-pane.eg-on {{ display: block; }}
+</style>
+
+<div id="pane-admin" class="prose eg-pane eg-on">{admin_html}</div>
+<div id="pane-user"  class="prose eg-pane">{user_html}</div>
+
+<script>
+  function pickTab(which) {{
+    document.getElementById('tab-admin').classList.toggle('eg-active', which === 'admin');
+    document.getElementById('tab-user').classList.toggle('eg-active', which === 'user');
+    document.getElementById('pane-admin').classList.toggle('eg-on', which === 'admin');
+    document.getElementById('pane-user').classList.toggle('eg-on', which === 'user');
+    if (history.replaceState) history.replaceState(null, '', '?' + which);
+  }}
+  // Deep link: /enterprise-guide?user or ?admin
+  if (location.search.indexOf('user') !== -1) pickTab('user');
+</script>
+"""
+    return HTMLResponse(_site_shell("Enterprise Guide", body, active="enterprise", wide=True))
+
+
 @app.get("/samples/compliance-report", response_class=HTMLResponse)
 def samples_compliance_report():
     """Audit-ready compliance report (Phase B.6). Standalone HTML with

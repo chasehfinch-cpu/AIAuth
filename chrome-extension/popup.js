@@ -18,7 +18,8 @@ function setStatus(msg, kind = "") {
 }
 
 function showState(n) {
-  for (const s of ["state1", "state2", "state3", "state5"]) {
+  // n may be "1" | "2" | "3" | "3u" | "5"
+  for (const s of ["state1", "state2", "state3", "state3u", "state5"]) {
     const el = $(s);
     if (el) el.classList.remove("active");
   }
@@ -29,6 +30,7 @@ function showState(n) {
 async function loadSessionState() {
   const data = await chrome.storage.local.get([
     "userId", "server", "session", "pendingEmail", "org", "tier",
+    "emailVerified", "managedConfig",
   ]);
   return {
     userId: data.userId || "",
@@ -37,6 +39,8 @@ async function loadSessionState() {
     pendingEmail: data.pendingEmail || "",
     org: data.org || null,                   // {org_id, name}
     tier: data.tier || "free",
+    emailVerified: data.emailVerified === true,
+    managedConfig: data.managedConfig || null,  // populated from chrome.storage.managed at startup
   };
 }
 
@@ -48,18 +52,19 @@ function sessionStillValid(session) {
 async function determineState() {
   const s = await loadSessionState();
   // No identity yet → State 1
-  if (!s.userId && !s.pendingEmail) return { n: 1, s };
-  // Waiting on magic link → State 2
-  if (s.pendingEmail && !sessionStillValid(s.session)) return { n: 2, s };
-  // Session expired → State 5
-  if (s.userId && s.session && !sessionStillValid(s.session)) return { n: 5, s };
+  if (!s.userId && !s.pendingEmail) return { n: "1", s };
+  // Waiting on magic link → State 2 (user chose Verify My Email)
+  if (s.pendingEmail && !sessionStillValid(s.session)) return { n: "2", s };
+  // Session expired → State 5 (was previously verified)
+  if (s.userId && s.session && !sessionStillValid(s.session) && s.emailVerified) return { n: "5", s };
   // Session valid, org linked → State 4
-  if (sessionStillValid(s.session) && s.org && s.org.org_id) return { n: 4, s };
-  // Session valid, personal only → State 3
-  if (sessionStillValid(s.session)) return { n: 3, s };
-  // Fallback: user has userId but no session (legacy — pre-Piece 7 install)
-  // Treat as State 3 but flag session as missing so auth endpoints warn.
-  return { n: 3, s };
+  if (sessionStillValid(s.session) && s.org && s.org.org_id) return { n: "4", s };
+  // Session valid → State 3 (verified personal tier)
+  if (sessionStillValid(s.session)) return { n: "3", s };
+  // Unverified Start-Attesting path: userId set, emailVerified=false, no session
+  if (s.userId && !s.emailVerified) return { n: "3u", s };
+  // Fallback
+  return { n: "3", s };
 }
 
 function fmtTime(iso) {
@@ -221,6 +226,7 @@ function extractToken(input) {
 // ---------- State transitions ----------
 
 async function onboardStart() {
+  // "Verify My Email" button — full magic-link flow.
   const email = ($("onboardEmail").value || "").trim().toLowerCase();
   if (!email || !email.includes("@")) {
     setStatus("Enter a valid email.", "err"); return;
@@ -228,12 +234,44 @@ async function onboardStart() {
   setStatus("Sending magic link…");
   const r = await sendMagicLink(email);
   if (r.ok) {
-    await chrome.storage.local.set({ pendingEmail: email, userId: email });
+    await chrome.storage.local.set({
+      pendingEmail: email, userId: email, emailVerified: false,
+    });
     setStatus("Check your email.", "ok");
     await render();
   } else {
     const code = r.json?.error?.code || "UNKNOWN";
     setStatus(`Could not start: ${code}`, "err");
+  }
+}
+
+async function startAttesting() {
+  // "Start Attesting" button — unverified path. No magic link sent.
+  const email = ($("onboardEmail").value || "").trim().toLowerCase();
+  if (!email || !email.includes("@") || !email.includes(".")) {
+    setStatus("Enter a valid email.", "err"); return;
+  }
+  await chrome.storage.local.set({
+    userId: email,
+    emailVerified: false,
+    pendingEmail: "",
+  });
+  setStatus("Ready. Press Ctrl+Shift+A to attest.", "ok");
+  await render();
+}
+
+async function requestVerificationFromUnverified() {
+  // "Verify Now" link inside State 3u — upgrades an unverified user.
+  const { userId } = await loadSessionState();
+  if (!userId) return;
+  setStatus("Sending verification link…");
+  const r = await sendMagicLink(userId);
+  if (r.ok) {
+    await chrome.storage.local.set({ pendingEmail: userId });
+    setStatus("Check your email.", "ok");
+    await render();
+  } else {
+    setStatus("Could not send link. Try again later.", "err");
   }
 }
 
@@ -252,6 +290,7 @@ async function verifyPasted() {
   await chrome.storage.local.set({
     userId: s.email,
     pendingEmail: "",
+    emailVerified: true,     // magic-link click is proof of email ownership
     session: {
       token: s.session_token,
       expires_at: s.expires_at,
@@ -407,22 +446,69 @@ function bindFileDrop() {
 async function render() {
   const { n, s } = await determineState();
   showState(n);
-  if (n === 2 && $("pendingEmail")) {
+  if (n === "2" && $("pendingEmail")) {
     $("pendingEmail").textContent = s.pendingEmail;
   }
-  if (n === 3 || n === 4) {
+  if (n === "3" || n === "4") {
     await renderIdentity(s);
     await renderReceipts();
     await renderStats();
   }
+  if (n === "3u") {
+    // Unverified dashboard — populate the "U" mirror IDs.
+    if ($("currentIdentU")) $("currentIdentU").textContent = s.userId;
+    if ($("serverU")) $("serverU").value = s.server;
+    await renderReceiptsTo("receiptsU");
+    await renderStatsTo({ today: "statTodayU", total: "statTotalU", pending: "statPendingU" });
+  }
+}
+
+// Render receipts into a specific DOM id (so State 3u can reuse the same
+// list without colliding with State 3's #receipts div).
+async function renderReceiptsTo(targetId) {
+  const list = $(targetId);
+  if (!list) return;
+  const prev = list.id;
+  list.id = "receipts";
+  try { await renderReceipts(); } finally { list.id = prev; }
+}
+
+async function renderStatsTo(ids) {
+  const { receipts = [] } = await chrome.storage.local.get("receipts");
+  const today = new Date().toISOString().slice(0, 10);
+  const todayCount = receipts.filter(r => (r.ts || "").startsWith(today)).length;
+  const pending = receipts.filter(r => r.status === "pending").length;
+  if ($(ids.today)) $(ids.today).textContent = todayCount;
+  if ($(ids.total)) $(ids.total).textContent = receipts.length;
+  if ($(ids.pending)) $(ids.pending).textContent = pending;
 }
 
 // ---------- Event wiring ----------
 
 document.addEventListener("DOMContentLoaded", async () => {
+  // Check managed config first (Phase C.3: enterprise-deployed extensions
+  // may force verified flow). If the Workspace admin has pushed a policy,
+  // it overrides DEFAULT_SERVER and hides the Start-Attesting button.
+  try {
+    const managed = await chrome.storage.managed?.get?.(null);
+    if (managed && (managed.enterprise_server || managed.org_domain)) {
+      await chrome.storage.local.set({
+        managedConfig: managed,
+        server: managed.enterprise_server || DEFAULT_SERVER,
+        tier: managed.tier || "enterprise",
+      });
+      // In managed mode, hide the unverified path.
+      const btn = $("startAttesting");
+      if (btn) btn.style.display = "none";
+    }
+  } catch {}
+
   // State 1 handlers
   $("onboardStart")?.addEventListener("click", onboardStart);
-  $("onboardEmail")?.addEventListener("keydown", (e) => { if (e.key === "Enter") onboardStart(); });
+  $("startAttesting")?.addEventListener("click", startAttesting);
+  $("onboardEmail")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") onboardStart(); // Enter defaults to the recommended "Verify" path
+  });
 
   // State 2 handlers
   $("useLink")?.addEventListener("click", verifyPasted);
@@ -434,6 +520,32 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("health")?.addEventListener("click", checkHealth);
   $("logout")?.addEventListener("click", onLogout);
   $("sign")?.addEventListener("click", signManualText);
+
+  // State 3u (unverified) handlers
+  $("verifyNow")?.addEventListener("click", (e) => { e.preventDefault(); requestVerificationFromUnverified(); });
+  $("signU")?.addEventListener("click", async () => {
+    const ta = $("manualU"); if (!ta) return;
+    const text = ta.value;
+    if (!text.trim()) { setStatus("Paste some text first.", "err"); return; }
+    setStatus("Signing…");
+    const resp = await chrome.runtime.sendMessage({
+      type: "AIAUTH_SIGN_TEXT", text, source: "popup",
+    });
+    if (resp && resp.ok) {
+      setStatus(`Receipt: ${resp.receipt_code}`, "ok");
+      try { await navigator.clipboard.writeText(resp.receipt_code); } catch {}
+      ta.value = "";
+      await render();
+    } else {
+      setStatus((resp && resp.error) || "Failed", "err");
+    }
+  });
+  $("saveU")?.addEventListener("click", async () => {
+    const server = ($("serverU")?.value.trim() || DEFAULT_SERVER).replace(/\/+$/, "");
+    await chrome.storage.local.set({ server });
+    setStatus("Saved.", "ok");
+  });
+  $("changeEmailU")?.addEventListener("click", changeEmail);
 
   // State 5 handler
   $("reauthSend")?.addEventListener("click", async () => {
