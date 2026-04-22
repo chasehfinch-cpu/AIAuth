@@ -575,13 +575,25 @@ class ContentVerifyRequest(BaseModel):
 
 @app.post("/v1/verify/content")
 def verify_content(req: ContentVerifyRequest):
-    """Is this receipt authentic AND does the content match? Y/N."""
+    """Is this receipt authentic AND does the content match? Y/N.
+
+    Caller supplies a content_hash. The server compares against the
+    receipt's hash. Per CLAUDE.md Content Hashing Rules, browser text
+    attestations (>= v0.5.0) hash the NORMALIZED text while files hash
+    raw bytes. If the receipt predates v0.5.0 or was produced by a
+    normalization-inconsistent client, the supplied hash may not match
+    on the first try. The server currently accepts a single hash from
+    the caller — clients that want to verify text content should try
+    both raw and normalized hashing on their side and call this
+    endpoint twice if the first call returns content_matches=false.
+    """
     sig_ok = check_sig(req.receipt, req.signature)
     hash_ok = req.receipt.get("hash") == req.content_hash
     return {
         "authentic": sig_ok and hash_ok,
         "signature_valid": sig_ok,
         "content_matches": hash_ok,
+        "note": "For text receipts, try both raw and normalized hashing on the client if the first call returns content_matches=false.",
     }
 
 
