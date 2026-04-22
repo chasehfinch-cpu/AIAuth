@@ -13,6 +13,29 @@
 const DEFAULT_SERVER = "https://aiauth.app";
 const EXTENSION_VERSION = "0.5.0";
 
+// CLIENT_SECRET is embedded in the extension and rotated per release.
+// The server holds a matching value in its env var CLIENT_SECRET.
+// Not tamper-proof (determined user can extract) but raises the bar
+// for forged metadata. See CLAUDE.md "Metadata Integrity".
+const CLIENT_SECRET = "aiauth-ext-v0.5.0-dev-secret-rotate-per-release";
+
+// Per-tab session IDs grouping attestations from the same AI conversation.
+// Regenerated on any navigation within a tab.
+const tabSessions = {};
+chrome.tabs.onUpdated?.addListener((tabId, changeInfo) => {
+  if (changeInfo.url) {
+    tabSessions[tabId] = (crypto.randomUUID().replace(/-/g, "")).slice(0, 12);
+  }
+});
+chrome.tabs.onRemoved?.addListener((tabId) => { delete tabSessions[tabId]; });
+function getTabSessionId(tabId) {
+  if (tabId == null) return null;
+  if (!tabSessions[tabId]) {
+    tabSessions[tabId] = (crypto.randomUUID().replace(/-/g, "")).slice(0, 12);
+  }
+  return tabSessions[tabId];
+}
+
 // AI domain → {model, provider} map for auto-detection (Feature 1)
 const AI_DOMAINS = {
   "claude.ai":              { model: "claude",         provider: "anthropic" },
@@ -54,6 +77,74 @@ async function hashNormalized(text) {
   return sha256Hex(normalizeText(text));
 }
 
+// HMAC-SHA256 over "<version>:<timestamp>:<content_hash>". Server validates
+// the same input using CLIENT_SECRET from its env var. Gives us
+// client_integrity: "extension" on the signed receipt when valid.
+async function clientIntegrityHmac(contentHash, timestamp) {
+  const input = `${EXTENSION_VERSION}:${timestamp}:${contentHash}`;
+  const keyBytes = new TextEncoder().encode(CLIENT_SECRET);
+  const key = await crypto.subtle.importKey(
+    "raw", keyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(input));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Destination domain classification from a URL. Returns a spec-level
+// category (email/messaging/document-platform/code-repository) or null.
+const DEST_HOST_MAP = {
+  "mail.google.com": "email",
+  "outlook.office.com": "email",
+  "outlook.live.com": "email",
+  "slack.com": "messaging",
+  "app.slack.com": "messaging",
+  "teams.microsoft.com": "messaging",
+  "discord.com": "messaging",
+  "docs.google.com": "document-platform",
+  "notion.so": "document-platform",
+  "www.notion.so": "document-platform",
+  "github.com": "code-repository",
+  "gitlab.com": "code-repository",
+  "bitbucket.org": "code-repository",
+};
+function detectDestination(url) {
+  try {
+    const u = new URL(url);
+    for (const [host, kind] of Object.entries(DEST_HOST_MAP)) {
+      if (u.hostname === host || u.hostname.endsWith("." + host)) return kind;
+    }
+  } catch {}
+  return null;
+}
+
+// Enumerate open tabs that match known AI domains (commercial tier).
+async function enumerateConcurrentAIApps() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const found = new Set();
+    for (const tab of tabs) {
+      try {
+        const host = new URL(tab.url).hostname;
+        const match = AI_DOMAINS[host];
+        if (match) found.add(`${match.model}-web`);
+      } catch {}
+    }
+    return [...found].sort();
+  } catch {
+    return [];
+  }
+}
+
+// Classification heuristic — weak but better than nothing at attest time.
+// Returns: "financial" | "legal" | "client-facing" | "internal" | null
+function suggestClassification(sourceDomain, fileType, destExt) {
+  if (destExt === true) return "client-facing";
+  if (fileType === "spreadsheet") return "financial";
+  if (fileType === "code") return "internal";
+  if (sourceDomain && /legal|compliance/.test(sourceDomain)) return "legal";
+  return null;
+}
+
 // Lightweight file-type heuristic for browser text attestations.
 // Returns one of: spreadsheet, document, presentation, code, snippet, prose.
 function detectFileType(url, text) {
@@ -86,9 +177,11 @@ async function getTier() {
   return tier === "enterprise" ? "enterprise" : "free";
 }
 
-// Build the v0.5.0 sign-request body. Fields populated here are free-tier
-// fields; commercial-only fields are NEVER added by this build.
-async function buildSignBody({ text, sourceUrl, userId, promptText }) {
+// Build the v0.5.0 sign-request body. Free-tier fields are always
+// included. Commercial-only fields (tta, sid, dest, dest_ext,
+// classification, concurrent_ai_apps) are ADDED ONLY when tier
+// === "enterprise" (CLAUDE.md Integrity Rule #11).
+async function buildSignBody({ text, sourceUrl, userId, promptText, tta, tabId }) {
   const normalized = normalizeText(text);
   const output_hash = await sha256Hex(normalized);
 
@@ -103,6 +196,9 @@ async function buildSignBody({ text, sourceUrl, userId, promptText }) {
     }
   } catch {}
 
+  const file_type = detectFileType(sourceUrl || "", text);
+  const tier = await getTier();
+
   const body = {
     output_hash,
     user_id: userId,
@@ -114,8 +210,10 @@ async function buildSignBody({ text, sourceUrl, userId, promptText }) {
     len: normalized.length,
     source_domain: hostname || null,
     source_app: "Google Chrome",
-    file_type: detectFileType(sourceUrl || "", text),
-    client_integrity: "none", // Piece 6 will upgrade to "extension" with HMAC
+    file_type,
+    // Claim "extension" integrity; server validates HMAC and downgrades
+    // to "none" if the header is missing/invalid.
+    client_integrity: CLIENT_SECRET ? "extension" : "none",
   };
   if (model) body.model = model;
   if (provider) body.provider = provider;
@@ -128,23 +226,59 @@ async function buildSignBody({ text, sourceUrl, userId, promptText }) {
 
   // ai_markers: browser text attestations cannot inspect file metadata,
   // so we leave this null. Desktop agent populates it on file attests.
-  // (Explicitly omitted — server treats absence as null.)
+
+  // ---------- Enterprise-tier ONLY fields ----------
+  if (tier === "enterprise") {
+    if (tta != null) body.tta = tta;
+    const sid = getTabSessionId(tabId);
+    if (sid) body.sid = sid;
+
+    // Destination detection: what category of app did they paste INTO?
+    // Heuristic: if the current tab hostname matches a destination
+    // mapping AND is NOT an AI domain, treat the tab as the destination.
+    // For browser workflows the destination usually isn't known at
+    // attest time (user may paste later), so this is best-effort.
+    const destKind = (() => {
+      if (AI_DOMAINS[hostname]) return null; // AI tab, not a destination
+      return detectDestination(sourceUrl || "");
+    })();
+    if (destKind) {
+      body.dest = destKind;
+      // dest_ext: whether destination appears external to the user's org.
+      // Without an explicit org-domain config in the browser, we can't
+      // determine this reliably. Leave null; Piece 10 will let enterprise
+      // clients pre-configure owned domains.
+    }
+
+    const classification = suggestClassification(hostname, file_type, null);
+    if (classification) body.classification = classification;
+
+    const apps = await enumerateConcurrentAIApps();
+    if (apps.length) body.concurrent_ai_apps = apps;
+  }
 
   return body;
 }
 
-async function signContent(text, sourceUrl, promptText) {
+async function signContent(text, sourceUrl, promptText, tta, tabId) {
   if (!text || !text.trim()) throw new Error("No text to attest.");
   const { server, userId } = await getConfig();
   if (!userId) throw new Error("Set your email/name in the AIAuth popup first.");
 
-  const body = await buildSignBody({ text, sourceUrl, userId, promptText });
+  const body = await buildSignBody({ text, sourceUrl, userId, promptText, tta, tabId });
+
+  // Build HMAC headers for client_integrity="extension" validation
+  const timestamp = new Date().toISOString();
+  const clientHash = await clientIntegrityHmac(body.output_hash, timestamp);
 
   const res = await fetch(`${server}/v1/sign`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-AIAuth-Client": `chrome-extension/${EXTENSION_VERSION}`,
+      "X-AIAuth-Extension-Version": EXTENSION_VERSION,
+      "X-AIAuth-Timestamp": timestamp,
+      "X-AIAuth-Client-Hash": clientHash,
     },
     body: JSON.stringify(body),
   });
@@ -198,15 +332,21 @@ async function signHash(output_hash, source, note) {
     review_status: "approved",
     reviewer_id: userId,
     register: true,
-    client_integrity: "none",
+    client_integrity: CLIENT_SECRET ? "extension" : "none",
   };
   if (note) body.note = note;
+
+  const timestamp = new Date().toISOString();
+  const clientHash = await clientIntegrityHmac(output_hash, timestamp);
 
   const res = await fetch(`${server}/v1/sign`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-AIAuth-Client": `chrome-extension/${EXTENSION_VERSION}`,
+      "X-AIAuth-Extension-Version": EXTENSION_VERSION,
+      "X-AIAuth-Timestamp": timestamp,
+      "X-AIAuth-Client-Hash": clientHash,
     },
     body: JSON.stringify(body),
   });
@@ -269,9 +409,9 @@ async function notify(title, message) {
   } catch (e) {}
 }
 
-async function handleAttest(text, sourceUrl, tabId, promptText) {
+async function handleAttest(text, sourceUrl, tabId, promptText, tta) {
   try {
-    const data = await signContent(text, sourceUrl, promptText);
+    const data = await signContent(text, sourceUrl, promptText, tta, tabId);
     if (tabId) {
       chrome.tabs.sendMessage(tabId, {
         type: "AIAUTH_RESULT",
@@ -304,11 +444,12 @@ chrome.commands.onCommand.addListener(async (command) => {
     const resp = await chrome.tabs.sendMessage(tab.id, { type: "AIAUTH_GET_SELECTION" });
     const text = (resp && resp.text) || "";
     const promptText = (resp && resp.prompt_text) || null;
+    const tta = (resp && typeof resp.tta === "number") ? resp.tta : null;
     if (!text) {
       await notify("AIAuth", "Select some AI-generated text first, then press Ctrl+Shift+A.");
       return;
     }
-    await handleAttest(text, tab.url, tab.id, promptText);
+    await handleAttest(text, tab.url, tab.id, promptText, tta);
   } catch (e) {
     await notify("AIAuth", "Open a supported AI site (Claude, ChatGPT, Gemini, Copilot) and select text.");
   }
@@ -329,13 +470,15 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   // Context menu can't reach the content script synchronously, so try
   // to fetch the last user prompt if the tab has our content script injected.
   let promptText = null;
+  let tta = null;
   if (tab?.id) {
     try {
       const resp = await chrome.tabs.sendMessage(tab.id, { type: "AIAUTH_GET_SELECTION" });
       promptText = (resp && resp.prompt_text) || null;
+      tta = (resp && typeof resp.tta === "number") ? resp.tta : null;
     } catch {}
   }
-  await handleAttest(text, tab?.url, tab?.id, promptText);
+  await handleAttest(text, tab?.url, tab?.id, promptText, tta);
 });
 
 // Messages from popup

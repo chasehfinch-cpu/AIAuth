@@ -881,8 +881,50 @@ def _validate_sign_request(req: SignRequest) -> None:
         raise AIAuthError("INVALID_RECEIPT", "client_integrity must be one of: none, extension, os-verified", 400)
 
 
+def _validate_client_integrity(request: Request, claimed: Optional[str], content_hash: str) -> str:
+    """Return the ACTUAL client integrity level per CLAUDE.md "Metadata
+    Integrity". Downgrades invalid claims to 'none' — never upgrades.
+
+    Level 2 (extension): HMAC header X-AIAuth-Client-Hash over
+    <version>:<timestamp>:<content_hash> using CLIENT_SECRET. Requires
+    X-AIAuth-Extension-Version and X-AIAuth-Timestamp headers too.
+    """
+    if claimed != "extension" and claimed != "os-verified":
+        return "none"
+
+    if claimed == "extension":
+        if not CLIENT_SECRET:
+            return "none"  # server not configured for HMAC — cannot verify
+        ver = request.headers.get("x-aiauth-extension-version", "")
+        ts = request.headers.get("x-aiauth-timestamp", "")
+        supplied = request.headers.get("x-aiauth-client-hash", "")
+        if not ver or not ts or not supplied:
+            return "none"
+        # Timestamp freshness window: 5 minutes — prevents replay
+        try:
+            ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            drift = abs((datetime.now(timezone.utc) - ts_dt).total_seconds())
+            if drift > 300:
+                return "none"
+        except Exception:
+            return "none"
+        expected = hmac.new(
+            CLIENT_SECRET.encode(),
+            f"{ver}:{ts}:{content_hash}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(expected, supplied.lower()):
+            return "extension"
+        return "none"
+
+    # "os-verified" would require per-agent cert verification; deferred.
+    # Accept the claim only if the server has been configured to trust
+    # the agent out of band (not implemented in v0.5.0 — downgrade).
+    return "none"
+
+
 @app.post("/v1/sign")
-def sign_receipt(req: SignRequest):
+def sign_receipt(req: SignRequest, request: Request):
     """
     Sign an attestation receipt and return it.
 
@@ -952,8 +994,9 @@ def sign_receipt(req: SignRequest):
     if req.content_length is not None: receipt["len"] = req.content_length
     if req.doc_id: receipt["doc_id"] = req.doc_id
     if req.ai_markers: receipt["ai_markers"] = req.ai_markers
-    # client_integrity: default to "none" if absent so downstream consumers always have a value
-    receipt["client_integrity"] = req.client_integrity or "none"
+    # client_integrity: validate against HMAC header. Downgrades-only:
+    # an invalid claim becomes "none"; never upgrades above what client requested.
+    receipt["client_integrity"] = _validate_client_integrity(request, req.client_integrity, req.output_hash)
 
     # v0.5.0 commercial-tier fields (server accepts whatever the client sends)
     if req.tta is not None: receipt["tta"] = req.tta

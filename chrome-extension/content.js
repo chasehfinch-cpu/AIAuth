@@ -2,12 +2,37 @@
 // Responsibilities:
 //   1. Return the current text selection when asked
 //   2. Detect the most recent user prompt on the page (for prompt_hash)
-//   3. Show a toast with the receipt code after signing
-//   4. Copy the receipt code to clipboard
+//   3. Track time since last AI output (for TTA — enterprise tier)
+//   4. Show a toast with the receipt code after signing
+//   5. Copy the receipt code to clipboard
+
+// Track when the AI last produced content — used for Time-to-Attest.
+// A MutationObserver on the main chat surface records the timestamp of
+// the latest DOM mutation that likely represents an AI-authored change.
+let lastAIResponseTime = null;
+try {
+  const target = document.querySelector("main") || document.body;
+  const observer = new MutationObserver(() => {
+    // Any mutation on the main chat surface counts — we don't try to
+    // distinguish user edits from AI output (would require per-platform
+    // selectors that break frequently). Worst case: TTA is lower than
+    // actual think time, which is a conservative bias toward detecting
+    // rubber-stamping.
+    lastAIResponseTime = Date.now();
+  });
+  observer.observe(target, { childList: true, subtree: true, characterData: true });
+} catch (e) {
+  // DOM not ready — mutation observer unavailable. TTA will be null.
+}
 
 function getSelectionText() {
   const sel = window.getSelection();
   return sel ? sel.toString() : "";
+}
+
+function getTimeToAttest() {
+  if (!lastAIResponseTime) return null;
+  return Math.max(0, Math.round((Date.now() - lastAIResponseTime) / 1000));
 }
 
 // Detect the most recent user-turn prompt text on the current AI page.
@@ -86,6 +111,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({
       text: getSelectionText(),
       prompt_text: getLastUserPromptText(),
+      tta: getTimeToAttest(),
     });
     return;
   }
