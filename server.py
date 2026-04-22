@@ -54,6 +54,13 @@ SERVER_SECRET = os.getenv("SERVER_SECRET", "")   # HMAC secret for magic-link + 
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")   # HMAC secret for extension client_integrity (Piece 9)
 PUBLIC_BASE_URL = os.getenv("AIAUTH_PUBLIC_URL", "https://aiauth.app")  # base URL for magic-link emails
 DEDUP_WINDOW = int(os.getenv("AIAUTH_DEDUP_WINDOW", "300"))  # seconds; 0 disables dedup
+LICENSE_GRACE_DAYS = int(os.getenv("AIAUTH_LICENSE_GRACE_DAYS", "30"))  # grace period after license expiry
+
+# Dual-secret rotation support (Piece 13): when rotating SERVER_SECRET, set
+# this to the PREVIOUS value for a transitional window. Email hashes and
+# Fernet ciphertext encrypted with the old secret remain verifiable while
+# new traffic uses the new secret.
+SERVER_SECRET_PREVIOUS = os.getenv("SERVER_SECRET_PREVIOUS", "")
 
 # Regex for SHA-256 hex (lowercase or uppercase)
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -73,20 +80,21 @@ _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 import hmac as _hmac_mod
 import hashlib as _hashlib_mod
 
-_EMAIL_HASH_SALT: bytes = b""        # populated at startup (if SERVER_SECRET set)
-_DB_ENCRYPTION_KEY: bytes = b""      # populated at startup
+_EMAIL_HASH_SALT: bytes = b""         # populated at startup (if SERVER_SECRET set)
+_EMAIL_HASH_SALT_PREV: bytes = b""    # populated at startup (if SERVER_SECRET_PREVIOUS set)
+_DB_ENCRYPTION_KEY: bytes = b""       # populated at startup
 _FERNET = None                        # populated at startup
+_FERNET_MULTI = None                  # MultiFernet with [new, old] if SERVER_SECRET_PREVIOUS is set
 
 
 def _derive_hardening_keys() -> None:
     """Derive email-hash salt and DB encryption key from SERVER_SECRET.
-    Called once at import time AFTER SERVER_SECRET is known. Safe to
-    re-run; idempotent."""
-    global _EMAIL_HASH_SALT, _DB_ENCRYPTION_KEY, _FERNET
+    If SERVER_SECRET_PREVIOUS is set, also derive PREV salt + a MultiFernet
+    that reads old-encrypted values while encrypting new ones with the
+    current key. Idempotent; safe to re-run."""
+    global _EMAIL_HASH_SALT, _EMAIL_HASH_SALT_PREV
+    global _DB_ENCRYPTION_KEY, _FERNET, _FERNET_MULTI
     if not SERVER_SECRET:
-        # Not configured — hardening helpers degrade to passthrough
-        # so dev/test without SERVER_SECRET still works. Production
-        # MUST set SERVER_SECRET.
         return
     _EMAIL_HASH_SALT = _hmac_mod.new(
         SERVER_SECRET.encode(), b"email-hash-v1", _hashlib_mod.sha256
@@ -94,11 +102,43 @@ def _derive_hardening_keys() -> None:
     _DB_ENCRYPTION_KEY = _hmac_mod.new(
         SERVER_SECRET.encode(), b"db-encrypt-v1", _hashlib_mod.sha256
     ).digest()  # 32 bytes
+
     try:
-        from cryptography.fernet import Fernet as _Fernet
+        from cryptography.fernet import Fernet as _Fernet, MultiFernet as _MultiFernet
         _FERNET = _Fernet(base64.urlsafe_b64encode(_DB_ENCRYPTION_KEY))
+
+        if SERVER_SECRET_PREVIOUS:
+            _EMAIL_HASH_SALT_PREV = _hmac_mod.new(
+                SERVER_SECRET_PREVIOUS.encode(), b"email-hash-v1", _hashlib_mod.sha256
+            ).digest()
+            prev_key = _hmac_mod.new(
+                SERVER_SECRET_PREVIOUS.encode(), b"db-encrypt-v1", _hashlib_mod.sha256
+            ).digest()
+            _FERNET_MULTI = _MultiFernet([
+                _FERNET,
+                _Fernet(base64.urlsafe_b64encode(prev_key)),
+            ])
+        else:
+            _FERNET_MULTI = None
     except Exception:
         _FERNET = None
+        _FERNET_MULTI = None
+
+
+def email_hash_candidates(email: str) -> List[str]:
+    """Return the list of email_hash values to check during lookup when
+    rotation is in progress: [new_hash, old_hash]. Callers use this to
+    JOIN/IN-match during the rotation window so users linked under the
+    old secret still resolve."""
+    norm = (email or "").strip().lower()
+    if not norm:
+        return []
+    out = [email_hash(norm)]
+    if _EMAIL_HASH_SALT_PREV:
+        out.append(_hmac_mod.new(
+            _EMAIL_HASH_SALT_PREV, norm.encode("utf-8"), _hashlib_mod.sha256
+        ).hexdigest())
+    return out
 
 
 def email_hash(email: str) -> str:
@@ -129,18 +169,20 @@ def encrypt_value(plaintext: str) -> str:
 
 def decrypt_value(ciphertext: str) -> str:
     """Inverse of encrypt_value. Returns empty string on decryption
-    failure — caller should treat that as "data unavailable" rather
-    than erroring out."""
+    failure. During SERVER_SECRET rotation, tries the MultiFernet
+    (new + previous) so values encrypted with the old key still decrypt."""
     if not ciphertext:
         return ""
     if ciphertext.startswith("NOENC:"):
         return ciphertext[6:]
-    if _FERNET is None:
-        return ""
     try:
-        return _FERNET.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+        if _FERNET_MULTI is not None:
+            return _FERNET_MULTI.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+        if _FERNET is not None:
+            return _FERNET.decrypt(ciphertext.encode("ascii")).decode("utf-8")
     except Exception:
-        return ""
+        pass
+    return ""
 
 
 # Derive now. If SERVER_SECRET is set later (e.g., env loaded after import),
@@ -213,17 +255,30 @@ def _match_rate_endpoint(path: str) -> Optional[str]:
     return None
 
 
+def _apply_license_headers(response) -> None:
+    """Inject license-expiry headers if the server is running on an
+    expired-but-in-grace license. Called after every response."""
+    if ENTERPRISE_LICENSE and ENTERPRISE_LICENSE.get("expired"):
+        response.headers["X-AIAuth-License-Expired"] = "true"
+        rem = ENTERPRISE_LICENSE.get("grace_remaining_days")
+        if rem is not None:
+            response.headers["X-AIAuth-License-Grace-Days"] = str(rem)
+
+
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     endpoint_key = _match_rate_endpoint(request.url.path)
     if endpoint_key is None:
-        return await call_next(request)
+        # Still need to add license-expiry header to non-rate-limited routes.
+        response = await call_next(request)
+        _apply_license_headers(response)
+        return response
 
     cfg = RATE_LIMITS[endpoint_key]
     ip = _client_ip(request)
 
     def _reject(window: int, limit: int):
-        return JSONResponse(
+        resp = JSONResponse(
             status_code=429,
             content={"error": {
                 "code": "RATE_LIMITED",
@@ -231,6 +286,8 @@ async def rate_limit_middleware(request: Request, call_next):
                 "details": {"window_seconds": window, "limit": limit, "endpoint": endpoint_key},
             }},
         )
+        _apply_license_headers(resp)
+        return resp
 
     if "per_ip_per_min" in cfg:
         limit = cfg["per_ip_per_min"]
@@ -241,12 +298,9 @@ async def rate_limit_middleware(request: Request, call_next):
         if not _rate_check((endpoint_key, "ip-hr", ip), 3600, limit):
             return _reject(3600, limit)
 
-    # X-AIAuth-Client header is advisory on /v1/sign* — we log absence but
-    # do NOT reject (preserves backward compat with curl tests and older
-    # clients). Enterprise tier may enforce in the future via policy engine.
-    # (Intentional no-op here.)
-
-    return await call_next(request)
+    response = await call_next(request)
+    _apply_license_headers(response)
+    return response
 
 
 # ===================================================================
@@ -545,7 +599,17 @@ def generate_license(company: str, tier: str = "enterprise",
 
 
 def validate_license(license_key: str) -> dict:
-    """Validate a license key. Returns license data if valid, None if not."""
+    """Validate a license key. Returns license data if valid (including
+    expired-but-in-grace), None if signature invalid, past grace period,
+    or unparseable.
+
+    Piece 13: soft-fail behavior. A billing lapse must never lock a
+    customer out of their own historical data. We add a grace period
+    (default 30 days, AIAUTH_LICENSE_GRACE_DAYS env override). Within
+    grace, the license still validates but the returned dict has
+    `expired: True` and `grace_remaining_days`. After grace, returns
+    None — enterprise features gate off, but /v1/sign and all
+    verification paths continue to work."""
     if not license_key:
         return None
     try:
@@ -558,17 +622,22 @@ def validate_license(license_key: str) -> dict:
 
         if data.get("type") != "aiauth_license":
             return None
-
-        # Verify signature using server's own key
         if not check_sig(data, sig):
             return None
 
-        # Check expiry
+        data["expired"] = False
+        data["grace_remaining_days"] = None
         if data.get("expires"):
             exp = datetime.fromisoformat(data["expires"])
-            if datetime.now(timezone.utc) > exp:
-                return None
-
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if now > exp:
+                grace_end = exp + timedelta(days=LICENSE_GRACE_DAYS)
+                if now > grace_end:
+                    return None  # past grace; hard-fail
+                data["expired"] = True
+                data["grace_remaining_days"] = (grace_end - now).days
         return data
     except Exception:
         return None
@@ -583,11 +652,15 @@ if MODE == "enterprise":
         print(f"[AIAuth]   Tier: {ENTERPRISE_LICENSE.get('tier')}")
         exp = ENTERPRISE_LICENSE.get("expires", "never")
         print(f"[AIAuth]   Expires: {exp}")
+        if ENTERPRISE_LICENSE.get("expired"):
+            print(f"[AIAuth]   WARNING: license EXPIRED. Running in grace period "
+                  f"({ENTERPRISE_LICENSE.get('grace_remaining_days')} days remaining). "
+                  f"Contact sales@aiauth.app to renew.")
     else:
-        print("[AIAuth] WARNING: Enterprise mode requested but no valid license key found.")
-        print("[AIAuth]   Set AIAUTH_LICENSE_KEY or run in public mode.")
-        print("[AIAuth]   Enterprise features will be disabled.")
-        MODE = "public"  # Fall back to public mode
+        print("[AIAuth] WARNING: Enterprise mode requested but no valid license key found "
+              "(either invalid signature or past grace period).")
+        print("[AIAuth]   Enterprise features will be disabled; attestation signing continues.")
+        MODE = "public"
 
 
 def require_enterprise():
@@ -885,9 +958,14 @@ def _verify_token(token: str) -> Optional[dict]:
     try:
         data_b64, sig_b64 = token.split(".", 1)
         canonical = _b64url_decode(data_b64)
-        expected = hmac.new(SERVER_SECRET.encode(), canonical, hashlib.sha256).digest()
         actual = _b64url_decode(sig_b64)
-        if not hmac.compare_digest(expected, actual):
+        # Try the current secret; if dual-secret rotation is active, fall back.
+        expected = hmac.new(SERVER_SECRET.encode(), canonical, hashlib.sha256).digest()
+        valid = hmac.compare_digest(expected, actual)
+        if not valid and SERVER_SECRET_PREVIOUS:
+            expected_prev = hmac.new(SERVER_SECRET_PREVIOUS.encode(), canonical, hashlib.sha256).digest()
+            valid = hmac.compare_digest(expected_prev, actual)
+        if not valid:
             return None
         payload = json.loads(canonical)
         exp = payload.get("expires_at")
@@ -1004,17 +1082,19 @@ def _require_session(authorization: Optional[str]) -> dict:
 
 def _find_account_by_email(email: str) -> Optional[sqlite3.Row]:
     """Look up an account_emails row by plaintext email. Hashes the
-    email with the server-side salt and queries by email_hash. Returns
-    None if not found."""
-    h = email_hash(email)
-    if not h:
+    email with the server-side salt and queries by email_hash. If a
+    SERVER_SECRET rotation is in progress, also looks up by the old-salt
+    hash. Returns None if not found."""
+    candidates = email_hash_candidates(email)
+    if not candidates:
         return None
     conn = get_db()
+    placeholders = ",".join("?" * len(candidates))
     row = conn.execute(
-        "SELECT ae.*, a.account_id AS acct_id FROM account_emails ae "
-        "JOIN accounts a ON ae.account_id = a.account_id "
-        "WHERE ae.email_hash = ?",
-        (h,),
+        f"SELECT ae.*, a.account_id AS acct_id FROM account_emails ae "
+        f"JOIN accounts a ON ae.account_id = a.account_id "
+        f"WHERE ae.email_hash IN ({placeholders})",
+        candidates,
     ).fetchone()
     conn.close()
     return row
