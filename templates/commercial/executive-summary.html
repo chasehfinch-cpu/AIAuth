@@ -64,6 +64,14 @@
     <h1>Executive Summary</h1>
     <div class="sub" id="subhead">Loading…</div>
 
+    <div id="companyPersonalize" style="display:none;background:#fff;border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:16px;">
+      <label for="companyInput" style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px;">Personalize this demo for your company:</label>
+      <div style="display:flex;gap:8px;">
+        <input id="companyInput" placeholder="Your company name" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;font:inherit;" />
+        <button id="companyApply" style="padding:8px 14px;background:var(--blue);color:white;border:0;border-radius:6px;font:inherit;font-weight:600;cursor:pointer;">Update</button>
+      </div>
+    </div>
+
     <div class="synthetic-warning" id="syntheticNotice" style="display:none;">
       <strong>Demo data.</strong> This report is generated from synthetic patterns representative of a mid-size financial services firm.
       Real pilots use your organization's actual attestation data.
@@ -120,6 +128,23 @@
         </thead>
         <tbody id="shadowRows"></tbody>
       </table>
+    </div>
+
+    <h2>Start a 30-Day Free Pilot</h2>
+    <div class="card" style="background:linear-gradient(180deg,#eff6ff,#fff);">
+      <p style="font-size:14px;color:var(--muted);margin-bottom:14px;line-height:1.55;">
+        AIAuth Enterprise runs on your infrastructure — self-hosted only. No AIAuth access to your data.
+        Get a license, spin up your own server in one command, point your extension at it. We'll send you
+        the install package and license key within 24 hours.
+      </p>
+      <form id="pilotForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <input name="company" id="pilotCompany" required placeholder="Company name" style="padding:10px;border:1px solid var(--border);border-radius:8px;font:inherit;" />
+        <input name="admin_email" required type="email" placeholder="Admin email" style="padding:10px;border:1px solid var(--border);border-radius:8px;font:inherit;" />
+        <input name="user_count" required type="number" min="1" placeholder="Estimated users (e.g. 50)" style="padding:10px;border:1px solid var(--border);border-radius:8px;font:inherit;" />
+        <input name="industry" required placeholder="Industry (e.g. Financial Services)" style="padding:10px;border:1px solid var(--border);border-radius:8px;font:inherit;" />
+        <button type="submit" style="grid-column:1/-1;padding:12px;background:var(--blue);color:white;border:0;border-radius:8px;font:inherit;font-weight:600;cursor:pointer;">Request a Pilot →</button>
+      </form>
+      <div id="pilotStatus" style="margin-top:10px;font-size:13px;"></div>
     </div>
 
     <footer>
@@ -224,6 +249,64 @@
     render().catch((e) => {
       document.getElementById("subhead").textContent = "Error loading data: " + e.message;
     });
+
+    // Company personalization (synthetic-data only)
+    (function(){
+      const qp = new URLSearchParams(location.search);
+      if (qp.get("source") === "live") return;  // don't show input on live dashboards
+      const box = document.getElementById("companyPersonalize");
+      const input = document.getElementById("companyInput");
+      const apply = document.getElementById("companyApply");
+      if (!box || !input || !apply) return;
+      box.style.display = "";
+      input.value = qp.get("company") || "";
+      apply.onclick = () => {
+        const v = input.value.trim();
+        if (!v) return;
+        const url = new URL(location.href);
+        url.searchParams.set("company", v);
+        location.href = url.toString();
+      };
+      input.addEventListener("keydown", e => { if (e.key === "Enter") apply.click(); });
+    })();
+
+    // Pilot-request form submission -> POST /v1/pilot/interest
+    (function(){
+      const form = document.getElementById("pilotForm");
+      const status = document.getElementById("pilotStatus");
+      if (!form) return;
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        status.textContent = "Submitting…";
+        status.style.color = "#64748b";
+        const fd = new FormData(form);
+        const payload = {
+          company: fd.get("company"),
+          admin_email: fd.get("admin_email"),
+          user_count: Number(fd.get("user_count")),
+          industry: fd.get("industry"),
+        };
+        try {
+          const res = await fetch("/v1/pilot/interest", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            status.textContent = "Thanks — we'll email you within 24 hours with your license key and install package.";
+            status.style.color = "#16a34a";
+            form.reset();
+          } else {
+            status.textContent = "Couldn't submit: " + (data.error?.message || res.status);
+            status.style.color = "#dc2626";
+          }
+        } catch(err) {
+          status.textContent = "Network error: " + err.message;
+          status.style.color = "#dc2626";
+        }
+      });
+    })();
   </script>
 </body>
 </html>

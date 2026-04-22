@@ -54,9 +54,141 @@ SERVER_SECRET = os.getenv("SERVER_SECRET", "")   # HMAC secret for magic-link + 
 CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")   # HMAC secret for extension client_integrity (Piece 9)
 PUBLIC_BASE_URL = os.getenv("AIAUTH_PUBLIC_URL", "https://aiauth.app")  # base URL for magic-link emails
 DEDUP_WINDOW = int(os.getenv("AIAUTH_DEDUP_WINDOW", "300"))  # seconds; 0 disables dedup
+LICENSE_GRACE_DAYS = int(os.getenv("AIAUTH_LICENSE_GRACE_DAYS", "30"))  # grace period after license expiry
+
+# Dual-secret rotation support (Piece 13): when rotating SERVER_SECRET, set
+# this to the PREVIOUS value for a transitional window. Email hashes and
+# Fernet ciphertext encrypted with the old secret remain verifiable while
+# new traffic uses the new secret.
+SERVER_SECRET_PREVIOUS = os.getenv("SERVER_SECRET_PREVIOUS", "")
 
 # Regex for SHA-256 hex (lowercase or uppercase)
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+# ===================================================================
+# ANTI-FORENSIC HARDENING (Piece 12, v0.5.1)
+# The account system (Piece 7) stored emails in plaintext. If the
+# server is compromised, an attacker should get HMAC hashes and
+# ciphertext — not readable emails. See CLAUDE.md "Data Hardening".
+#
+# Keys are DERIVED from SERVER_SECRET at startup — nothing extra in
+# .env to manage, nothing extra to rotate. If SERVER_SECRET itself
+# leaks or rotates, see scripts/rotate_server_secret.py (Piece 13).
+# ===================================================================
+
+import hmac as _hmac_mod
+import hashlib as _hashlib_mod
+
+_EMAIL_HASH_SALT: bytes = b""         # populated at startup (if SERVER_SECRET set)
+_EMAIL_HASH_SALT_PREV: bytes = b""    # populated at startup (if SERVER_SECRET_PREVIOUS set)
+_DB_ENCRYPTION_KEY: bytes = b""       # populated at startup
+_FERNET = None                        # populated at startup
+_FERNET_MULTI = None                  # MultiFernet with [new, old] if SERVER_SECRET_PREVIOUS is set
+
+
+def _derive_hardening_keys() -> None:
+    """Derive email-hash salt and DB encryption key from SERVER_SECRET.
+    If SERVER_SECRET_PREVIOUS is set, also derive PREV salt + a MultiFernet
+    that reads old-encrypted values while encrypting new ones with the
+    current key. Idempotent; safe to re-run."""
+    global _EMAIL_HASH_SALT, _EMAIL_HASH_SALT_PREV
+    global _DB_ENCRYPTION_KEY, _FERNET, _FERNET_MULTI
+    if not SERVER_SECRET:
+        return
+    _EMAIL_HASH_SALT = _hmac_mod.new(
+        SERVER_SECRET.encode(), b"email-hash-v1", _hashlib_mod.sha256
+    ).digest()
+    _DB_ENCRYPTION_KEY = _hmac_mod.new(
+        SERVER_SECRET.encode(), b"db-encrypt-v1", _hashlib_mod.sha256
+    ).digest()  # 32 bytes
+
+    try:
+        from cryptography.fernet import Fernet as _Fernet, MultiFernet as _MultiFernet
+        _FERNET = _Fernet(base64.urlsafe_b64encode(_DB_ENCRYPTION_KEY))
+
+        if SERVER_SECRET_PREVIOUS:
+            _EMAIL_HASH_SALT_PREV = _hmac_mod.new(
+                SERVER_SECRET_PREVIOUS.encode(), b"email-hash-v1", _hashlib_mod.sha256
+            ).digest()
+            prev_key = _hmac_mod.new(
+                SERVER_SECRET_PREVIOUS.encode(), b"db-encrypt-v1", _hashlib_mod.sha256
+            ).digest()
+            _FERNET_MULTI = _MultiFernet([
+                _FERNET,
+                _Fernet(base64.urlsafe_b64encode(prev_key)),
+            ])
+        else:
+            _FERNET_MULTI = None
+    except Exception:
+        _FERNET = None
+        _FERNET_MULTI = None
+
+
+def email_hash_candidates(email: str) -> List[str]:
+    """Return the list of email_hash values to check during lookup when
+    rotation is in progress: [new_hash, old_hash]. Callers use this to
+    JOIN/IN-match during the rotation window so users linked under the
+    old secret still resolve."""
+    norm = (email or "").strip().lower()
+    if not norm:
+        return []
+    out = [email_hash(norm)]
+    if _EMAIL_HASH_SALT_PREV:
+        out.append(_hmac_mod.new(
+            _EMAIL_HASH_SALT_PREV, norm.encode("utf-8"), _hashlib_mod.sha256
+        ).hexdigest())
+    return out
+
+
+def email_hash(email: str) -> str:
+    """Return a deterministic, salt-HMAC hash suitable for use as a
+    lookup index for an email address. Normalizes (lowercase + trim)
+    before hashing. 64-char hex. If SERVER_SECRET is not configured,
+    returns a SHA-256 of the normalized email (dev/test fallback — not
+    for production)."""
+    norm = (email or "").strip().lower()
+    if not norm:
+        return ""
+    if _EMAIL_HASH_SALT:
+        return _hmac_mod.new(_EMAIL_HASH_SALT, norm.encode("utf-8"), _hashlib_mod.sha256).hexdigest()
+    return _hashlib_mod.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def encrypt_value(plaintext: str) -> str:
+    """Fernet-encrypt a string. Returns base64 ciphertext (URL-safe).
+    If Fernet is unavailable, returns the plaintext prefixed with
+    `NOENC:` so it's obviously NOT ciphertext in a DB dump — but this
+    is only for dev/test; production MUST have SERVER_SECRET set."""
+    if not plaintext:
+        return ""
+    if _FERNET is not None:
+        return _FERNET.encrypt(plaintext.encode("utf-8")).decode("ascii")
+    return "NOENC:" + plaintext
+
+
+def decrypt_value(ciphertext: str) -> str:
+    """Inverse of encrypt_value. Returns empty string on decryption
+    failure. During SERVER_SECRET rotation, tries the MultiFernet
+    (new + previous) so values encrypted with the old key still decrypt."""
+    if not ciphertext:
+        return ""
+    if ciphertext.startswith("NOENC:"):
+        return ciphertext[6:]
+    try:
+        if _FERNET_MULTI is not None:
+            return _FERNET_MULTI.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+        if _FERNET is not None:
+            return _FERNET.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+    except Exception:
+        pass
+    return ""
+
+
+# Derive now. If SERVER_SECRET is set later (e.g., env loaded after import),
+# call _derive_hardening_keys() again manually.
+_derive_hardening_keys()
+
 
 app = FastAPI(title="AIAuth", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -123,17 +255,30 @@ def _match_rate_endpoint(path: str) -> Optional[str]:
     return None
 
 
+def _apply_license_headers(response) -> None:
+    """Inject license-expiry headers if the server is running on an
+    expired-but-in-grace license. Called after every response."""
+    if ENTERPRISE_LICENSE and ENTERPRISE_LICENSE.get("expired"):
+        response.headers["X-AIAuth-License-Expired"] = "true"
+        rem = ENTERPRISE_LICENSE.get("grace_remaining_days")
+        if rem is not None:
+            response.headers["X-AIAuth-License-Grace-Days"] = str(rem)
+
+
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     endpoint_key = _match_rate_endpoint(request.url.path)
     if endpoint_key is None:
-        return await call_next(request)
+        # Still need to add license-expiry header to non-rate-limited routes.
+        response = await call_next(request)
+        _apply_license_headers(response)
+        return response
 
     cfg = RATE_LIMITS[endpoint_key]
     ip = _client_ip(request)
 
     def _reject(window: int, limit: int):
-        return JSONResponse(
+        resp = JSONResponse(
             status_code=429,
             content={"error": {
                 "code": "RATE_LIMITED",
@@ -141,6 +286,8 @@ async def rate_limit_middleware(request: Request, call_next):
                 "details": {"window_seconds": window, "limit": limit, "endpoint": endpoint_key},
             }},
         )
+        _apply_license_headers(resp)
+        return resp
 
     if "per_ip_per_min" in cfg:
         limit = cfg["per_ip_per_min"]
@@ -151,12 +298,9 @@ async def rate_limit_middleware(request: Request, call_next):
         if not _rate_check((endpoint_key, "ip-hr", ip), 3600, limit):
             return _reject(3600, limit)
 
-    # X-AIAuth-Client header is advisory on /v1/sign* — we log absence but
-    # do NOT reject (preserves backward compat with curl tests and older
-    # clients). Enterprise tier may enforce in the future via policy engine.
-    # (Intentional no-op here.)
-
-    return await call_next(request)
+    response = await call_next(request)
+    _apply_license_headers(response)
+    return response
 
 
 # ===================================================================
@@ -455,7 +599,17 @@ def generate_license(company: str, tier: str = "enterprise",
 
 
 def validate_license(license_key: str) -> dict:
-    """Validate a license key. Returns license data if valid, None if not."""
+    """Validate a license key. Returns license data if valid (including
+    expired-but-in-grace), None if signature invalid, past grace period,
+    or unparseable.
+
+    Piece 13: soft-fail behavior. A billing lapse must never lock a
+    customer out of their own historical data. We add a grace period
+    (default 30 days, AIAUTH_LICENSE_GRACE_DAYS env override). Within
+    grace, the license still validates but the returned dict has
+    `expired: True` and `grace_remaining_days`. After grace, returns
+    None — enterprise features gate off, but /v1/sign and all
+    verification paths continue to work."""
     if not license_key:
         return None
     try:
@@ -468,17 +622,22 @@ def validate_license(license_key: str) -> dict:
 
         if data.get("type") != "aiauth_license":
             return None
-
-        # Verify signature using server's own key
         if not check_sig(data, sig):
             return None
 
-        # Check expiry
+        data["expired"] = False
+        data["grace_remaining_days"] = None
         if data.get("expires"):
             exp = datetime.fromisoformat(data["expires"])
-            if datetime.now(timezone.utc) > exp:
-                return None
-
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if now > exp:
+                grace_end = exp + timedelta(days=LICENSE_GRACE_DAYS)
+                if now > grace_end:
+                    return None  # past grace; hard-fail
+                data["expired"] = True
+                data["grace_remaining_days"] = (grace_end - now).days
         return data
     except Exception:
         return None
@@ -493,11 +652,15 @@ if MODE == "enterprise":
         print(f"[AIAuth]   Tier: {ENTERPRISE_LICENSE.get('tier')}")
         exp = ENTERPRISE_LICENSE.get("expires", "never")
         print(f"[AIAuth]   Expires: {exp}")
+        if ENTERPRISE_LICENSE.get("expired"):
+            print(f"[AIAuth]   WARNING: license EXPIRED. Running in grace period "
+                  f"({ENTERPRISE_LICENSE.get('grace_remaining_days')} days remaining). "
+                  f"Contact sales@aiauth.app to renew.")
     else:
-        print("[AIAuth] WARNING: Enterprise mode requested but no valid license key found.")
-        print("[AIAuth]   Set AIAUTH_LICENSE_KEY or run in public mode.")
-        print("[AIAuth]   Enterprise features will be disabled.")
-        MODE = "public"  # Fall back to public mode
+        print("[AIAuth] WARNING: Enterprise mode requested but no valid license key found "
+              "(either invalid signature or past grace period).")
+        print("[AIAuth]   Enterprise features will be disabled; attestation signing continues.")
+        MODE = "public"
 
 
 def require_enterprise():
@@ -535,29 +698,41 @@ def init_registry():
         parent_hash   TEXT,
         registered_at TEXT NOT NULL
     )""")
-    # v0.5.0 migration: add doc_id column if missing (idempotent, safe to re-run)
+    # v0.5.0 migration: add doc_id column if missing (idempotent)
+    # v0.5.1 migration: add content_hash_canonical column (6th col)
     existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(hash_registry)").fetchall()}
     if "doc_id" not in existing_cols:
         conn.execute("ALTER TABLE hash_registry ADD COLUMN doc_id TEXT")
+    if "content_hash_canonical" not in existing_cols:
+        conn.execute("ALTER TABLE hash_registry ADD COLUMN content_hash_canonical TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_hash ON hash_registry(content_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_parent ON hash_registry(parent_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_receipt ON hash_registry(receipt_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_doc_id ON hash_registry(doc_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_canonical ON hash_registry(content_hash_canonical)")
     conn.commit()
     conn.close()
 
 init_registry()
 
-def register_hash(content_hash: str, receipt_id: str, parent_hash: str = None, doc_id: str = None):
+def register_hash(content_hash: str, receipt_id: str, parent_hash: str = None,
+                  doc_id: str = None, content_hash_canonical: str = None):
     """Add an entry to the public registry. No user data stored.
 
-    Five columns only (per Core Principle #3): content_hash, receipt_id,
-    parent_hash, doc_id, registered_at. No uid, no model, no prompt_hash.
+    Six columns (per Integrity Rule #3, post v0.5.1): content_hash,
+    receipt_id, parent_hash, doc_id, content_hash_canonical, registered_at.
+    All are hashes — still PII-free. The sixth column enables cross-format
+    chain discovery (Piece 14): xlsx -> csv -> pdf of the same logical
+    content share a content_hash_canonical, even though their byte
+    hashes all differ.
     """
     conn = get_registry()
     conn.execute(
-        "INSERT INTO hash_registry (content_hash, receipt_id, parent_hash, doc_id, registered_at) VALUES (?,?,?,?,?)",
-        (content_hash, receipt_id, parent_hash, doc_id, datetime.now(timezone.utc).isoformat())
+        "INSERT INTO hash_registry "
+        "(content_hash, receipt_id, parent_hash, doc_id, content_hash_canonical, registered_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (content_hash, receipt_id, parent_hash, doc_id, content_hash_canonical,
+         datetime.now(timezone.utc).isoformat())
     )
     conn.commit()
     conn.close()
@@ -611,22 +786,24 @@ def init_db():
 
     # ---------------- Accounts (always, all modes) ----------------
     conn.execute("""CREATE TABLE IF NOT EXISTS accounts (
-        account_id    TEXT PRIMARY KEY,
-        primary_email TEXT NOT NULL,
-        created_at    TEXT NOT NULL,
-        updated_at    TEXT NOT NULL
+        account_id         TEXT PRIMARY KEY,
+        primary_email_hash TEXT NOT NULL,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS account_emails (
-        email         TEXT PRIMARY KEY,
+        email_hash    TEXT PRIMARY KEY,
         account_id    TEXT NOT NULL REFERENCES accounts(account_id),
         email_type    TEXT NOT NULL,
         org_id        TEXT,
         verified      INTEGER NOT NULL DEFAULT 0,
         added_at      TEXT NOT NULL,
-        verified_at   TEXT
+        verified_at   TEXT,
+        email_domain_plain TEXT  -- domain-only (e.g. "acme.com") for org-claim matching; never a full email
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_account ON account_emails(account_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_org ON account_emails(org_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_domain ON account_emails(email_domain_plain)")
 
     # ---------------- Organizations + membership ----------------
     conn.execute("""CREATE TABLE IF NOT EXISTS organizations (
@@ -651,13 +828,15 @@ def init_db():
 
     # ---------------- Immutable consent audit log ----------------
     conn.execute("""CREATE TABLE IF NOT EXISTS consent_log (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        account_id    TEXT NOT NULL,
-        org_id        TEXT NOT NULL,
-        action        TEXT NOT NULL,
-        timestamp     TEXT NOT NULL,
-        details       TEXT
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id          TEXT NOT NULL,
+        org_id              TEXT NOT NULL,
+        action              TEXT NOT NULL,
+        timestamp           TEXT NOT NULL,
+        subject_email_hash  TEXT,
+        details_encrypted   TEXT
     )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cl_subject ON consent_log(subject_email_hash)")
 
     # ---------------- Magic-link / session tokens ----------------
     conn.execute("""CREATE TABLE IF NOT EXISTS used_tokens (
@@ -671,6 +850,25 @@ def init_db():
         reason        TEXT
     )""")
 
+    # Pilot-interest leads from /v1/pilot/interest (Phase B.5).
+    # Admin emails are stored as hashes (Piece 12 hardening applies everywhere).
+    conn.execute("""CREATE TABLE IF NOT EXISTS pilot_interest (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        submitted_at     TEXT NOT NULL,
+        company          TEXT NOT NULL,
+        admin_email_hash TEXT NOT NULL,
+        admin_email_encrypted TEXT NOT NULL,
+        admin_email_domain    TEXT,
+        user_count       INTEGER,
+        industry         TEXT,
+        source_ip        TEXT,
+        handled          INTEGER NOT NULL DEFAULT 0,
+        handled_at       TEXT,
+        handled_note     TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pi_submitted ON pilot_interest(submitted_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pi_handled ON pilot_interest(handled)")
+
     # ---------------- v0.5.0 enterprise attestation store ----------------
     # Full receipt metadata is stored here when enterprise clients POST
     # to /v1/enterprise/ingest. Created unconditionally so switching
@@ -681,7 +879,8 @@ def init_db():
         ts              TEXT NOT NULL,
         hash            TEXT NOT NULL,
         prompt_hash     TEXT,
-        uid             TEXT NOT NULL,
+        uid_hash        TEXT NOT NULL,
+        uid_encrypted   TEXT,
         uid_pseudonym   TEXT,
         src             TEXT,
         model           TEXT,
@@ -709,7 +908,7 @@ def init_db():
         client_integrity TEXT DEFAULT 'none',
         ingested_at     TEXT NOT NULL
     )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_uid ON enterprise_attestations(uid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_uid_hash ON enterprise_attestations(uid_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_ts ON enterprise_attestations(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_org ON enterprise_attestations(org_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_model ON enterprise_attestations(model)")
@@ -790,9 +989,14 @@ def _verify_token(token: str) -> Optional[dict]:
     try:
         data_b64, sig_b64 = token.split(".", 1)
         canonical = _b64url_decode(data_b64)
-        expected = hmac.new(SERVER_SECRET.encode(), canonical, hashlib.sha256).digest()
         actual = _b64url_decode(sig_b64)
-        if not hmac.compare_digest(expected, actual):
+        # Try the current secret; if dual-secret rotation is active, fall back.
+        expected = hmac.new(SERVER_SECRET.encode(), canonical, hashlib.sha256).digest()
+        valid = hmac.compare_digest(expected, actual)
+        if not valid and SERVER_SECRET_PREVIOUS:
+            expected_prev = hmac.new(SERVER_SECRET_PREVIOUS.encode(), canonical, hashlib.sha256).digest()
+            valid = hmac.compare_digest(expected_prev, actual)
+        if not valid:
             return None
         payload = json.loads(canonical)
         exp = payload.get("expires_at")
@@ -832,19 +1036,60 @@ def _make_session_token(account_id: str, email: str, ttl_hours: int = 24) -> tup
 
 
 def _send_magic_link(email: str, token: str, purpose: str) -> None:
-    """Email delivery is intentionally stubbed in v0.5.0. The link is
-    logged to stdout and to KEY_DIR/magic_links.log so an admin can
-    wire in a transactional email provider (Resend, Postmark, SES)
-    without touching server code."""
+    """Email delivery path (v0.5.1+).
+
+    Preferred: transactional email provider (Resend) when RESEND_API_KEY
+    is set in the environment. Email is never persisted to disk.
+
+    Fallback: stdout-only logging. A file-based log is available but
+    DISABLED BY DEFAULT — operators must explicitly opt in via
+    AIAUTH_LOG_MAGIC_LINKS=true (dev/test only; never production).
+
+    The magic-link URL contains the token, which is HMAC-signed by
+    SERVER_SECRET and expires in 15 minutes. The recipient email is
+    in-memory for the duration of this call and never stored in our
+    databases — see Integrity Rule #12 (Data Hardening)."""
     link = f"{PUBLIC_BASE_URL}/auth?token={token}&p={purpose}"
-    msg = f"[AIAuth magic-link] to={email} purpose={purpose} link={link}"
-    print(msg)
-    try:
-        log_path = KEY_DIR / "magic_links.log"
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
-    except Exception:
-        pass
+
+    # Track what was logged for return/test visibility (without leaking email)
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if api_key:
+        try:
+            import resend
+            resend.api_key = api_key
+            resend.Emails.send({
+                "from": os.getenv("RESEND_FROM", "AIAuth <auth@aiauth.app>"),
+                "to": email,
+                "subject": {
+                    "login": "Your AIAuth login link",
+                    "verify_email": "Verify your AIAuth email",
+                }.get(purpose, "Your AIAuth link"),
+                "text": (
+                    f"Click to complete sign-in: {link}\n\n"
+                    "This link expires in 15 minutes and can only be used once. "
+                    "If you didn't request it, ignore this email."
+                ),
+            })
+            print(f"[AIAuth magic-link] delivered via Resend; purpose={purpose}")
+            return
+        except Exception as exc:
+            # Log the failure (not the email) and fall through to stdout
+            print(f"[AIAuth magic-link] Resend delivery failed: {type(exc).__name__}; falling back to stdout log")
+
+    # Stdout — operator can retrieve from systemd journal for testing
+    print(f"[AIAuth magic-link] purpose={purpose} link={link}")
+
+    # Opt-in file log (dev/test only)
+    if os.getenv("AIAUTH_LOG_MAGIC_LINKS", "").strip().lower() == "true":
+        try:
+            log_path = KEY_DIR / "magic_links.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{datetime.now(timezone.utc).isoformat()} "
+                    f"purpose={purpose} link={link}\n"
+                )
+        except Exception:
+            pass
 
 
 def _require_session(authorization: Optional[str]) -> dict:
@@ -867,15 +1112,31 @@ def _require_session(authorization: Optional[str]) -> dict:
 
 
 def _find_account_by_email(email: str) -> Optional[sqlite3.Row]:
+    """Look up an account_emails row by plaintext email. Hashes the
+    email with the server-side salt and queries by email_hash. If a
+    SERVER_SECRET rotation is in progress, also looks up by the old-salt
+    hash. Returns None if not found."""
+    candidates = email_hash_candidates(email)
+    if not candidates:
+        return None
     conn = get_db()
+    placeholders = ",".join("?" * len(candidates))
     row = conn.execute(
-        "SELECT ae.*, a.primary_email FROM account_emails ae "
-        "JOIN accounts a ON ae.account_id = a.account_id "
-        "WHERE ae.email = ?",
-        (email,),
+        f"SELECT ae.*, a.account_id AS acct_id FROM account_emails ae "
+        f"JOIN accounts a ON ae.account_id = a.account_id "
+        f"WHERE ae.email_hash IN ({placeholders})",
+        candidates,
     ).fetchone()
     conn.close()
     return row
+
+
+def _email_domain(email: str) -> str:
+    """Extract the lowercase domain part of an email address, or "" on malformed input."""
+    norm = (email or "").strip().lower()
+    if "@" not in norm:
+        return ""
+    return norm.split("@", 1)[1]
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -923,6 +1184,11 @@ class SignRequest(BaseModel):
     classification: Optional[str] = None        # financial / legal / client-facing / internal
     concurrent_ai_apps: Optional[List[str]] = None  # AI processes running at attest moment
 
+    # ----- v0.5.1: cross-format chain integrity (Piece 14) -----
+    content_hash_canonical: Optional[str] = None  # SHA-256 of canonical text extraction (xlsx/csv/pdf chain)
+    perceptual_hashes: Optional[Dict[str, Any]] = None  # {dhash, phash} for images
+    canonical_extraction_failed: Optional[bool] = None  # set by client when format extractor was unavailable
+
     # Pydantic v2 config: allow "len" as alias; also tolerate extra fields for forward-compat
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
@@ -939,6 +1205,8 @@ def _validate_sign_request(req: SignRequest) -> None:
         raise AIAuthError("INVALID_RECEIPT", "user_id (uid) is required", 400)
     if req.client_integrity not in (None, "none", "extension", "os-verified"):
         raise AIAuthError("INVALID_RECEIPT", "client_integrity must be one of: none, extension, os-verified", 400)
+    if req.content_hash_canonical is not None and not _SHA256_RE.match(req.content_hash_canonical):
+        raise AIAuthError("INVALID_HASH", "content_hash_canonical must be a 64-character SHA-256 hex string", 400)
 
 
 def _validate_client_integrity(request: Request, claimed: Optional[str], content_hash: str) -> str:
@@ -1066,6 +1334,14 @@ def sign_receipt(req: SignRequest, request: Request):
     if req.classification: receipt["classification"] = req.classification
     if req.concurrent_ai_apps: receipt["concurrent_ai_apps"] = req.concurrent_ai_apps
 
+    # v0.5.1 cross-format chain fields (Piece 14)
+    if req.content_hash_canonical:
+        receipt["content_hash_canonical"] = req.content_hash_canonical
+    if req.perceptual_hashes:
+        receipt["perceptual_hashes"] = req.perceptual_hashes
+    if req.canonical_extraction_failed is True:
+        receipt["canonical_extraction_failed"] = True
+
     if req.review_status:
         receipt["review"] = {
             "status": req.review_status,
@@ -1076,9 +1352,11 @@ def sign_receipt(req: SignRequest, request: Request):
 
     signature = sign(receipt)
 
-    # Public hash registry — stores hash->receipt_id mapping + doc_id only, no user data
+    # Public hash registry — 6 anonymous columns (still PII-free):
+    # content_hash, receipt_id, parent_hash, doc_id, content_hash_canonical, registered_at
     if req.register:
-        register_hash(req.output_hash, receipt_id, req.parent_hash, req.doc_id)
+        register_hash(req.output_hash, receipt_id, req.parent_hash, req.doc_id,
+                      req.content_hash_canonical)
 
     # Enterprise: also store full attestation
     if MODE == "enterprise":
@@ -1173,14 +1451,18 @@ def account_create(body: AccountCreateRequest):
         account_id = existing["account_id"]
     else:
         account_id = "ACC_" + uuid.uuid4().hex[:12]
+        eh = email_hash(email)
+        domain = _email_domain(email)
         conn = get_db()
         conn.execute(
-            "INSERT INTO accounts (account_id, primary_email, created_at, updated_at) VALUES (?,?,?,?)",
-            (account_id, email, now, now),
+            "INSERT INTO accounts (account_id, primary_email_hash, created_at, updated_at) VALUES (?,?,?,?)",
+            (account_id, eh, now, now),
         )
         conn.execute(
-            "INSERT INTO account_emails (email, account_id, email_type, verified, added_at) VALUES (?,?,?,?,?)",
-            (email, account_id, "personal", 0, now),
+            "INSERT INTO account_emails "
+            "(email_hash, account_id, email_type, verified, added_at, email_domain_plain) "
+            "VALUES (?,?,?,?,?,?)",
+            (eh, account_id, "personal", 0, now, domain),
         )
         conn.commit()
         conn.close()
@@ -1233,8 +1515,8 @@ def account_verify(body: AccountVerifyRequest):
     # Mark email as verified if this is a login/verify_email token
     conn.execute(
         "UPDATE account_emails SET verified = 1, verified_at = ? "
-        "WHERE email = ? AND verified = 0",
-        (now, payload["email"]),
+        "WHERE email_hash = ? AND verified = 0",
+        (now, email_hash(payload["email"])),
     )
     conn.commit()
     conn.close()
@@ -1251,13 +1533,21 @@ def account_verify(body: AccountVerifyRequest):
 
 @app.get("/v1/account/me")
 def account_me(authorization: Optional[str] = Header(default=None)):
-    """Return the authenticated caller's account info: emails linked,
-    verification status, org memberships."""
+    """Return the authenticated caller's account info: linked emails
+    (by hash + domain), verification status, org memberships.
+
+    The server does NOT store plaintext emails — we return only the
+    caller's CURRENT email (from their session token) plus metadata
+    about OTHER linked emails: their domain, type, verification status.
+    Full plaintext of additional linked emails is unavailable post-
+    hardening; if you need to re-display the list, either the client
+    caches it locally or the user re-verifies each (link flow)."""
     session = _require_session(authorization)
     account_id = session["account_id"]
     conn = get_db()
-    emails = [dict(r) for r in conn.execute(
-        "SELECT email, email_type, org_id, verified, added_at, verified_at "
+    raw_emails = [dict(r) for r in conn.execute(
+        "SELECT email_hash, email_type, org_id, verified, added_at, verified_at, "
+        "       email_domain_plain "
         "FROM account_emails WHERE account_id = ?",
         (account_id,),
     ).fetchall()]
@@ -1269,10 +1559,28 @@ def account_me(authorization: Optional[str] = Header(default=None)):
         (account_id,),
     ).fetchall()]
     conn.close()
+
+    # Only the CURRENT session's email can be returned in full (came in with the request).
+    current_eh = email_hash(session.get("email", ""))
+    emails_out = []
+    for r in raw_emails:
+        entry = {
+            "email_hash": r["email_hash"],
+            "email_type": r["email_type"],
+            "org_id": r["org_id"],
+            "verified": r["verified"],
+            "added_at": r["added_at"],
+            "verified_at": r["verified_at"],
+            "domain": r["email_domain_plain"],
+        }
+        if r["email_hash"] == current_eh:
+            entry["email"] = session["email"]  # current session's email is safe to echo
+        emails_out.append(entry)
+
     return {
         "account_id": account_id,
         "current_email": session["email"],
-        "emails": emails,
+        "emails": emails_out,
         "organizations": orgs,
     }
 
@@ -1335,19 +1643,22 @@ def account_confirm(body: AccountConfirmRequest):
         conn.close()
         raise AIAuthError("TOKEN_USED", "Token has already been used", 400)
 
-    # Insert or update the email
+    # Insert or update the email (hashed)
+    eh = email_hash(payload["email"])
+    domain = _email_domain(payload["email"])
     try:
         conn.execute(
-            "INSERT INTO account_emails (email, account_id, email_type, verified, added_at, verified_at) "
-            "VALUES (?,?,?,1,?,?)",
-            (payload["email"], payload["account_id"], email_type, now, now),
+            "INSERT INTO account_emails "
+            "(email_hash, account_id, email_type, verified, added_at, verified_at, email_domain_plain) "
+            "VALUES (?,?,?,1,?,?,?)",
+            (eh, payload["account_id"], email_type, now, now, domain),
         )
     except sqlite3.IntegrityError:
         # Already linked to same account — just ensure verified
         conn.execute(
             "UPDATE account_emails SET verified = 1, verified_at = ? "
-            "WHERE email = ? AND account_id = ?",
-            (now, payload["email"], payload["account_id"]),
+            "WHERE email_hash = ? AND account_id = ?",
+            (now, eh, payload["account_id"]),
         )
     conn.commit()
     conn.close()
@@ -1381,8 +1692,12 @@ def account_consent(body: AccountConsentRequest, authorization: Optional[str] = 
     now = datetime.now(timezone.utc).isoformat()
     action = "grant_personal" if new_val else "revoke_personal"
     conn.execute(
-        "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
-        (account_id, body.org_id, action, now, json.dumps({"email": session["email"]})),
+        "INSERT INTO consent_log "
+        "(account_id, org_id, action, timestamp, subject_email_hash, details_encrypted) "
+        "VALUES (?,?,?,?,?,?)",
+        (account_id, body.org_id, action, now,
+         email_hash(session["email"]),
+         encrypt_value(json.dumps({"email": session["email"]}))),
     )
     conn.commit()
     conn.close()
@@ -1404,24 +1719,87 @@ def account_export(authorization: Optional[str] = Header(default=None)):
         "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
     ).fetchone() or {})
     emails = [dict(r) for r in conn.execute(
-        "SELECT * FROM account_emails WHERE account_id = ?", (account_id,)
+        "SELECT email_hash, email_type, org_id, verified, added_at, verified_at, email_domain_plain "
+        "FROM account_emails WHERE account_id = ?", (account_id,)
     ).fetchall()]
     orgs = [dict(r) for r in conn.execute(
         "SELECT * FROM org_members WHERE account_id = ?", (account_id,)
     ).fetchall()]
-    consent = [dict(r) for r in conn.execute(
-        "SELECT * FROM consent_log WHERE account_id = ? ORDER BY timestamp DESC",
+    consent_raw = [dict(r) for r in conn.execute(
+        "SELECT id, account_id, org_id, action, timestamp, details_encrypted "
+        "FROM consent_log WHERE account_id = ? ORDER BY timestamp DESC",
         (account_id,),
     ).fetchall()]
     conn.close()
+    # Decrypt consent details for the owner (they're authenticated)
+    consent = []
+    for r in consent_raw:
+        dec = decrypt_value(r.pop("details_encrypted") or "")
+        try:
+            r["details"] = json.loads(dec) if dec else None
+        except Exception:
+            r["details"] = None
+        consent.append(r)
     return {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "account": account,
+        "current_email": session["email"],
         "emails": emails,
         "organizations": orgs,
         "consent_history": consent,
-        "note": "Free-tier attestation receipts are stored on your device, not on our server.",
+        "note": "Free-tier attestation receipts are stored on your device, not on our server. Stored emails are hashed; we return only hashes + domains for linked emails.",
     }
+
+
+class PilotInterestRequest(BaseModel):
+    company: str
+    admin_email: str
+    user_count: Optional[int] = None
+    industry: Optional[str] = None
+
+
+@app.post("/v1/pilot/interest")
+def pilot_interest(body: PilotInterestRequest, request: Request):
+    """Pilot-request form submission from /demo. Unauthenticated (anyone
+    viewing the demo can submit). Rate-limit-adjacent via nginx IP throttle
+    + a simple per-day cap enforced below.
+
+    Stores a hashed admin email + company + user count + industry. Alerts
+    the operator (via stdout + optional Resend notification) so follow-up
+    happens within 24 hours.
+    """
+    company = (body.company or "").strip()
+    email = (body.admin_email or "").strip().lower()
+    if not company or not _valid_email(email):
+        raise AIAuthError("INVALID_RECEIPT", "company and valid admin_email required", 400)
+    # Rough rate guard: no more than 20 submissions per day per IP
+    ip = _client_ip(request)
+    conn = get_db()
+    recent = conn.execute(
+        "SELECT COUNT(*) AS n FROM pilot_interest WHERE source_ip = ? AND submitted_at > datetime('now', '-1 day')",
+        (ip,),
+    ).fetchone()
+    if recent and recent["n"] >= 20:
+        conn.close()
+        raise AIAuthError("RATE_LIMITED", "Too many pilot requests from this IP today", 429)
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO pilot_interest "
+        "(submitted_at, company, admin_email_hash, admin_email_encrypted, admin_email_domain, "
+        " user_count, industry, source_ip) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (now, company, email_hash(email), encrypt_value(email),
+         _email_domain(email), body.user_count, body.industry, ip),
+    )
+    conn.commit()
+    conn.close()
+
+    # Operator notification (stdout for now — owner can wire to Slack later)
+    print(f"[AIAuth pilot-interest] company={company!r} email_domain={_email_domain(email)!r} "
+          f"users={body.user_count} industry={body.industry!r}")
+
+    return {"submitted": True, "message": "Thanks. We'll email you within 24 hours."}
 
 
 @app.post("/v1/account/logout")
@@ -1611,22 +1989,22 @@ def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
         )
 
     # Block offboarded users. Two signals, either one suffices:
-    #   (a) org_members row with left_at set (known linked member who left)
+    #   (a) org_members row with left_at set
     #   (b) consent_log row with action dsar_pseudonymize or dsar_delete
-    #       for this (email, org) — covers users who were pseudonymized
-    #       without ever having linked a personal account.
+    #       for this (email_hash, org)
+    uid_h = email_hash(uid)
     conn = get_db()
     left_member = conn.execute(
         "SELECT om.left_at FROM org_members om "
         "JOIN account_emails ae ON ae.account_id = om.account_id "
-        "WHERE ae.email = ? AND om.org_id = ? AND om.left_at IS NOT NULL",
-        (uid, org["org_id"]),
+        "WHERE ae.email_hash = ? AND om.org_id = ? AND om.left_at IS NOT NULL",
+        (uid_h, org["org_id"]),
     ).fetchone()
     dsar_out = conn.execute(
         "SELECT id FROM consent_log "
         "WHERE org_id = ? AND action IN ('dsar_pseudonymize','dsar_delete') "
-        "AND details LIKE ? LIMIT 1",
-        (org["org_id"], f'%"email": "{uid}"%'),
+        "AND subject_email_hash = ? LIMIT 1",
+        (org["org_id"], uid_h),
     ).fetchone()
     if left_member is not None or dsar_out is not None:
         conn.close()
@@ -1647,8 +2025,9 @@ def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
         receipt.get("ts"),
         receipt.get("hash"),
         receipt.get("prompt_hash"),
-        uid,
-        None,  # uid_pseudonym
+        uid_h,                          # uid_hash (HMAC-SHA256 of normalized uid)
+        encrypt_value(uid),             # uid_encrypted (Fernet ciphertext)
+        None,                           # uid_pseudonym
         receipt.get("src"),
         receipt.get("model"),
         receipt.get("provider"),
@@ -1677,12 +2056,13 @@ def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
     )
     conn.execute(
         "INSERT INTO enterprise_attestations ("
-        "id, ts, hash, prompt_hash, uid, uid_pseudonym, src, model, provider, "
-        "source_domain, source_app, concurrent_ai_apps, ai_markers, doc_id, parent, "
+        "id, ts, hash, prompt_hash, uid_hash, uid_encrypted, uid_pseudonym, "
+        "src, model, provider, source_domain, source_app, "
+        "concurrent_ai_apps, ai_markers, doc_id, parent, "
         "file_type, len, tta, sid, dest, dest_ext, classification, "
         "review_status, review_by, review_at, review_note, tags, "
         "schema_version, org_id, client_integrity, ingested_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         row,
     )
 
@@ -1734,13 +2114,16 @@ def admin_org_claim(body: OrgClaimRequest, authorization: Optional[str] = Header
     if not domains:
         raise AIAuthError("INVALID_RECEIPT", "At least one domain is required", 400)
 
-    # Proof-of-control: the caller must have a verified email in each domain
+    # Proof-of-control: the caller must have a verified email in each domain.
+    # Post-Piece 12, emails are not stored plaintext — we use the separate
+    # email_domain_plain column for domain matching.
     conn = get_db()
-    verified = {row["email"].split("@", 1)[1].lower()
+    verified = {row["email_domain_plain"]
                 for row in conn.execute(
-                    "SELECT email FROM account_emails WHERE account_id = ? AND verified = 1",
+                    "SELECT email_domain_plain FROM account_emails "
+                    "WHERE account_id = ? AND verified = 1 AND email_domain_plain IS NOT NULL",
                     (session["account_id"],),
-                ).fetchall() if "@" in row["email"]}
+                ).fetchall()}
     missing = [d for d in domains if d not in verified]
     if missing:
         conn.close()
@@ -1763,12 +2146,12 @@ def admin_org_claim(body: OrgClaimRequest, authorization: Optional[str] = Header
         (session["account_id"], org_id, "admin", now),
     )
     # Also mark each of the caller's verified emails matching a claimed
-    # domain as corporate emails under this org.
+    # domain as corporate emails under this org (match by domain column).
     for domain in domains:
         conn.execute(
             "UPDATE account_emails SET email_type = 'corporate', org_id = ? "
-            "WHERE account_id = ? AND email LIKE ? AND email_type != 'corporate'",
-            (org_id, session["account_id"], f"%@{domain}"),
+            "WHERE account_id = ? AND email_domain_plain = ? AND email_type != 'corporate'",
+            (org_id, session["account_id"], domain),
         )
     conn.commit()
     conn.close()
@@ -1781,12 +2164,22 @@ def admin_org_claim(body: OrgClaimRequest, authorization: Optional[str] = Header
 @app.get("/v1/admin/org/members")
 def admin_org_members(org_id: str = Query(...), authorization: Optional[str] = Header(default=None)):
     """List members of an org (admin-authed). Shows link status:
-    which members have a personal email linked, which consented to
-    personal-history sharing, who has left."""
+    who has a personal email linked, who consented to personal-history
+    sharing, who has left.
+
+    Post-hardening: we return the primary-email HASH and the account's
+    corporate-email DOMAIN (never the full plaintext email). Admins who
+    need to contact a specific member go through the invite list kept
+    in their own IT system."""
     session = _require_admin_session(authorization, org_id)
     conn = get_db()
     rows = conn.execute(
-        "SELECT om.*, a.primary_email, "
+        "SELECT om.account_id, om.org_id, om.role, om.department, "
+        "       om.joined_at, om.left_at, om.consent_personal_history, "
+        "       a.primary_email_hash, "
+        "       (SELECT email_domain_plain FROM account_emails ae "
+        "        WHERE ae.account_id = om.account_id AND ae.org_id = om.org_id "
+        "        LIMIT 1) AS corporate_domain, "
         "       (SELECT COUNT(*) FROM account_emails ae "
         "        WHERE ae.account_id = om.account_id AND ae.email_type = 'personal') AS has_personal "
         "FROM org_members om JOIN accounts a ON om.account_id = a.account_id "
@@ -1816,65 +2209,86 @@ def admin_dsar(body: DSARRequest, authorization: Optional[str] = Header(default=
     if body.action not in ("export", "pseudonymize", "delete"):
         raise AIAuthError("INVALID_RECEIPT", "action must be export/pseudonymize/delete", 400)
 
+    uid_h = email_hash(email)
+
     conn = get_db()
     member = conn.execute(
         "SELECT om.account_id FROM org_members om "
         "JOIN account_emails ae ON ae.account_id = om.account_id "
-        "WHERE ae.email = ? AND om.org_id = ?",
-        (email, body.org_id),
+        "WHERE ae.email_hash = ? AND om.org_id = ?",
+        (uid_h, body.org_id),
     ).fetchone()
     account_id = member["account_id"] if member else None
 
     now = datetime.now(timezone.utc).isoformat()
     if body.action == "export":
-        attests = [dict(r) for r in conn.execute(
-            "SELECT * FROM enterprise_attestations WHERE uid = ? AND org_id = ?",
-            (email, body.org_id),
-        ).fetchall()]
+        # Pull attestations by uid_hash; decrypt uid_encrypted for the admin's view.
+        raw = conn.execute(
+            "SELECT * FROM enterprise_attestations WHERE uid_hash = ? AND org_id = ?",
+            (uid_h, body.org_id),
+        ).fetchall()
+        attests = []
+        for r in raw:
+            d = dict(r)
+            if d.get("uid_encrypted"):
+                d["uid"] = decrypt_value(d["uid_encrypted"])   # admin view, in-memory only
+            attests.append(d)
         emails = [dict(r) for r in conn.execute(
-            "SELECT * FROM account_emails WHERE email = ?", (email,)
+            "SELECT email_hash, email_type, org_id, verified, added_at, verified_at, email_domain_plain "
+            "FROM account_emails WHERE email_hash = ?",
+            (uid_h,),
         ).fetchall()]
         conn.execute(
-            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
-            (account_id or "unknown", body.org_id, "dsar_export", now, json.dumps({"email": email})),
+            "INSERT INTO consent_log "
+            "(account_id, org_id, action, timestamp, subject_email_hash, details_encrypted) "
+            "VALUES (?,?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_export", now, uid_h,
+             encrypt_value(json.dumps({"email": email, "requested_by": session["email"]}))),
         )
         conn.commit()
         conn.close()
         return {"action": "export", "email": email, "attestations": attests, "emails": emails}
 
     if body.action == "pseudonymize":
-        # One-way pseudonym: SHA-256(email + org_salt + "pseudonymize")
-        # org_salt = org_id (stable, org-specific)
+        # One-way pseudonym derived from email + org salt. Deterministic so
+        # re-running doesn't produce a new pseudonym each time.
         pseud = hashlib.sha256(f"{email}{body.org_id}pseudonymize".encode()).hexdigest()[:24]
+        # Clear the uid_encrypted column and set the pseudonym; uid_hash
+        # remains so offboarded-check queries keep working.
         conn.execute(
             "UPDATE enterprise_attestations "
-            "SET uid_pseudonym = ?, uid = '[pseudonymized]' "
-            "WHERE uid = ? AND org_id = ?",
-            (pseud, email, body.org_id),
+            "SET uid_pseudonym = ?, uid_encrypted = NULL "
+            "WHERE uid_hash = ? AND org_id = ?",
+            (pseud, uid_h, body.org_id),
         )
-        # Mark user as left
+        # Mark user as left (if they were linked as a member)
         if account_id:
             conn.execute(
                 "UPDATE org_members SET left_at = ? WHERE account_id = ? AND org_id = ? AND left_at IS NULL",
                 (now, account_id, body.org_id),
             )
         conn.execute(
-            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
-            (account_id or "unknown", body.org_id, "dsar_pseudonymize", now, json.dumps({"email": email, "pseudonym": pseud})),
+            "INSERT INTO consent_log "
+            "(account_id, org_id, action, timestamp, subject_email_hash, details_encrypted) "
+            "VALUES (?,?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_pseudonymize", now, uid_h,
+             encrypt_value(json.dumps({"email": email, "pseudonym": pseud, "requested_by": session["email"]}))),
         )
         conn.commit()
         conn.close()
         return {"action": "pseudonymize", "email": email, "pseudonym": pseud}
 
     if body.action == "delete":
-        # Nuclear. Remove attestations entirely. Registry entries untouched (no PII).
         deleted = conn.execute(
-            "DELETE FROM enterprise_attestations WHERE uid = ? AND org_id = ?",
-            (email, body.org_id),
+            "DELETE FROM enterprise_attestations WHERE uid_hash = ? AND org_id = ?",
+            (uid_h, body.org_id),
         ).rowcount
         conn.execute(
-            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
-            (account_id or "unknown", body.org_id, "dsar_delete", now, json.dumps({"email": email, "deleted_rows": deleted})),
+            "INSERT INTO consent_log "
+            "(account_id, org_id, action, timestamp, subject_email_hash, details_encrypted) "
+            "VALUES (?,?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_delete", now, uid_h,
+             encrypt_value(json.dumps({"email": email, "deleted_rows": deleted, "requested_by": session["email"]}))),
         )
         conn.commit()
         conn.close()
@@ -1913,7 +2327,7 @@ def violations_feed(
         where += " AND pv.severity = ?"
         params.append(severity)
     rows = conn.execute(
-        f"SELECT pv.*, ea.uid, ea.ts AS attestation_ts "
+        f"SELECT pv.*, ea.uid_hash, ea.uid_pseudonym, ea.ts AS attestation_ts "
         f"FROM policy_violations pv "
         f"JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
         f"WHERE {where} ORDER BY pv.detected_at DESC LIMIT ?",
@@ -1975,7 +2389,7 @@ def dashboard_data(
 
     # Join to get department (NULL-safe via LEFT JOIN)
     join = (
-        "LEFT JOIN account_emails ae ON ea.uid = ae.email "
+        "LEFT JOIN account_emails ae ON ea.uid_hash = ae.email_hash "
         "LEFT JOIN org_members om ON ae.account_id = om.account_id AND om.org_id = ea.org_id "
     )
 
@@ -1987,7 +2401,7 @@ def dashboard_data(
     # Summary counts
     summary_row = conn.execute(
         f"SELECT COUNT(*) AS total, "
-        f"       COUNT(DISTINCT ea.uid) AS unique_users, "
+        f"       COUNT(DISTINCT ea.uid_hash) AS unique_users, "
         f"       COUNT(DISTINCT ea.sid) AS unique_sessions, "
         f"       AVG(ea.tta) AS avg_tta, "
         f"       SUM(CASE WHEN ea.review_status IS NOT NULL THEN 1 ELSE 0 END) AS reviewed, "
@@ -2042,7 +2456,7 @@ def dashboard_data(
     by_department = []
     for dept_row in conn.execute(
         f"SELECT IFNULL(om.department, 'Unmapped') AS dept, "
-        f"       COUNT(*) AS total, COUNT(DISTINCT ea.uid) AS unique_users, "
+        f"       COUNT(*) AS total, COUNT(DISTINCT ea.uid_hash) AS unique_users, "
         f"       AVG(ea.tta) AS avg_tta, "
         f"       SUM(CASE WHEN ea.review_status IS NOT NULL THEN 1 ELSE 0 END) AS reviewed, "
         f"       SUM(CASE WHEN COALESCE(ea.tta,999)<10 AND COALESCE(ea.len,0)>500 THEN 1 ELSE 0 END) AS rubber, "
@@ -2113,10 +2527,10 @@ def dashboard_data(
             "count": rubber_stamp,
             "threshold": {"tta_under": 10, "len_over": 500},
             "top_offenders": [dict(r) for r in conn.execute(
-                f"SELECT ea.uid, COUNT(*) AS count, IFNULL(om.department, 'Unmapped') AS department "
+                f"SELECT ea.uid_hash, ea.uid_pseudonym, COUNT(*) AS count, IFNULL(om.department, 'Unmapped') AS department "
                 f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
                 f"AND COALESCE(ea.tta,999) < 10 AND COALESCE(ea.len,0) > 500 "
-                f"GROUP BY ea.uid ORDER BY count DESC LIMIT 5",
+                f"GROUP BY ea.uid_hash ORDER BY count DESC LIMIT 5",
                 params,
             ).fetchall()],
         },
@@ -2519,6 +2933,135 @@ def verify_chain(req: ChainVerifyRequest):
 # 4. CHAIN DISCOVERY — find related receipts via hash registry
 # ===================================================================
 
+class ContentDiscoveryRequest(BaseModel):
+    """Body for POST /v1/discover/content."""
+    content_hash_canonical: str
+
+
+@app.post("/v1/discover/content")
+def discover_by_canonical(req: ContentDiscoveryRequest):
+    """Cross-format chain discovery (Piece 14).
+
+    Given a canonical-text hash (same for xlsx -> csv -> pdf of the
+    same logical content), return every registered receipt that shares
+    it. Enables "find every receipt whose content is equivalent to
+    this file, regardless of format".
+
+    The public registry stores only the hash and the receipt_id — no
+    file-type, no uid, no model. The response explicitly nulls
+    any format-identifying field. Enterprise customers with access to
+    their own enterprise_attestations table can JOIN on receipt_id to
+    get file_type and user context within their data.
+    """
+    if not _SHA256_RE.match(req.content_hash_canonical or ""):
+        raise AIAuthError(
+            "INVALID_HASH",
+            "content_hash_canonical must be a 64-character SHA-256 hex string",
+            400,
+        )
+    conn = get_registry()
+    rows = conn.execute(
+        "SELECT receipt_id, content_hash, registered_at "
+        "FROM hash_registry WHERE content_hash_canonical = ? "
+        "ORDER BY registered_at ASC",
+        (req.content_hash_canonical,),
+    ).fetchall()
+    conn.close()
+    return {
+        "canonical_hash": req.content_hash_canonical,
+        "found": len(rows) > 0,
+        "receipt_count": len(rows),
+        "receipts": [
+            {"receipt_id": r["receipt_id"],
+             "content_hash": r["content_hash"],
+             "registered_at": r["registered_at"],
+             "file_type": None}  # explicit null — registry is anonymous
+            for r in rows
+        ],
+        "note": (f"{len(rows)} receipts share this canonical content. "
+                 "Different byte representations (likely format conversions) of "
+                 "the same logical document."),
+    }
+
+
+class SimilarImageRequest(BaseModel):
+    phash: Optional[str] = None
+    dhash: Optional[str] = None
+    distance: int = 5
+    org_id: str
+
+
+def _hamming_distance_hex(a: str, b: str) -> int:
+    """Hamming distance between two hex strings of equal length. Used
+    for perceptual-hash similarity scoring."""
+    if not a or not b or len(a) != len(b):
+        return 10**9
+    try:
+        ai = int(a, 16); bi = int(b, 16)
+    except ValueError:
+        return 10**9
+    return bin(ai ^ bi).count("1")
+
+
+@app.get("/v1/discover/similar-image")
+def discover_similar_image(
+    phash: Optional[str] = Query(default=None),
+    dhash: Optional[str] = Query(default=None),
+    distance: int = Query(default=5, ge=0, le=32),
+    org_id: str = Query(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Enterprise-only perceptual-hash similarity search (Piece 14).
+
+    Admin-authenticated against a specific org. Scans the org's
+    enterprise_attestations for receipts whose ai_markers.perceptual_hashes
+    are within Hamming distance `distance` of the supplied phash/dhash.
+
+    Used for cases like 'find every receipt whose image is a resized
+    or watermarked copy of this one'. Not exposed in the public
+    anonymous registry — perceptual hashes CAN sometimes identify an
+    image without revealing its content, which is a privacy concern
+    for free-tier users; limiting to enterprise admins makes the
+    consent context explicit.
+    """
+    if not (phash or dhash):
+        raise AIAuthError("INVALID_RECEIPT", "Must supply phash and/or dhash", 400)
+    _require_admin_session(authorization, org_id)
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, ts, hash, ai_markers, file_type, doc_id "
+        "FROM enterprise_attestations "
+        "WHERE org_id = ? AND ai_markers IS NOT NULL",
+        (org_id,),
+    ).fetchall()
+    conn.close()
+
+    matches = []
+    for r in rows:
+        try:
+            markers = json.loads(r["ai_markers"] or "{}")
+        except Exception:
+            continue
+        ph = markers.get("perceptual_hashes") or {}
+        if not isinstance(ph, dict):
+            continue
+        best = 10**9
+        if phash and ph.get("phash"):
+            best = min(best, _hamming_distance_hex(phash, ph["phash"]))
+        if dhash and ph.get("dhash"):
+            best = min(best, _hamming_distance_hex(dhash, ph["dhash"]))
+        if best <= distance:
+            matches.append({
+                "id": r["id"], "ts": r["ts"], "hash": r["hash"],
+                "file_type": r["file_type"], "doc_id": r["doc_id"],
+                "similarity_distance": best,
+            })
+
+    return {"org_id": org_id, "matches": sorted(matches, key=lambda x: x["similarity_distance"]),
+            "distance_threshold": distance, "note": "Lower distance = more similar; 0 = identical."}
+
+
 @app.get("/v1/discover/{content_hash}")
 def discover_chain(content_hash: str):
     """
@@ -2750,10 +3293,22 @@ def validate_license_endpoint(license_key: str = ""):
 
 @app.get("/", response_class=HTMLResponse)
 def homepage():
-    """Public homepage: what AIAuth is, how it works, verify link, commercial licensing."""
+    """Public homepage — wraps the index.html body fragment in the
+    shared site chrome (_site_shell) for consistency with every other
+    page. Piece B.2."""
     index_path = Path(__file__).parent / "index.html"
     if index_path.exists():
-        return HTMLResponse(index_path.read_text(encoding="utf-8"))
+        body = index_path.read_text(encoding="utf-8")
+        # Legacy index.html files (before Phase B) were self-contained
+        # HTML documents. Detect + fall back to serving raw if so.
+        if body.lstrip().startswith("<!DOCTYPE"):
+            return HTMLResponse(body)
+        return HTMLResponse(_site_shell(
+            "Chain of Custody for AI-Generated Work",
+            body,
+            active="home",
+            wide=True,
+        ))
     return HTMLResponse("<h1>AIAuth</h1><p>Homepage not yet deployed.</p>")
 
 @app.get("/logo.png")
@@ -2772,23 +3327,189 @@ def favicon():
 
 @app.get("/check", response_class=HTMLResponse)
 def verification_page():
-    """The public verification page — anyone can paste a receipt and verify it."""
+    """Public verification page — wraps the verify.html body fragment in
+    the shared site chrome (_site_shell) for consistency. Phase B.3."""
     verify_path = Path(__file__).parent / "verify.html"
     if verify_path.exists():
-        return HTMLResponse(verify_path.read_text(encoding="utf-8"))
-    return HTMLResponse("<h1>AIAuth</h1><p>Verification page not found. Place verify.html alongside server.py.</p>")
+        body = verify_path.read_text(encoding="utf-8")
+        # Legacy pre-Phase-B verify.html was self-contained; serve raw.
+        if body.lstrip().startswith("<!DOCTYPE"):
+            return HTMLResponse(body)
+        return HTMLResponse(_site_shell(
+            "Verify a Receipt", body, active="check",
+        ))
+    return HTMLResponse("<h1>AIAuth</h1><p>Verification page not found.</p>", status_code=404)
 
 
 @app.get("/demo", response_class=HTMLResponse)
 def demo_dashboard():
     """Interactive commercial demo using synthetic data. Prospects can
-    add ?company=... to personalize. The template lives at
-    templates/commercial/executive-summary.html and uses
-    synthetic-data.js for fake but realistic data."""
+    add ?company=... to personalize. Template is standalone (not
+    wrapped in _site_shell) so it exports cleanly as a self-contained
+    HTML artifact for prospect handoff."""
     tpl = Path(__file__).parent / "templates" / "commercial" / "executive-summary.html"
     if tpl.exists():
         return HTMLResponse(tpl.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>AIAuth Demo</h1><p>Demo template not found.</p>", status_code=404)
+
+
+@app.get("/admin/license/issue", response_class=HTMLResponse)
+def admin_license_issuer_page(master_key: Optional[str] = Query(default=None)):
+    """License issuer admin page (Phase C.2).
+
+    Gated behind AIAUTH_MASTER_KEY. This is the sales-side tool used
+    to issue signed license keys to new enterprise customers. Not
+    linked from any public nav; reached by explicit URL with master_key
+    query param.
+    """
+    if not MASTER_KEY or master_key != MASTER_KEY:
+        return HTMLResponse(_site_shell(
+            "Not Found", "<h1 class='page-title'>Not Found</h1>"
+            "<p class='lead'>This page requires administrative access.</p>",
+            active=""), status_code=404)
+
+    body = """<span class="eyebrow">Admin: License Issuer</span>
+<h1 class="page-title">Issue Enterprise License</h1>
+<p class="lead">Generate a signed license key for a new customer. Key is validated offline against this server's signing key; no phone-home required.</p>
+
+<div class="card">
+  <form id="issueForm" style="display:grid;gap:12px;">
+    <label>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Company name</div>
+      <input name="company" required style="width:100%;padding:10px;border:1px solid #e5e7eb;border-radius:8px;font:inherit;" placeholder="Acme Corp" />
+    </label>
+    <label>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Tier</div>
+      <select name="tier" style="width:100%;padding:10px;border:1px solid #e5e7eb;border-radius:8px;font:inherit;">
+        <option value="enterprise">enterprise (self-hosted)</option>
+        <option value="compliance">compliance (self-hosted + policy engine + DSAR)</option>
+      </select>
+    </label>
+    <label>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Max users (0 = unlimited)</div>
+      <input type="number" name="max_users" value="0" min="0" style="width:100%;padding:10px;border:1px solid #e5e7eb;border-radius:8px;font:inherit;" />
+    </label>
+    <label>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Expires (ISO date, blank = never)</div>
+      <input type="date" name="expires" style="width:100%;padding:10px;border:1px solid #e5e7eb;border-radius:8px;font:inherit;" />
+    </label>
+    <button type="submit" style="padding:12px;background:var(--accent);color:white;border:0;border-radius:8px;font:inherit;font-weight:600;cursor:pointer;">Generate License Key</button>
+  </form>
+  <pre id="result" style="display:none;margin-top:20px;padding:16px;background:#0b1220;color:#e6edf6;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;line-height:1.5;"></pre>
+  <div id="copyRow" style="display:none;margin-top:10px;">
+    <button id="copyBtn" class="copy-btn" type="button">Copy License Key</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  const urlKey = new URLSearchParams(location.search).get('master_key');
+  document.getElementById('issueForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const payload = {
+      company: fd.get('company'),
+      tier: fd.get('tier'),
+      max_users: Number(fd.get('max_users') || 0),
+      expires: fd.get('expires') ? fd.get('expires') + 'T23:59:59+00:00' : '',
+      master_key: urlKey,
+    };
+    const res = await fetch('/v1/admin/license/generate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    const pre = document.getElementById('result');
+    pre.style.display = 'block';
+    if (res.ok) {
+      pre.textContent = data.license_key;
+      document.getElementById('copyRow').style.display = 'block';
+      document.getElementById('copyBtn').onclick = () => navigator.clipboard.writeText(data.license_key);
+    } else {
+      pre.textContent = 'Error: ' + JSON.stringify(data, null, 2);
+    }
+  });
+})();
+</script>
+"""
+    return HTMLResponse(_site_shell("Issue License", body, active=""))
+
+
+@app.get("/enterprise-guide", response_class=HTMLResponse)
+def enterprise_guide():
+    """Two-part enterprise documentation: Admin Guide | User Guide (Phase B.11).
+    Tabbed navigation wrapped in _site_shell. Markdown rendered via `markdown` lib."""
+    admin_path = Path(__file__).parent / "docs" / "ENTERPRISE_ADMIN_GUIDE.md"
+    user_path  = Path(__file__).parent / "docs" / "ENTERPRISE_USER_GUIDE.md"
+
+    try:
+        import markdown as _md
+    except ImportError:
+        return HTMLResponse(_site_shell(
+            "Enterprise Guide",
+            "<h1 class='page-title'>Enterprise Guide</h1>"
+            "<p class='lead'>The markdown renderer isn't installed on this server. "
+            "Install the <code>markdown</code> package.</p>",
+            active="enterprise"))
+
+    def render_md(path: Path) -> str:
+        if not path.exists():
+            return "<p>Guide not deployed yet.</p>"
+        txt = path.read_text(encoding="utf-8")
+        return _md.markdown(
+            txt,
+            extensions=["fenced_code", "tables", "sane_lists", "toc"],
+        )
+
+    admin_html = render_md(admin_path)
+    user_html  = render_md(user_path)
+
+    body = f"""<span class="eyebrow">Enterprise Documentation</span>
+<h1 class="page-title">Enterprise Guide</h1>
+<p class="lead">Deployment, operation, and end-user documentation for AIAuth Enterprise (self-hosted).</p>
+
+<div style="margin-top:24px; border-bottom:1px solid var(--border);">
+  <button id="tab-admin" class="eg-tab eg-active" onclick="pickTab('admin')">Admin Guide</button>
+  <button id="tab-user"  class="eg-tab" onclick="pickTab('user')">User Guide</button>
+</div>
+
+<style>
+  .eg-tab {{ background: transparent; border: none; padding: 10px 18px; font-family: inherit; font-size: 14px;
+             font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent;
+             margin-bottom: -1px; }}
+  .eg-tab:hover {{ color: var(--text); }}
+  .eg-active {{ color: var(--accent) !important; border-bottom-color: var(--accent) !important; }}
+  .eg-pane {{ display: none; }}
+  .eg-pane.eg-on {{ display: block; }}
+</style>
+
+<div id="pane-admin" class="prose eg-pane eg-on">{admin_html}</div>
+<div id="pane-user"  class="prose eg-pane">{user_html}</div>
+
+<script>
+  function pickTab(which) {{
+    document.getElementById('tab-admin').classList.toggle('eg-active', which === 'admin');
+    document.getElementById('tab-user').classList.toggle('eg-active', which === 'user');
+    document.getElementById('pane-admin').classList.toggle('eg-on', which === 'admin');
+    document.getElementById('pane-user').classList.toggle('eg-on', which === 'user');
+    if (history.replaceState) history.replaceState(null, '', '?' + which);
+  }}
+  // Deep link: /enterprise-guide?user or ?admin
+  if (location.search.indexOf('user') !== -1) pickTab('user');
+</script>
+"""
+    return HTMLResponse(_site_shell("Enterprise Guide", body, active="enterprise", wide=True))
+
+
+@app.get("/samples/compliance-report", response_class=HTMLResponse)
+def samples_compliance_report():
+    """Audit-ready compliance report (Phase B.6). Standalone HTML with
+    @media print styles for PDF export. Synthetic data by default;
+    switches to live via ?source=live&org_id=...&session=..."""
+    tpl = Path(__file__).parent / "templates" / "commercial" / "compliance-report.html"
+    if tpl.exists():
+        return HTMLResponse(tpl.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>Compliance Report</h1><p>Template not deployed.</p>", status_code=404)
 
 
 @app.get("/static/synthetic-data.js")
@@ -2819,9 +3540,19 @@ def admin_dashboard_html():
         return HTMLResponse(tpl.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>Dashboard</h1><p>Template not deployed.</p>", status_code=404)
 
-def _page_shell(title: str, body_html: str, active: str = "") -> str:
-    """Shared page chrome matching index.html."""
+def _site_shell(title: str, body_html: str, active: str = "", wide: bool = False) -> str:
+    """Shared site chrome — single source of nav + footer for every
+    public page. Title Case throughout. Piece B.1.
+
+    Args:
+      title: inner <title> (gets " — AIAuth" suffix)
+      body_html: page content (already-formed HTML)
+      active: which nav item to highlight ("home" | "how" | "business" |
+              "guide" | "check" | "enterprise" | "")
+      wide: use wider content container (for dashboards, tables)
+    """
     def active_cls(key): return ' style="color:var(--text)"' if active == key else ""
+    inner_class = "container-wide" if wide else "container"
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2844,6 +3575,8 @@ a:hover {{ text-decoration:underline; }}
 .nav-links a {{ color:var(--muted); }}
 .nav-cta {{ background:var(--accent); color:#fff !important; padding:8px 14px; border-radius:8px; font-weight:600; }}
 .nav-cta:hover {{ text-decoration:none; background:#1d4ed8; }}
+.nav-cta-outline {{ border:1px solid var(--border); color:var(--text) !important; padding:7px 12px; border-radius:8px; font-weight:600; }}
+.nav-cta-outline:hover {{ text-decoration:none; border-color:var(--accent); color:var(--accent) !important; }}
 .page {{ padding:64px 0 96px; }}
 .eyebrow {{ display:inline-flex; padding:6px 12px; background:var(--accent-soft); color:var(--accent); border-radius:999px; font-size:12px; font-weight:600; letter-spacing:0.02em; text-transform:uppercase; }}
 h1.page-title {{ font-size:clamp(30px,4vw,46px); line-height:1.1; font-weight:800; letter-spacing:-0.02em; margin-top:18px; }}
@@ -2870,26 +3603,37 @@ h1.page-title {{ font-size:clamp(30px,4vw,46px); line-height:1.1; font-weight:80
 footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px solid var(--border); }}
 .foot-inner {{ display:flex; justify-content:space-between; flex-wrap:wrap; gap:16px; }}
 .foot-inner a {{ color:var(--muted); margin-right:18px; }}
-@media (max-width:760px) {{ .nav-links {{ display:none; }} }}
+@media (max-width:760px) {{ .nav-links a:not(.nav-cta):not(.brand) {{ display:none; }} }}
 </style>
 </head><body>
 <nav class="nav"><div class="container-wide nav-inner">
   <a class="brand" href="/"><img src="/logo.png" alt="AIAuth"><span>AIAuth</span></a>
   <div class="nav-links">
-    <a href="/#how"{active_cls('how')}>How it works</a>
-    <a href="/#download"{active_cls('download')}>Download</a>
-    <a href="/guide"{active_cls('guide')}>User guide</a>
-    <a class="nav-cta" href="/check">Verify a receipt</a>
+    <a href="/#how-it-works"{active_cls('how')}>How It Works</a>
+    <a href="/#business"{active_cls('business')}>For Business</a>
+    <a href="/guide"{active_cls('guide')}>User Guide</a>
+    <a class="nav-cta-outline" href="/check"{active_cls('check')}>Verify a Receipt</a>
   </div>
 </div></nav>
-<main class="page"><div class="container">
+<main class="page"><div class="{inner_class}">
 {body_html}
 </div></main>
 <footer><div class="container-wide foot-inner">
   <div>&copy; 2026 Finch Business Services LLC · AIAuth</div>
-  <div><a href="/check">Verify</a><a href="/guide">User guide</a><a href="/public-key">Public key</a></div>
+  <div>
+    <a href="/privacy">Privacy</a>
+    <a href="/public-key">Public Key</a>
+    <a href="/enterprise-guide">Enterprise Guide</a>
+    <a href="https://github.com/chasehfinch-cpu/AIAuth" target="_blank" rel="noopener">GitHub</a>
+  </div>
 </div></footer>
 </body></html>"""
+
+
+# Backward-compat alias so older route handlers continue to work while
+# Phase B rewrites happen incrementally.
+def _page_shell(title: str, body_html: str, active: str = "") -> str:
+    return _site_shell(title, body_html, active=active)
 
 
 @app.get("/guide", response_class=HTMLResponse)
@@ -2915,80 +3659,98 @@ def user_guide():
 
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy_page():
-    body = """<span class="eyebrow">Privacy policy</span>
-<h1 class="page-title">AIAuth privacy policy</h1>
-<p class="lead">Short version: your content never leaves your device. AIAuth only sees a one-way cryptographic fingerprint (SHA-256 hash) of what you attest, and that fingerprint cannot be reversed into your original content.</p>
+    body = """<span class="eyebrow">Privacy Policy</span>
+<h1 class="page-title">Privacy Policy</h1>
+<p class="lead">Your content never leaves your device. We store hashes and ciphertext, not emails or files. If our server is compromised, an attacker should get nothing useful.</p>
 
 <div class="prose">
-<p style="color:var(--muted);font-size:13px">Last updated: April 21, 2026 · Operator: Finch Business Services LLC</p>
+<p style="color:var(--muted);font-size:13px">Last updated: April 22, 2026 · Operator: Finch Business Services LLC</p>
 
-<h2>What AIAuth does</h2>
-<p>AIAuth is a cryptographic attestation service. It lets you create tamper-evident receipts for AI-generated content that you produce or review. You interact with it through the AIAuth Chrome extension, a desktop app, or direct API calls.</p>
+<h2>What AIAuth Does</h2>
+<p>AIAuth creates tamper-proof receipts for AI-generated work. You interact with it through the Chrome extension, a desktop agent, or direct API calls. The free tier is anonymous by design; the Enterprise tier is self-hosted and runs on your own infrastructure.</p>
 
-<h2>What data AIAuth processes</h2>
-<h3>1. On your device (the Chrome extension)</h3>
-<p>The extension stores, locally in Chrome's <code>chrome.storage.local</code>, only what you explicitly enter or create:</p>
+<h2>What We Store on the Free Tier</h2>
+
+<h3>1. The anonymous hash registry</h3>
+<p>Every attested content hash gets a row in a six-column registry:</p>
 <ul>
-  <li>An identifier you enter (email address or name). Used inside your receipts so you can later prove you attested something. Never sent to AIAuth servers as a standalone record.</li>
-  <li>The server URL you configure (default <code>https://aiauth.app</code>).</li>
-  <li>Your receipts — the signed JSON for each attestation you create, kept so you can share or verify them later.</li>
+  <li><code>content_hash</code> — SHA-256 of your content (one-way; cannot be reversed)</li>
+  <li><code>receipt_id</code> — a random UUID</li>
+  <li><code>parent_hash</code> — the previous version's hash, for chain discovery</li>
+  <li><code>doc_id</code> — persistent document identifier</li>
+  <li><code>content_hash_canonical</code> — SHA-256 of the canonical text (enables cross-format chain: xlsx → csv → pdf)</li>
+  <li><code>registered_at</code> — timestamp</li>
 </ul>
-<p>This local data stays on your machine. Uninstalling the extension removes it.</p>
+<p>No email. No name. No content. No IP address. Nothing here identifies a person.</p>
 
-<h3>2. What the extension sends to the AIAuth server</h3>
-<p>When you attest content, the extension computes a SHA-256 hash of that content <em>in your browser</em>, then sends the following to the server's <code>/v1/sign</code> endpoint over HTTPS:</p>
+<h3>2. Email address and account_id — ONLY if you create an account</h3>
+<p>Creating an account is optional. You can use AIAuth without one — the Chrome extension's "Start Attesting" button enables attestation immediately. An account is only needed if you want to link email addresses across devices, verify your identity for cross-person chain-of-custody use cases, or manage consent for enterprise deployments.</p>
+<p>When you create an account, we store:</p>
 <ul>
-  <li>The SHA-256 hash (a 64-character hex string).</li>
-  <li>The identifier you entered (email or name).</li>
-  <li>A source string (for example <code>chrome-extension</code> or <code>file:yourfile.xlsx</code>).</li>
-  <li>For file attestations, an optional note containing filename, size, and MIME type so you can tell receipts apart in your own list.</li>
+  <li>An HMAC hash of your email (never the plaintext)</li>
+  <li>An account identifier</li>
+  <li>Timestamps (created, updated, verified)</li>
+  <li>A separate "domain" field (e.g. <code>acme.com</code>) for enterprise-domain matching</li>
 </ul>
-<p><strong>The original content is never transmitted.</strong> A SHA-256 hash is a one-way fingerprint — it cannot be reversed to recover your content.</p>
+<p>We cannot enumerate who is registered — the hash is salted with a server secret. The only way your email is linked to your account in our database is through the one-way hash.</p>
 
-<h3>3. What the AIAuth server stores</h3>
-<p>In public mode (the default mode at <code>aiauth.app</code>), the server stores only:</p>
+<h3>3. Authentication ephemera</h3>
+<p>For magic-link logins we store single-use nonces (to prevent token replay) and revoked session IDs (for logout). Both are auto-pruned. No long-lived identifiers.</p>
+
+<h2>What We Never Store on the Free Tier</h2>
 <ul>
-  <li>A minimal <em>hash registry</em>: the content hash, the receipt ID, an optional parent hash, and a timestamp. No user identifier, no content, no IP address, no session data.</li>
+  <li><strong>Your content.</strong> Only a SHA-256 hash is sent, and hashes are one-way.</li>
+  <li><strong>Plaintext emails.</strong> We hash with HMAC-SHA256 before writing to disk. Our own database dumps show 64-character hashes, not email addresses.</li>
+  <li><strong>Receipt contents.</strong> The full signed receipt is returned to your device; we sign and forget.</li>
+  <li><strong>Behavioral metadata.</strong> Time-to-attest, destinations, classifications, concurrent AI apps — none of these are captured on the free tier. (Enterprise customers opt in to these for their own dashboards, on their own servers.)</li>
+  <li><strong>Prompt text.</strong> If you attest AI output and we detect the prompt that produced it, only its one-way hash is recorded. We never see the prompt.</li>
 </ul>
-<p>The registry exists so that anyone holding the same content or a receipt code can confirm a receipt exists. It contains nothing that can identify a person.</p>
-<p>The full signed receipt (which <em>does</em> contain your identifier) is returned to your device and never persisted on the server.</p>
 
-<h2>What AIAuth does not do</h2>
+<h2>Data Hardening</h2>
+<p>If someone breaks into our server, they should get as little as possible. Concretely:</p>
 <ul>
-  <li>AIAuth does not read, store, or transmit the text or files you attest.</li>
-  <li>AIAuth does not track you across sites, log your browsing, or profile your activity.</li>
-  <li>AIAuth does not use analytics, cookies, trackers, or third-party SDKs in the extension.</li>
-  <li>AIAuth does not sell, rent, or share your data with any third party.</li>
-  <li>AIAuth does not use your data for advertising, credit scoring, or any purpose unrelated to producing and verifying the receipts you ask for.</li>
+  <li>Email addresses are stored as HMAC hashes, salted with a server secret.</li>
+  <li>Enterprise-tier user identifiers (<code>uid</code>) are stored as AES-GCM ciphertext; only an authenticated admin of the owning organization can decrypt them, and only at response time — never written to a log.</li>
+  <li>Consent-log details (who requested what access) are stored as AES-GCM ciphertext.</li>
+  <li>Magic-link emails are delivered via a transactional email provider (Resend) and never written to our filesystem. Local file logging of magic links is off by default.</li>
+  <li>The one residual risk is our private signing keys — losing them means receipts can't be verified, so we keep them on encrypted offline backups and rotate annually. A new signing key never invalidates historical receipts; the old public key stays in our key manifest for verification.</li>
 </ul>
 
-<h2>Server logs</h2>
-<p>The AIAuth web server (nginx + uvicorn) may write standard HTTP access logs containing request timestamps, paths, status codes, and IP addresses, for operational reliability and abuse prevention. These logs are rotated and are not used for marketing, analytics, or resale. They are not tied to any stored user profile because AIAuth does not maintain user profiles.</p>
+<h2>What Changes on the Enterprise Tier</h2>
+<p>AIAuth Enterprise is <strong>self-hosted</strong>. You run the server on your own infrastructure, your IT team manages the keys, and your employees' attestation data stays on your network. We never see it. Finch Business Services LLC is a software vendor, not a data processor, for enterprise deployments. Your organization's own privacy policy governs the data your server processes.</p>
 
-<h2>Third-party services</h2>
-<p>The AIAuth website loads fonts from Google Fonts for typography. When you visit a page on aiauth.app, your browser fetches these font files from Google's CDN; this is subject to Google's own privacy terms. No AIAuth data is transmitted to Google.</p>
-<p>The AIAuth Chrome extension itself does not load any third-party resources.</p>
+<h2>GDPR and Data Subject Rights</h2>
+<p>Because the hash registry contains no personally identifiable information, registry rows are not subject to GDPR — a hash cannot be traced to you.</p>
+<p>For accounts, you have the right to export, pseudonymize, or delete your data. Contact us at <a href="mailto:privacy@aiauth.app">privacy@aiauth.app</a> and we will respond within 30 days. In most cases, deleting your local data (by uninstalling the extension) and requesting account deletion is sufficient.</p>
 
-<h2>Enterprise / self-hosted deployments</h2>
-<p>Organizations running AIAuth in <code>enterprise</code> mode on their own infrastructure may configure the server to store full attestation records, including content hashes, user identifiers, review status, and timestamps, inside their own database. In that case, the operating organization — not Finch Business Services LLC — is the data controller, and their own privacy policy governs that data.</p>
-
-<h2>Your rights</h2>
+<h2>What We Don't Do</h2>
 <ul>
-  <li>Your local data: you can delete it by clearing the extension's storage from <code>chrome://extensions</code> or by uninstalling the extension.</li>
-  <li>Registered hashes: because the hash registry contains no identifying information, there is no personal data to access, correct, or delete. A hash cannot be traced to you.</li>
-  <li>If you contact us with a specific request, we will respond within 30 days.</li>
+  <li>No tracking across sites. No analytics. No ad pixels.</li>
+  <li>No third-party SDKs in the Chrome extension.</li>
+  <li>No selling, renting, or sharing of your data.</li>
+  <li>No scraping or retention of the content you attest.</li>
 </ul>
+
+<h2>Server Logs</h2>
+<p>Our reverse proxy (nginx) logs standard HTTP access records — timestamps, paths, status codes, IP addresses — for operational reliability and abuse prevention. These are rotated weekly and not linked to any user profile (because we don't maintain user profiles in the traditional sense).</p>
+
+<h2>Third-Party Services</h2>
+<p>Our website loads typography fonts from Google Fonts. When you visit a page on aiauth.app, your browser fetches font files from Google's CDN — subject to Google's own privacy terms. The Chrome extension loads no third-party resources.</p>
+<p>Our transactional email provider is <strong>Resend</strong>. They hold email-delivery metadata (recipient address, timestamp) for up to 30 days for deliverability diagnostics. We do not transmit anything else to them.</p>
 
 <h2>Children</h2>
 <p>AIAuth is not directed to children under 13 and does not knowingly collect information from them.</p>
 
-<h2>Changes to this policy</h2>
-<p>Material changes will be announced on this page, and the "last updated" date above will change. The public-mode data practices described here (content never transmitted, no identifying data stored server-side) are core to the product and will not change without a new major version.</p>
+<h2>Honest Reality</h2>
+<p>AIAuth is built by a one-person business. We offer no SLAs, no 24/7 support line, and no formal data-protection officer. What we offer is software that tries to be small, honest, and correct. If you have questions or concerns, you'll get a direct reply from a human within a few days.</p>
+
+<h2>Changes to This Policy</h2>
+<p>Material changes are announced on this page and the "last updated" date changes. The core guarantees (content never transmitted; no plaintext emails stored; no selling data) will never change without a new major version and explicit notice to existing account holders.</p>
 
 <h2>Contact</h2>
-<p>Questions, requests, or concerns: <a href="mailto:chase@finchbusinessserv.com">chase@finchbusinessserv.com</a>.</p>
+<p>Questions: <a href="mailto:privacy@aiauth.app">privacy@aiauth.app</a>. Security advisories: <a href="mailto:security@aiauth.app">security@aiauth.app</a>.</p>
 </div>"""
-    return HTMLResponse(_page_shell("Privacy", body, active=""))
+    return HTMLResponse(_site_shell("Privacy", body, active=""))
 
 
 @app.get("/public-key", response_class=HTMLResponse)

@@ -1,71 +1,55 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AIAuth — Verify a Receipt</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- AIAuth /check body fragment — wrapped in _site_shell() by server.
+     Light theme aligned to the rest of the site (Phase B.3). -->
 <style>
-:root { --bg:#08090a; --surface:#111214; --border:#1e2023; --text:#e8e9eb; --muted:#6b7075; --accent:#2563eb; --green:#22c55e; --red:#ef4444; --amber:#eab308; }
-* { margin:0; padding:0; box-sizing:border-box; }
-body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; }
-.container { width:100%; max-width:640px; padding:48px 24px; }
-.logo { display:flex; align-items:center; gap:12px; margin-bottom:8px; }
-.logo-mark { width:40px; height:40px; background:var(--accent); border-radius:10px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:20px; color:white; }
-.logo-text { font-size:24px; font-weight:700; letter-spacing:-0.5px; }
-.subtitle { color:var(--muted); font-size:15px; margin-bottom:40px; }
-textarea { width:100%; min-height:180px; padding:16px; background:var(--surface); border:1px solid var(--border); border-radius:10px; color:var(--text); font-family:'DM Mono',monospace; font-size:13px; line-height:1.6; resize:vertical; outline:none; }
-textarea:focus { border-color:var(--accent); }
-textarea::placeholder { color:#3a3d42; }
-.hint { color:var(--muted); font-size:12px; margin-top:8px; }
-.btn { width:100%; padding:14px; background:var(--accent); color:white; border:none; border-radius:10px; font-size:15px; font-weight:600; font-family:inherit; cursor:pointer; margin-top:16px; }
-.btn:hover { background:#1d4ed8; }
-.btn:disabled { background:#1e2023; color:#3a3d42; cursor:default; }
-#result { display:none; margin-top:32px; animation:fadeIn .3s ease; }
-@keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
-.r-header { display:flex; align-items:center; gap:12px; padding:20px; border-radius:10px 10px 0 0; }
-.r-valid { background:#22c55e12; border:1px solid #22c55e25; }
-.r-invalid { background:#ef444412; border:1px solid #ef444425; }
-.r-icon { width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:700; flex-shrink:0; }
-.r-valid .r-icon { background:#22c55e20; color:var(--green); }
-.r-invalid .r-icon { background:#ef444420; color:var(--red); }
-.r-title { font-size:17px; font-weight:600; }
-.r-sub { font-size:13px; color:var(--muted); margin-top:2px; }
-.r-body { background:var(--surface); border:1px solid var(--border); border-top:none; border-radius:0 0 10px 10px; padding:20px; }
-.r-row { display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid var(--border); font-size:14px; }
-.r-row:last-child { border-bottom:none; }
-.r-label { color:var(--muted); font-weight:500; }
-.r-val { text-align:right; font-family:'DM Mono',monospace; font-size:13px; max-width:55%; word-break:break-all; }
-.good { color:var(--green); }
-.bad { color:var(--red); }
-.chain-section { margin-top:20px; padding-top:20px; border-top:1px solid var(--border); }
-.chain-title { font-size:13px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-bottom:12px; }
-.chain-link { display:flex; gap:14px; padding:10px 0; }
-.chain-line { display:flex; flex-direction:column; align-items:center; width:20px; }
-.chain-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
-.chain-dot.ok { background:var(--green); }
-.chain-dot.fail { background:var(--red); }
-.chain-conn { width:2px; flex:1; background:var(--border); min-height:8px; }
-.chain-detail { flex:1; font-size:13px; line-height:1.5; }
-.chain-user { font-weight:600; }
-.chain-meta { color:var(--muted); font-size:12px; }
-.chain-model { display:inline-block; background:var(--border); padding:1px 8px; border-radius:4px; font-family:'DM Mono',monospace; font-size:11px; }
-.how { margin-top:56px; padding-top:32px; border-top:1px solid var(--border); }
-.how h2 { font-size:16px; font-weight:600; margin-bottom:20px; }
-.step { display:flex; gap:14px; margin-bottom:16px; }
-.step-n { width:28px; height:28px; background:var(--surface); border:1px solid var(--border); border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; color:var(--accent); flex-shrink:0; }
-.step-t { font-size:14px; line-height:1.6; color:var(--muted); padding-top:3px; }
-.footer { margin-top:56px; text-align:center; font-size:12px; color:#3a3d42; padding-bottom:32px; }
-.footer a { color:var(--muted); text-decoration:none; }
+  /* Page-local overrides to complement _site_shell's vars.
+     Colors use the site palette; status colors kept distinct. */
+  .v-local { --surface:#f7f8fa; --green:#15803d; --red:#b91c1c; --amber:#b45309; }
+  .v-local .subtitle { color:var(--muted); font-size:15px; margin:-12px 0 32px; }
+  .v-local textarea { width:100%; min-height:180px; padding:16px; background:#fff; border:1px solid var(--border); border-radius:10px; color:var(--text); font-family:'JetBrains Mono',monospace; font-size:13px; line-height:1.6; resize:vertical; outline:none; }
+  .v-local textarea:focus { border-color:var(--accent); }
+  .v-local textarea::placeholder { color:#9aa0a6; }
+  .v-local .hint { color:var(--muted); font-size:12px; margin-top:8px; }
+  .v-local .btn { width:100%; padding:14px; background:var(--accent); color:white; border:none; border-radius:10px; font-size:15px; font-weight:600; font-family:inherit; cursor:pointer; margin-top:16px; }
+  .v-local .btn:hover { background:#1d4ed8; }
+  .v-local .btn:disabled { background:#e5e7eb; color:#9aa0a6; cursor:default; }
+  .v-local #result { display:none; margin-top:32px; animation:fadeIn .3s ease; }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  .v-local .r-header { display:flex; align-items:center; gap:12px; padding:20px; border-radius:10px 10px 0 0; }
+  .v-local .r-valid { background:#ecfdf5; border:1px solid #bbf7d0; }
+  .v-local .r-invalid { background:#fef2f2; border:1px solid #fecaca; }
+  .v-local .r-icon { width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:700; flex-shrink:0; }
+  .v-local .r-valid .r-icon { background:#d1fae5; color:var(--green); }
+  .v-local .r-invalid .r-icon { background:#fee2e2; color:var(--red); }
+  .v-local .r-title { font-size:17px; font-weight:600; }
+  .v-local .r-sub { font-size:13px; color:var(--muted); margin-top:2px; }
+  .v-local .r-body { background:#fff; border:1px solid var(--border); border-top:none; border-radius:0 0 10px 10px; padding:20px; }
+  .v-local .r-row { display:flex; justify-content:space-between; padding:10px 0; border-bottom:1px solid #f1f5f9; font-size:14px; }
+  .v-local .r-row:last-child { border-bottom:none; }
+  .v-local .r-label { color:var(--muted); font-weight:500; }
+  .v-local .r-val { text-align:right; font-family:'JetBrains Mono',monospace; font-size:13px; max-width:55%; word-break:break-all; }
+  .v-local .good { color:var(--green); }
+  .v-local .bad { color:var(--red); }
+  .v-local .chain-section { margin-top:20px; padding-top:20px; border-top:1px solid var(--border); }
+  .v-local .chain-title { font-size:13px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-bottom:12px; }
+  .v-local .chain-link { display:flex; gap:14px; padding:10px 0; }
+  .v-local .chain-line { display:flex; flex-direction:column; align-items:center; width:20px; }
+  .v-local .chain-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+  .v-local .chain-dot.ok { background:var(--green); }
+  .v-local .chain-dot.fail { background:var(--red); }
+  .v-local .chain-conn { width:2px; flex:1; background:var(--border); min-height:8px; }
+  .v-local .chain-detail { flex:1; font-size:13px; line-height:1.5; }
+  .v-local .chain-user { font-weight:600; }
+  .v-local .chain-meta { color:var(--muted); font-size:12px; }
+  .v-local .chain-model { display:inline-block; background:var(--panel); padding:1px 8px; border-radius:4px; font-family:'JetBrains Mono',monospace; font-size:11px; }
+  .v-local .how { margin-top:56px; padding-top:32px; border-top:1px solid var(--border); }
+  .v-local .how h2 { font-size:16px; font-weight:600; margin-bottom:20px; }
+  .v-local .step { display:flex; gap:14px; margin-bottom:16px; }
+  .v-local .step-n { width:28px; height:28px; background:var(--panel); border:1px solid var(--border); border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:600; color:var(--accent); flex-shrink:0; }
+  .v-local .step-t { font-size:14px; line-height:1.6; color:var(--muted); padding-top:3px; }
 </style>
-</head>
-<body>
-<div class="container">
-  <div class="logo">
-    <div class="logo-mark">A</div>
-    <div class="logo-text">AIAuth</div>
-  </div>
-  <p class="subtitle">Verify an AI attestation receipt</p>
+<div class="v-local">
+  <h1 class="page-title">Verify a Receipt</h1>
+  <p class="subtitle">Paste a receipt or drop a file to check its chain of custody.</p>
 
   <div>
     <textarea id="input" placeholder='Paste either:
@@ -88,11 +72,6 @@ textarea::placeholder { color:#3a3d42; }
   </div>
 
   <div id="result"></div>
-
-  <div class="footer">
-    <a href="/">← AIAuth home</a> — Notarize your AI work<br>
-    <a href="/guide">User Guide</a> · <a href="/docs">API Docs</a>
-  </div>
 </div>
 
 <script>
@@ -444,5 +423,3 @@ async function verifyFile(file) {
   });
 })();
 </script>
-</body>
-</html>

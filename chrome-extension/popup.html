@@ -147,14 +147,69 @@
   <!-- STATE 1: NOT CONFIGURED -->
   <div id="state1" class="state">
     <div class="panel">
-      <div class="head">Chain of custody for AI work.</div>
-      <div class="body">Enter your email to get started. Free forever. No content leaves your machine.</div>
+      <div class="head">Chain of Custody for AI Work</div>
+      <div class="body">Enter your email to start. Free forever. No content leaves your machine.</div>
       <label for="onboardEmail" style="text-align:left;">Your email</label>
       <input id="onboardEmail" type="email" placeholder="you@example.com" />
-      <div class="row" style="margin-top:8px;">
-        <button id="onboardStart" class="primary">Get Started</button>
+      <div class="row" style="margin-top:10px; flex-direction:column; gap:6px;">
+        <button id="startAttesting" class="primary">Start Attesting</button>
+        <button id="onboardStart" class="secondary">Verify My Email (Recommended)</button>
+      </div>
+      <div class="body" style="font-size:10px; margin-top:10px; color:#888; line-height:1.4;">
+        <b>Start Attesting</b> lets you begin immediately. Your email appears on receipts as-is.
+        <b>Verify My Email</b> enables cross-person chain-of-custody and enterprise features.
       </div>
     </div>
+  </div>
+
+  <!-- STATE 3u: UNVERIFIED READY — attestation works; nudge to verify -->
+  <div id="state3u" class="state">
+    <div class="muted">
+      <b id="currentIdentU">you@example.com</b>
+      <span class="badge free">Free · Unverified</span>
+    </div>
+    <div class="muted" style="margin-top:4px;">Ctrl+Shift+A on a supported AI site to attest selected text.</div>
+
+    <div id="verifyBanner" style="margin-top:12px; padding:10px; background:#fef3c7; border:1px solid #fcd34d; border-radius:8px; font-size:12px; color:#78350f;">
+      <b>Your email is unverified.</b> Attestation works, but cross-person and enterprise features
+      need a verified email. <a href="#" id="verifyNow" style="color:#2563eb; font-weight:600;">Verify Now</a>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="n" id="statTodayU">0</div><div class="lbl">Today</div></div>
+      <div class="stat"><div class="n" id="statTotalU">0</div><div class="lbl">Total</div></div>
+      <div class="stat"><div class="n" id="statPendingU">0</div><div class="lbl">Pending</div></div>
+    </div>
+
+    <div class="section">
+      <h2>Recent receipts</h2>
+      <div id="receiptsU"></div>
+    </div>
+
+    <div class="section">
+      <h2>Attest a file</h2>
+      <div id="dropU" class="drop">
+        <span class="drop-label">Drop a file here, or click to choose</span>
+        <span class="drop-sub">Excel, PDF, Word, images — hashed locally, file never uploaded.</span>
+      </div>
+      <input id="filePickerU" type="file" style="display:none" />
+    </div>
+
+    <div class="section">
+      <h2>Attest pasted text</h2>
+      <textarea id="manualU" placeholder="Paste AI output here"></textarea>
+      <button id="signU" style="margin-top:6px;">Attest text</button>
+    </div>
+
+    <details>
+      <summary>Settings</summary>
+      <label for="serverU">Server</label>
+      <input id="serverU" type="text" placeholder="https://aiauth.app" />
+      <div class="row" style="margin-top:8px;">
+        <button id="saveU" class="secondary">Save</button>
+        <button id="changeEmailU" class="secondary">Change email</button>
+      </div>
+    </details>
   </div>
 
   <!-- STATE 2: AWAITING VERIFICATION -->

@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "description": "AIAuth enterprise managed configuration. Push via Google Workspace Admin Console -> Apps -> Chrome -> Apps & Extensions -> Managed configuration. Fields below override user-configurable defaults.",
+  "properties": {
+    "enterprise_server": {
+      "type": "string",
+      "description": "Customer's self-hosted AIAuth server URL (e.g., https://aiauth.acme.com). Overrides DEFAULT_SERVER on first launch.",
+      "title": "AIAuth Server URL"
+    },
+    "org_domain": {
+      "type": "string",
+      "description": "The primary email domain for your organization (e.g., acme.com). Used to restrict sign-up to corporate emails.",
+      "title": "Organization Email Domain"
+    },
+    "tier": {
+      "type": "string",
+      "enum": ["free", "enterprise"],
+      "description": "Capture tier for this deployment. 'enterprise' enables commercial fields (tta, sid, dest, classification, concurrent_ai_apps).",
+      "title": "Capture Tier"
+    },
+    "require_verification": {
+      "type": "boolean",
+      "description": "When true, hides the 'Start Attesting (unverified)' button and forces the magic-link verification flow.",
+      "title": "Require Email Verification"
+    }
+  }
+}

@@ -615,6 +615,86 @@ def attest_clipboard(config: dict):
         print(f"[ERROR] {e}")
 
 
+def _load_sidecar(filepath: Path) -> Optional[dict]:
+    """Read a {filename}.aiauth sidecar file if it exists next to the
+    target file. Sidecar carries doc_id, parent chain, canonical_hash
+    for formats that can't embed metadata natively (CSV, TXT, JSON)."""
+    sidecar = Path(str(filepath) + ".aiauth")
+    if not sidecar.exists():
+        return None
+    try:
+        with open(sidecar, "r", encoding="utf-8") as f:
+            import json as _json
+            return _json.load(f)
+    except Exception:
+        return None
+
+
+def _write_sidecar(filepath: Path, receipt: dict) -> None:
+    """Write or update the .aiauth sidecar next to a file after a
+    successful attest. Preserves chain-of-custody across formats that
+    don't support embedded metadata."""
+    sidecar = Path(str(filepath) + ".aiauth")
+    payload = {
+        "doc_id": receipt.get("doc_id"),
+        "receipt_id": receipt.get("id"),
+        "receipt_code": f"[AIAuth:{receipt['id'][:12]}]",
+        "parent": receipt.get("parent"),
+        "canonical_hash": receipt.get("content_hash_canonical"),
+        "last_attested": receipt.get("ts"),
+        "note": (f"Keep this .aiauth file alongside {filepath.name} to "
+                 "preserve chain of custody across transfers."),
+    }
+    try:
+        import json as _json
+        with open(sidecar, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, indent=2)
+    except Exception:
+        pass
+
+
+# File formats that benefit from a sidecar (can't embed metadata natively)
+_SIDECAR_EXTENSIONS = {".csv", ".tsv", ".txt", ".md", ".json", ".yaml", ".yml"}
+
+
+def _canonical_hash_for_file(filepath: Path) -> tuple:
+    """Try to compute a canonical content hash for the file. Returns
+    (hash_hex, extraction_failed_flag). Gracefully falls back if the
+    aiauth_canonical module or its dependencies are missing."""
+    try:
+        # Import lazily so agents without the self-hosted folder still run.
+        import sys
+        here = Path(__file__).parent
+        candidate = here / "self-hosted"
+        if str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+        import aiauth_canonical  # type: ignore
+    except ImportError:
+        return None, False
+    try:
+        h = aiauth_canonical.canonical_hash(filepath)
+        return h, h is None and filepath.suffix.lower() in aiauth_canonical._EXTRACTORS
+    except NotImplementedError:
+        return None, True
+    except Exception:
+        return None, False
+
+
+def _perceptual_hashes_for_image(filepath: Path) -> Optional[dict]:
+    """Compute dhash + phash for image files. None if not an image or
+    if imagehash/Pillow unavailable."""
+    try:
+        import sys
+        here = Path(__file__).parent
+        candidate = here / "self-hosted"
+        if str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
+        import aiauth_canonical  # type: ignore
+    except ImportError:
+        return None
+    return aiauth_canonical.perceptual_hashes(filepath)
+
+
 def attest_file(filepath_str: str, config: dict):
     """File attestation entry point (invoked by --attest-file CLI)."""
     filepath = Path(filepath_str)
@@ -631,6 +711,22 @@ def attest_file(filepath_str: str, config: dict):
     file_type = detect_file_type(filepath)
     ai_markers = detect_ai_markers(filepath)
 
+    # Piece 14: canonical text hash (cross-format chain) + perceptual hash for images
+    canonical_hash, extraction_failed = _canonical_hash_for_file(filepath)
+
+    if filepath.suffix.lower() in (".jpg", ".jpeg", ".png", ".tiff", ".webp", ".gif"):
+        ph = _perceptual_hashes_for_image(filepath)
+        if ph:
+            # Merge into ai_markers (don't clobber other markers)
+            if ai_markers is None:
+                ai_markers = {"source": None, "verified": False}
+            ai_markers["perceptual_hashes"] = ph
+
+    # Sidecar: read for parent-chain carry; we write after successful sign
+    sidecar = _load_sidecar(filepath) if filepath.suffix.lower() in _SIDECAR_EXTENSIONS else None
+    parent_hash = (sidecar or {}).get("canonical_hash") or (sidecar or {}).get("content_hash")
+    doc_id = (sidecar or {}).get("doc_id")
+
     payload = build_sign_payload(
         content_hash,
         config,
@@ -639,7 +735,16 @@ def attest_file(filepath_str: str, config: dict):
         file_type=file_type,
         content_length=filepath.stat().st_size,
         ai_markers=ai_markers,
+        parent_hash=parent_hash,
+        doc_id=doc_id,
     )
+    # Attach Piece 14 fields if available
+    if canonical_hash:
+        payload["content_hash_canonical"] = canonical_hash
+    if extraction_failed:
+        payload["canonical_extraction_failed"] = True
+    if ai_markers and ai_markers.get("perceptual_hashes"):
+        payload["perceptual_hashes"] = ai_markers["perceptual_hashes"]
 
     server_url = config["server_url"]
     try:
@@ -650,9 +755,12 @@ def attest_file(filepath_str: str, config: dict):
             receipt_code = result["receipt_code"]
             set_clipboard_text(receipt_code)
             short_id = result.get("short_id") or result["receipt"]["id"][:12]
-            markers_note = f" (marker: {ai_markers['source']})" if ai_markers else ""
+            markers_note = f" (marker: {ai_markers['source']})" if ai_markers and ai_markers.get("source") else ""
             notify("AIAuth", f"File signed: {short_id}{markers_note}")
-            print(f"[OK] {receipt_code} — {filepath.name}{markers_note}")
+            print(f"[OK] {receipt_code} - {filepath.name}{markers_note}")
+            # Piece 14: write sidecar for formats that can't embed metadata
+            if filepath.suffix.lower() in _SIDECAR_EXTENSIONS:
+                _write_sidecar(filepath, result["receipt"])
         elif resp.status_code == 409:
             err = resp.json().get("error", {})
             existing_id = (err.get("details") or {}).get("existing_receipt_id", "?")

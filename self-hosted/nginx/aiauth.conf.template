@@ -1,0 +1,19 @@
+# AIAuth Enterprise — nginx reverse proxy template.
+# install.sh substitutes {{SERVER_HOST}} with the host from your config.yaml server_url.
+# Run `certbot --nginx -d {{SERVER_HOST}}` after this is in place to obtain TLS.
+
+server {
+    listen 80;
+    server_name {{SERVER_HOST}};
+
+    # Preserve originating client info for rate limiting + audit
+    location / {
+        proxy_pass http://127.0.0.1:8100;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        client_max_body_size 10m;
+    }
+}
