@@ -21,17 +21,18 @@ Enterprise mode (adds storage, dashboard, review history):
 
 import json
 import os
+import re
 import uuid
 import sqlite3
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
@@ -41,15 +42,42 @@ from cryptography.hazmat.primitives import serialization
 # CONFIG
 # ===================================================================
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
+SCHEMA_MIN = "0.4.0"   # server accepts receipts from any schema >= this
 MODE = os.getenv("AIAUTH_MODE", "public")
 KEY_DIR = Path(os.getenv("AIAUTH_KEY_DIR", "."))
 DB_PATH = os.getenv("AIAUTH_DB_PATH", "aiauth.db")
 LICENSE_KEY = os.getenv("AIAUTH_LICENSE_KEY", "")
 MASTER_KEY = os.getenv("AIAUTH_MASTER_KEY", "")  # Your admin key for issuing licenses
+DEDUP_WINDOW = int(os.getenv("AIAUTH_DEDUP_WINDOW", "300"))  # seconds; 0 disables dedup
+
+# Regex for SHA-256 hex (lowercase or uppercase)
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 app = FastAPI(title="AIAuth", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+# ===================================================================
+# STANDARD ERROR RESPONSE FORMAT
+# Matches the contract in CLAUDE.md "Error Handling" section.
+# ===================================================================
+
+class AIAuthError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400, details: Optional[dict] = None):
+        self.code = code
+        self.message = message
+        self.status = status
+        self.details = details or {}
+        super().__init__(message)
+
+
+@app.exception_handler(AIAuthError)
+async def _aiauth_error_handler(request: Request, exc: AIAuthError):
+    return JSONResponse(
+        status_code=exc.status,
+        content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}},
+    )
 
 
 # ===================================================================
@@ -210,23 +238,50 @@ def init_registry():
         parent_hash   TEXT,
         registered_at TEXT NOT NULL
     )""")
+    # v0.5.0 migration: add doc_id column if missing (idempotent, safe to re-run)
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(hash_registry)").fetchall()}
+    if "doc_id" not in existing_cols:
+        conn.execute("ALTER TABLE hash_registry ADD COLUMN doc_id TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_hash ON hash_registry(content_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_parent ON hash_registry(parent_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_receipt ON hash_registry(receipt_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_doc_id ON hash_registry(doc_id)")
     conn.commit()
     conn.close()
 
 init_registry()
 
-def register_hash(content_hash: str, receipt_id: str, parent_hash: str = None):
-    """Add an entry to the public registry. No user data stored."""
+def register_hash(content_hash: str, receipt_id: str, parent_hash: str = None, doc_id: str = None):
+    """Add an entry to the public registry. No user data stored.
+
+    Five columns only (per Core Principle #3): content_hash, receipt_id,
+    parent_hash, doc_id, registered_at. No uid, no model, no prompt_hash.
+    """
     conn = get_registry()
     conn.execute(
-        "INSERT INTO hash_registry (content_hash, receipt_id, parent_hash, registered_at) VALUES (?,?,?,?)",
-        (content_hash, receipt_id, parent_hash, datetime.now(timezone.utc).isoformat())
+        "INSERT INTO hash_registry (content_hash, receipt_id, parent_hash, doc_id, registered_at) VALUES (?,?,?,?,?)",
+        (content_hash, receipt_id, parent_hash, doc_id, datetime.now(timezone.utc).isoformat())
     )
     conn.commit()
     conn.close()
+
+
+def find_recent_duplicate(content_hash: str, window_seconds: int) -> Optional[dict]:
+    """Return {receipt_id, registered_at} if this hash was registered within
+    the dedup window, else None. Used by /v1/sign to avoid double-registration
+    from accidental double-clicks or batched replay."""
+    if window_seconds <= 0:
+        return None
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+    conn = get_registry()
+    row = conn.execute(
+        "SELECT receipt_id, registered_at FROM hash_registry "
+        "WHERE content_hash = ? AND registered_at > ? "
+        "ORDER BY registered_at DESC LIMIT 1",
+        (content_hash, cutoff)
+    ).fetchone()
+    conn.close()
+    return {"receipt_id": row["receipt_id"], "registered_at": row["registered_at"]} if row else None
 
 
 # ===================================================================
@@ -268,17 +323,56 @@ init_db()
 # ===================================================================
 
 class SignRequest(BaseModel):
-    output_hash: str              # SHA-256 of the content
-    user_id: str                  # Who is attesting
-    source: str = "unknown"       # Where it came from
-    model: Optional[str] = None   # AI model (if applicable)
+    # ----- Required (all schema versions) -----
+    output_hash: str              # SHA-256 of the content (64 hex chars)
+    user_id: str                  # Who is attesting (email or chosen uid)
+    source: str = "unknown"       # Surface: chrome-extension / desktop-agent / litellm-callback
+
+    # ----- v0.4.0 fields (retained) -----
+    model: Optional[str] = None
     provider: Optional[str] = None
-    review_status: Optional[str] = None  # approved/modified/rejected
+    review_status: Optional[str] = None  # approved / modified / rejected
     reviewer_id: Optional[str] = None
     note: Optional[str] = None
-    parent_hash: Optional[str] = None    # Previous version's OUTPUT hash
+    parent_hash: Optional[str] = None    # previous version's content hash
     tags: Optional[list] = None
-    register: bool = True         # Add to public hash registry for chain discovery
+    register: bool = True                # add to public hash registry
+
+    # ----- v0.5.0: free-tier additive fields -----
+    prompt_hash: Optional[str] = None           # SHA-256 of prompt text (free tier, see CLAUDE.md Prompt Hashing)
+    source_domain: Optional[str] = None         # e.g. "claude.ai"
+    source_app: Optional[str] = None            # active window/app title (desktop)
+    file_type: Optional[str] = None             # spreadsheet/document/pdf/code/image/prose/snippet/text/data
+    content_length: Optional[int] = Field(default=None, alias="len")   # character/byte count, NOT content
+    doc_id: Optional[str] = None                # persistent document identifier
+    ai_markers: Optional[Dict[str, Any]] = None # {"source": "...", "verified": bool}
+    client_integrity: Optional[str] = None      # "none" | "extension" | "os-verified"  (server may downgrade)
+
+    # ----- v0.5.0: commercial-tier fields (free-tier clients omit) -----
+    tta: Optional[int] = None                   # seconds between AI output and attestation
+    sid: Optional[str] = None                   # session id grouping same AI conversation
+    dest: Optional[str] = None                  # email / messaging / document-platform / code-repository
+    dest_ext: Optional[bool] = None             # destination external to org?
+    classification: Optional[str] = None        # financial / legal / client-facing / internal
+    concurrent_ai_apps: Optional[List[str]] = None  # AI processes running at attest moment
+
+    # Pydantic v2 config: allow "len" as alias; also tolerate extra fields for forward-compat
+    model_config = {"populate_by_name": True, "extra": "ignore"}
+
+
+def _validate_sign_request(req: SignRequest) -> None:
+    """Apply v0.5.0 schema-level validation, raising AIAuthError on failure."""
+    if not _SHA256_RE.match(req.output_hash or ""):
+        raise AIAuthError("INVALID_HASH", "output_hash must be a 64-character SHA-256 hex string", 400)
+    if req.prompt_hash is not None and not _SHA256_RE.match(req.prompt_hash):
+        raise AIAuthError("INVALID_PROMPT_HASH", "prompt_hash must be a 64-character SHA-256 hex string", 400)
+    if req.parent_hash is not None and not _SHA256_RE.match(req.parent_hash):
+        raise AIAuthError("INVALID_HASH", "parent_hash must be a 64-character SHA-256 hex string", 400)
+    if not (req.user_id or "").strip():
+        raise AIAuthError("INVALID_RECEIPT", "user_id (uid) is required", 400)
+    if req.client_integrity not in (None, "none", "extension", "os-verified"):
+        raise AIAuthError("INVALID_RECEIPT", "client_integrity must be one of: none, extension, os-verified", 400)
+
 
 @app.post("/v1/sign")
 def sign_receipt(req: SignRequest):
@@ -288,14 +382,45 @@ def sign_receipt(req: SignRequest):
     If register=true (default), the content hash and receipt ID are
     added to the public hash registry. This enables chain discovery —
     others can find out that a receipt exists for a given content hash.
-    The registry stores NO user data — only hash → receipt_id mappings.
+    The registry stores NO user data — only hash → receipt_id mappings
+    (five columns: content_hash, receipt_id, parent_hash, doc_id, registered_at).
 
     If register=false, the server signs and forgets entirely.
+
+    v0.5.0 behavior:
+      - Accepts all v0.5.0 schema fields (additive; missing fields default to null).
+      - Applies a deduplication window (default 300s, configurable via AIAUTH_DEDUP_WINDOW):
+        re-submitting the same content_hash within the window returns HTTP 409 with
+        the original receipt_id, so the client can reuse its cached signature.
+      - Rejects malformed hashes with standardized error response.
+      - prompt_hash is signed into the receipt but NEVER added to the public registry
+        (see Integrity Rule #12 in CLAUDE.md).
     """
+    _validate_sign_request(req)
+
+    # Deduplication: if the same content_hash was registered recently, return 409.
+    # The public server does not store signatures, so we do not echo the prior signature —
+    # the client's local receipt store already has it (see Offline-First Client Architecture).
+    if req.register and DEDUP_WINDOW > 0:
+        existing = find_recent_duplicate(req.output_hash, DEDUP_WINDOW)
+        if existing:
+            raise AIAuthError(
+                code="RECEIPT_DUPLICATE",
+                message="This content was already attested within the deduplication window",
+                status=409,
+                details={
+                    "existing_receipt_id": existing["receipt_id"],
+                    "registered_at": existing["registered_at"],
+                    "window_seconds": DEDUP_WINDOW,
+                },
+            )
+
     receipt_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    receipt = {
+    # Build receipt: required fields first, then all populated optional fields.
+    # Null/empty fields are OMITTED (keeps receipt compact and backward-compatible).
+    receipt: Dict[str, Any] = {
         "v": VERSION,
         "id": receipt_id,
         "ts": now,
@@ -304,10 +429,30 @@ def sign_receipt(req: SignRequest):
         "src": req.source,
     }
 
+    # v0.4.0-compat optional fields
     if req.model: receipt["model"] = req.model
     if req.provider: receipt["provider"] = req.provider
     if req.parent_hash: receipt["parent"] = req.parent_hash
     if req.tags: receipt["tags"] = req.tags
+
+    # v0.5.0 free-tier additions
+    if req.prompt_hash: receipt["prompt_hash"] = req.prompt_hash
+    if req.source_domain: receipt["source_domain"] = req.source_domain
+    if req.source_app: receipt["source_app"] = req.source_app
+    if req.file_type: receipt["file_type"] = req.file_type
+    if req.content_length is not None: receipt["len"] = req.content_length
+    if req.doc_id: receipt["doc_id"] = req.doc_id
+    if req.ai_markers: receipt["ai_markers"] = req.ai_markers
+    # client_integrity: default to "none" if absent so downstream consumers always have a value
+    receipt["client_integrity"] = req.client_integrity or "none"
+
+    # v0.5.0 commercial-tier fields (server accepts whatever the client sends)
+    if req.tta is not None: receipt["tta"] = req.tta
+    if req.sid: receipt["sid"] = req.sid
+    if req.dest: receipt["dest"] = req.dest
+    if req.dest_ext is not None: receipt["dest_ext"] = req.dest_ext
+    if req.classification: receipt["classification"] = req.classification
+    if req.concurrent_ai_apps: receipt["concurrent_ai_apps"] = req.concurrent_ai_apps
 
     if req.review_status:
         receipt["review"] = {
@@ -319,9 +464,9 @@ def sign_receipt(req: SignRequest):
 
     signature = sign(receipt)
 
-    # Public hash registry — stores hash→receipt_id only, no user data
+    # Public hash registry — stores hash→receipt_id mapping + doc_id only, no user data
     if req.register:
-        register_hash(req.output_hash, receipt_id, req.parent_hash)
+        register_hash(req.output_hash, receipt_id, req.parent_hash, req.doc_id)
 
     # Enterprise: also store full attestation
     if MODE == "enterprise":
