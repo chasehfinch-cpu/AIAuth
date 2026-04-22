@@ -1924,6 +1924,328 @@ def violations_feed(
 
 
 # ===================================================================
+# DASHBOARD DATA CONTRACT (v0.5.0+)
+# GET /v1/admin/dashboard/data returns the exact schema documented in
+# CLAUDE.md "Dashboard Data Contract". Aggregations use NULL-safe SQL
+# per Schema Versioning Rule #3.
+# ===================================================================
+
+def _grade_for(review_rate: float, critical_violations: int) -> str:
+    if critical_violations > 0 and review_rate < 0.95:
+        return "F"
+    if review_rate >= 0.95 and critical_violations == 0: return "A"
+    if review_rate >= 0.85: return "B"
+    if review_rate >= 0.70: return "C"
+    if review_rate >= 0.50: return "D"
+    return "F"
+
+
+@app.get("/v1/admin/dashboard/data")
+def dashboard_data(
+    org_id: str = Query(...),
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = Query(default=None),
+    department: Optional[str] = Query(default=None),
+    model: Optional[str] = Query(default=None),
+    classification: Optional[str] = Query(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Aggregated enterprise dashboard data. See Dashboard Data Contract
+    in CLAUDE.md for response schema. Every key in the shape appears in
+    every response (null/0/[] when empty) — no consumer has to null-check."""
+    _require_admin_session(authorization, org_id)
+
+    conn = get_db()
+    org_row = conn.execute("SELECT * FROM organizations WHERE org_id = ?", (org_id,)).fetchone()
+    if org_row is None:
+        conn.close()
+        raise AIAuthError("ORG_NOT_FOUND", "Organization not found", 404)
+
+    # Build WHERE clause + params shared by most queries
+    where = "ea.org_id = :org"
+    params: dict = {"org": org_id}
+    if from_:
+        where += " AND ea.ts >= :from_"; params["from_"] = from_
+    if to:
+        where += " AND ea.ts <= :to"; params["to"] = to
+    if model:
+        where += " AND ea.model = :model"; params["model"] = model
+    if classification:
+        where += " AND ea.classification = :cls"; params["cls"] = classification
+
+    # Join to get department (NULL-safe via LEFT JOIN)
+    join = (
+        "LEFT JOIN account_emails ae ON ea.uid = ae.email "
+        "LEFT JOIN org_members om ON ae.account_id = om.account_id AND om.org_id = ea.org_id "
+    )
+
+    dept_filter = ""
+    if department:
+        dept_filter = " AND IFNULL(om.department, 'Unmapped') = :dept"
+        params["dept"] = department
+
+    # Summary counts
+    summary_row = conn.execute(
+        f"SELECT COUNT(*) AS total, "
+        f"       COUNT(DISTINCT ea.uid) AS unique_users, "
+        f"       COUNT(DISTINCT ea.sid) AS unique_sessions, "
+        f"       AVG(ea.tta) AS avg_tta, "
+        f"       SUM(CASE WHEN ea.review_status IS NOT NULL THEN 1 ELSE 0 END) AS reviewed, "
+        f"       SUM(CASE WHEN COALESCE(ea.tta, 999) < 10 AND COALESCE(ea.len, 0) > 500 THEN 1 ELSE 0 END) AS rubber_stamps, "
+        f"       SUM(CASE WHEN ea.dest_ext = 1 THEN 1 ELSE 0 END) AS external_exposure, "
+        f"       SUM(CASE WHEN ea.ai_markers IS NOT NULL THEN 1 ELSE 0 END) AS ai_authored, "
+        f"       SUM(CASE WHEN ea.prompt_hash IS NOT NULL THEN 1 ELSE 0 END) AS with_prompt_hash "
+        f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter}",
+        params,
+    ).fetchone()
+    total = summary_row["total"] or 0
+    reviewed = summary_row["reviewed"] or 0
+    review_rate = (reviewed / total) if total else 0.0
+    rubber_stamp = summary_row["rubber_stamps"] or 0
+
+    # Median TTA via quantile (SQLite has no native MEDIAN — approximate)
+    median_tta = None
+    tta_rows = [r["tta"] for r in conn.execute(
+        f"SELECT ea.tta FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} AND ea.tta IS NOT NULL ORDER BY ea.tta",
+        params,
+    ).fetchall() if r["tta"] is not None]
+    if tta_rows:
+        mid = len(tta_rows) // 2
+        median_tta = tta_rows[mid]
+
+    # Policy violations by severity
+    violations_by_sev = {k: 0 for k in ("critical", "high", "medium", "low")}
+    for sev_row in conn.execute(
+        f"SELECT pv.severity, COUNT(*) AS n "
+        f"FROM policy_violations pv JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
+        f"{join} WHERE {where} {dept_filter} GROUP BY pv.severity",
+        params,
+    ).fetchall():
+        if sev_row["severity"] in violations_by_sev:
+            violations_by_sev[sev_row["severity"]] = sev_row["n"]
+
+    # Chain-break detection: receipts with parent_hash that isn't in registry
+    chain_breaks_rows = conn.execute(
+        f"SELECT COUNT(DISTINCT ea.doc_id) AS total_chains, "
+        f"       COUNT(DISTINCT CASE WHEN ea.parent IS NOT NULL "
+        f"              AND NOT EXISTS (SELECT 1 FROM enterprise_attestations ea2 "
+        f"              WHERE ea2.hash = ea.parent AND ea2.org_id = ea.org_id) "
+        f"              THEN ea.doc_id END) AS broken "
+        f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} AND ea.doc_id IS NOT NULL",
+        params,
+    ).fetchone()
+    total_chains = chain_breaks_rows["total_chains"] or 0
+    broken_chains = chain_breaks_rows["broken"] or 0
+    complete_chains = max(0, total_chains - broken_chains)
+
+    # By department (NULL-safe: "Unmapped")
+    by_department = []
+    for dept_row in conn.execute(
+        f"SELECT IFNULL(om.department, 'Unmapped') AS dept, "
+        f"       COUNT(*) AS total, COUNT(DISTINCT ea.uid) AS unique_users, "
+        f"       AVG(ea.tta) AS avg_tta, "
+        f"       SUM(CASE WHEN ea.review_status IS NOT NULL THEN 1 ELSE 0 END) AS reviewed, "
+        f"       SUM(CASE WHEN COALESCE(ea.tta,999)<10 AND COALESCE(ea.len,0)>500 THEN 1 ELSE 0 END) AS rubber, "
+        f"       SUM(CASE WHEN ea.dest_ext = 1 THEN 1 ELSE 0 END) AS ext_exposure "
+        f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
+        f"GROUP BY dept ORDER BY total DESC",
+        params,
+    ).fetchall():
+        t = dept_row["total"] or 0
+        r_rate = (dept_row["reviewed"] / t) if t else 0.0
+        # violation counts per dept
+        v_per_dept = {k: 0 for k in ("critical", "high", "medium", "low")}
+        vp_params = {**params, "dept_name": dept_row["dept"]}
+        for sev in conn.execute(
+            f"SELECT pv.severity, COUNT(*) AS n "
+            f"FROM policy_violations pv JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
+            f"{join} WHERE {where} AND IFNULL(om.department, 'Unmapped') = :dept_name "
+            f"GROUP BY pv.severity",
+            vp_params,
+        ).fetchall():
+            if sev["severity"] in v_per_dept:
+                v_per_dept[sev["severity"]] = sev["n"]
+        by_department.append({
+            "department": dept_row["dept"],
+            "total": t,
+            "unique_users": dept_row["unique_users"] or 0,
+            "review_rate": round(r_rate, 3),
+            "rubber_stamp_rate": round((dept_row["rubber"] / t) if t else 0.0, 4),
+            "avg_tta": round(dept_row["avg_tta"], 1) if dept_row["avg_tta"] else None,
+            "external_exposure": dept_row["ext_exposure"] or 0,
+            "violations": v_per_dept,
+            "grade": _grade_for(r_rate, v_per_dept["critical"]),
+        })
+
+    # By model
+    by_model = [
+        {"model": r["model"], "provider": r["provider"], "count": r["n"],
+         "avg_tta": round(r["avg_tta"], 1) if r["avg_tta"] else None}
+        for r in conn.execute(
+            f"SELECT ea.model, ea.provider, COUNT(*) AS n, AVG(ea.tta) AS avg_tta "
+            f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
+            f"GROUP BY ea.model, ea.provider ORDER BY n DESC",
+            params,
+        ).fetchall()
+    ]
+
+    # TTA distribution
+    def _bucket(tta):
+        if tta is None: return None
+        if tta < 10: return "0-10s"
+        if tta < 30: return "10-30s"
+        if tta < 60: return "30-60s"
+        if tta < 300: return "1-5m"
+        if tta < 900: return "5-15m"
+        return "15m+"
+
+    tta_buckets = {"0-10s": 0, "10-30s": 0, "30-60s": 0, "1-5m": 0, "5-15m": 0, "15m+": 0}
+    for t in tta_rows:
+        key = _bucket(t)
+        if key: tta_buckets[key] = tta_buckets.get(key, 0) + 1
+
+    tta_distribution = {
+        "buckets": [
+            {"range": k, "count": v, "flagged": k == "0-10s"}
+            for k, v in tta_buckets.items()
+        ],
+        "rubber_stamps": {
+            "count": rubber_stamp,
+            "threshold": {"tta_under": 10, "len_over": 500},
+            "top_offenders": [dict(r) for r in conn.execute(
+                f"SELECT ea.uid, COUNT(*) AS count, IFNULL(om.department, 'Unmapped') AS department "
+                f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
+                f"AND COALESCE(ea.tta,999) < 10 AND COALESCE(ea.len,0) > 500 "
+                f"GROUP BY ea.uid ORDER BY count DESC LIMIT 5",
+                params,
+            ).fetchall()],
+        },
+    }
+
+    # Shadow AI heatmap (commercial-tier field)
+    shadow_by_app = []
+    for r in conn.execute(
+        f"SELECT json_each.value AS app, COUNT(*) AS times_open, "
+        f"       SUM(CASE WHEN ea.source_app LIKE '%' || json_each.value || '%' THEN 1 ELSE 0 END) AS times_used "
+        f"FROM enterprise_attestations ea, json_each(IFNULL(ea.concurrent_ai_apps, '[]')) "
+        f"{join} WHERE {where} {dept_filter} "
+        f"GROUP BY json_each.value ORDER BY (times_open - times_used) DESC LIMIT 10",
+        params,
+    ).fetchall():
+        t_open = r["times_open"] or 0
+        t_used = r["times_used"] or 0
+        shadow_by_app.append({
+            "app": r["app"],
+            "times_open": t_open,
+            "times_attested_from": t_used,
+            "shadow_ratio": round((t_open - t_used) / t_open, 3) if t_open else 0.0,
+            "interpretation": ("open but not attesting — potential ungoverned use"
+                               if t_open > t_used else "aligned"),
+        })
+
+    # AI authorship detection
+    ai_by_source = [
+        {"source": r["source"], "count": r["n"]}
+        for r in conn.execute(
+            f"SELECT json_extract(ea.ai_markers, '$.source') AS source, COUNT(*) AS n "
+            f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
+            f"AND ea.ai_markers IS NOT NULL "
+            f"GROUP BY source ORDER BY n DESC",
+            params,
+        ).fetchall() if r["source"]
+    ]
+    ai_unattested = conn.execute(
+        f"SELECT COUNT(*) AS n FROM enterprise_attestations ea {join} "
+        f"WHERE {where} {dept_filter} "
+        f"AND ea.ai_markers IS NOT NULL AND ea.parent IS NULL",
+        params,
+    ).fetchone()["n"] or 0
+
+    # Recent violations feed (last 20)
+    recent_vios = [
+        {**dict(r), "details": json.loads(r["details"] or "{}")}
+        for r in conn.execute(
+            f"SELECT pv.id, pv.attestation_id, pv.policy_id, pv.severity, "
+            f"       pv.details, pv.detected_at, pv.resolved_at "
+            f"FROM policy_violations pv JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
+            f"{join} WHERE {where} {dept_filter} "
+            f"ORDER BY pv.detected_at DESC LIMIT 20",
+            params,
+        ).fetchall()
+    ]
+
+    file_type_rows = [
+        {"type": r["file_type"] or "unknown", "count": r["n"]}
+        for r in conn.execute(
+            f"SELECT ea.file_type, COUNT(*) AS n FROM enterprise_attestations ea {join} "
+            f"WHERE {where} {dept_filter} GROUP BY ea.file_type ORDER BY n DESC",
+            params,
+        ).fetchall()
+    ]
+    conn.close()
+
+    # Prompt-hash coverage as a rate (useful "chain of AI custody" KPI)
+    prompt_cov = (summary_row["with_prompt_hash"] / total) if total else 0.0
+
+    return {
+        "meta": {
+            "org_id": org_id,
+            "org_name": org_row["name"],
+            "date_range": {"from": from_, "to": to},
+            "filters_applied": {"department": department, "model": model, "classification": classification},
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "schema_version": VERSION,
+        },
+        "summary": {
+            "total_attestations": total,
+            "unique_users": summary_row["unique_users"] or 0,
+            "unique_sessions": summary_row["unique_sessions"] or 0,
+            "review_rate": round(review_rate, 3),
+            "rubber_stamp_count": rubber_stamp,
+            "rubber_stamp_rate": round((rubber_stamp / total) if total else 0.0, 4),
+            "external_exposure_count": summary_row["external_exposure"] or 0,
+            "chain_break_count": broken_chains,
+            "policy_violations": violations_by_sev,
+            "avg_tta_seconds": round(summary_row["avg_tta"], 1) if summary_row["avg_tta"] else None,
+            "median_tta_seconds": median_tta,
+            "prompt_hash_coverage": round(prompt_cov, 3),
+            "ai_authored_detected": summary_row["ai_authored"] or 0,
+            "shadow_ai_alerts": sum(1 for s in shadow_by_app if s["shadow_ratio"] > 0.2),
+        },
+        "by_department": by_department,
+        "by_model": by_model,
+        "by_time": {"bucket_size": "week", "buckets": []},  # simplified; full time-series in Piece 11b
+        "tta_distribution": tta_distribution,
+        "file_types": file_type_rows,
+        "external_exposure": {
+            "total": summary_row["external_exposure"] or 0,
+            "by_destination": [],
+            "by_classification": [],
+        },
+        "chain_integrity": {
+            "total_chains": total_chains,
+            "complete_chains": complete_chains,
+            "broken_chains": broken_chains,
+            "breaks": [],
+        },
+        "recent_violations": recent_vios,
+        "shadow_ai_heatmap": {
+            "total_unique_apps_detected": len(shadow_by_app),
+            "by_app": shadow_by_app,
+            "by_department": [],
+        },
+        "ai_authorship": {
+            "total_with_markers": summary_row["ai_authored"] or 0,
+            "by_source": ai_by_source,
+            "unattested_with_markers": {
+                "count": ai_unattested,
+                "interpretation": "AI-authored content appearing in chain without attestation",
+            },
+        },
+    }
+
+
+# ===================================================================
 # 2. VERIFY — check a receipt's signature (stateless Y/N)
 # ===================================================================
 
@@ -2455,6 +2777,47 @@ def verification_page():
     if verify_path.exists():
         return HTMLResponse(verify_path.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>AIAuth</h1><p>Verification page not found. Place verify.html alongside server.py.</p>")
+
+
+@app.get("/demo", response_class=HTMLResponse)
+def demo_dashboard():
+    """Interactive commercial demo using synthetic data. Prospects can
+    add ?company=... to personalize. The template lives at
+    templates/commercial/executive-summary.html and uses
+    synthetic-data.js for fake but realistic data."""
+    tpl = Path(__file__).parent / "templates" / "commercial" / "executive-summary.html"
+    if tpl.exists():
+        return HTMLResponse(tpl.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>AIAuth Demo</h1><p>Demo template not found.</p>", status_code=404)
+
+
+@app.get("/static/synthetic-data.js")
+def static_synthetic_data_js():
+    """Served alongside /demo so the template's <script src="synthetic-data.js"></script>
+    resolves (the template references it relative to its own path)."""
+    p = Path(__file__).parent / "templates" / "commercial" / "synthetic-data.js"
+    if p.exists():
+        return FileResponse(str(p), media_type="application/javascript")
+    raise AIAuthError("NOT_FOUND", "synthetic-data.js not deployed", 404)
+
+
+@app.get("/synthetic-data.js")
+def synthetic_data_js_at_root():
+    """Alias so the template's relative <script src="synthetic-data.js"> works
+    when served via the HTMLResponse path (the request comes back to the
+    server root, not to templates/commercial/)."""
+    return static_synthetic_data_js()
+
+
+@app.get("/v1/admin/dashboard", response_class=HTMLResponse)
+def admin_dashboard_html():
+    """Enterprise compliance dashboard entry point. Renders the
+    executive-summary template. Future versions will swap in a richer
+    SPA; the data contract remains stable so the template works today."""
+    tpl = Path(__file__).parent / "templates" / "commercial" / "executive-summary.html"
+    if tpl.exists():
+        return HTMLResponse(tpl.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>Dashboard</h1><p>Template not deployed.</p>", status_code=404)
 
 def _page_shell(title: str, body_html: str, active: str = "") -> str:
     """Shared page chrome matching index.html."""

@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AIAuth — Executive Summary</title>
+  <style>
+    :root {
+      --bg: #fafafa; --panel: #fff; --border: #e5e7eb;
+      --ink: #0f172a; --muted: #64748b; --blue: #2563eb;
+      --good: #16a34a; --warn: #d97706; --bad: #dc2626;
+    }
+    body {
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg); color: var(--ink); margin: 0; padding: 40px 24px;
+    }
+    .container { max-width: 960px; margin: 0 auto; }
+    h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: -0.4px; }
+    .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+    .banner {
+      background: linear-gradient(135deg, #1e40af 0%, #2563eb 100%);
+      color: white; padding: 22px 24px; border-radius: 12px; margin-bottom: 24px;
+    }
+    .banner .title { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+    .banner .body { font-size: 13px; opacity: 0.9; }
+    .grid { display: grid; gap: 16px; }
+    .grid-4 { grid-template-columns: repeat(4, 1fr); }
+    .grid-3 { grid-template-columns: repeat(3, 1fr); }
+    @media (max-width: 720px) { .grid-4 { grid-template-columns: repeat(2, 1fr); } .grid-3 { grid-template-columns: 1fr; } }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+    .kpi .n { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
+    .kpi .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; margin-top: 4px; }
+    .kpi .trend { font-size: 11px; margin-top: 6px; }
+    .kpi.good .n { color: var(--good); } .kpi.warn .n { color: var(--warn); } .kpi.bad .n { color: var(--bad); }
+    h2 { font-size: 16px; margin: 32px 0 12px; }
+    .bar-row { display: flex; align-items: center; gap: 12px; margin: 6px 0; }
+    .bar-label { width: 120px; font-size: 12px; color: var(--muted); }
+    .bar-wrap { flex: 1; background: #f1f5f9; height: 8px; border-radius: 4px; overflow: hidden; }
+    .bar-fill { background: var(--blue); height: 100%; }
+    .bar-val { width: 60px; text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
+    .grade { display: inline-block; width: 24px; text-align: center; font-weight: 700; font-size: 12px; border-radius: 4px; padding: 2px 0; }
+    .grade.A { background: #dcfce7; color: var(--good); }
+    .grade.B { background: #ecfccb; color: #65a30d; }
+    .grade.C { background: #fef3c7; color: var(--warn); }
+    .grade.D { background: #fee2e2; color: var(--bad); }
+    .grade.F { background: #fecaca; color: var(--bad); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    td { padding: 10px; border-bottom: 1px solid #f1f5f9; }
+    .sev.critical { color: var(--bad); font-weight: 600; }
+    .sev.high { color: var(--bad); }
+    .sev.medium { color: var(--warn); }
+    .sev.low { color: var(--muted); }
+    .note { font-size: 12px; color: var(--muted); margin-top: 8px; font-style: italic; }
+    .synthetic-warning {
+      background: #fef3c7; border: 1px solid #fcd34d; color: #78350f;
+      padding: 10px 14px; border-radius: 8px; font-size: 12px; margin-bottom: 16px;
+    }
+    footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Executive Summary</h1>
+    <div class="sub" id="subhead">Loading…</div>
+
+    <div class="synthetic-warning" id="syntheticNotice" style="display:none;">
+      <strong>Demo data.</strong> This report is generated from synthetic patterns representative of a mid-size financial services firm.
+      Real pilots use your organization's actual attestation data.
+    </div>
+
+    <div class="banner">
+      <div class="title" id="bannerTitle">What AIAuth found</div>
+      <div class="body" id="bannerBody">In the last reporting window, AIAuth tracked AI-assisted work across your organization without ever seeing, storing, or transmitting the content itself.</div>
+    </div>
+
+    <div class="grid grid-4">
+      <div class="card kpi"><div class="n" id="k_total">—</div><div class="lbl">Total attestations</div><div class="trend" id="k_total_trend"></div></div>
+      <div class="card kpi"><div class="n" id="k_users">—</div><div class="lbl">Unique users</div></div>
+      <div class="card kpi good"><div class="n" id="k_rev">—</div><div class="lbl">Review rate</div></div>
+      <div class="card kpi warn"><div class="n" id="k_rubber">—</div><div class="lbl">Rubber-stamp alerts</div></div>
+    </div>
+
+    <div class="grid grid-4" style="margin-top:12px;">
+      <div class="card kpi"><div class="n" id="k_ext">—</div><div class="lbl">External exposures</div></div>
+      <div class="card kpi"><div class="n" id="k_shadow">—</div><div class="lbl">Shadow AI alerts</div></div>
+      <div class="card kpi"><div class="n" id="k_ai">—</div><div class="lbl">AI-authored artifacts</div></div>
+      <div class="card kpi"><div class="n" id="k_prompt">—</div><div class="lbl">Prompt-chain coverage</div></div>
+    </div>
+
+    <h2>Department scorecard</h2>
+    <div class="card" style="padding:0;">
+      <table>
+        <thead>
+          <tr><th>Department</th><th>Attestations</th><th>Users</th><th>Review rate</th><th>Rubber-stamp rate</th><th>Avg TTA</th><th>Grade</th></tr>
+        </thead>
+        <tbody id="deptRows"></tbody>
+      </table>
+    </div>
+
+    <h2>Tool adoption</h2>
+    <div class="card">
+      <div id="modelBars"></div>
+      <div class="note">Claude and Copilot dominate usage. Shadow AI heatmap below shows which tools are open without being used for attested work.</div>
+    </div>
+
+    <h2>Policy violations</h2>
+    <div class="grid grid-4">
+      <div class="card kpi bad"><div class="n" id="v_crit">—</div><div class="lbl">Critical</div></div>
+      <div class="card kpi bad"><div class="n" id="v_high">—</div><div class="lbl">High</div></div>
+      <div class="card kpi warn"><div class="n" id="v_med">—</div><div class="lbl">Medium</div></div>
+      <div class="card kpi"><div class="n" id="v_low">—</div><div class="lbl">Low</div></div>
+    </div>
+
+    <h2>Shadow AI heatmap</h2>
+    <div class="card" style="padding:0;">
+      <table>
+        <thead>
+          <tr><th>AI app</th><th>Times open</th><th>Times attested from</th><th>Shadow ratio</th><th>Interpretation</th></tr>
+        </thead>
+        <tbody id="shadowRows"></tbody>
+      </table>
+    </div>
+
+    <footer>
+      AIAuth never sees, stores, or transmits your content. This report is derived from metadata only.
+      Generated <span id="gen">—</span>. Schema <span id="sv">—</span>.
+    </footer>
+  </div>
+
+  <script src="synthetic-data.js"></script>
+  <script>
+    // Data-source strategy:
+    //  - If ?source=live&org_id=...&session=... provided, fetch from
+    //    /v1/admin/dashboard/data with Bearer auth.
+    //  - Otherwise render with synthetic data (customizable via ?company=).
+    async function getData() {
+      const qp = new URLSearchParams(location.search);
+      const src = qp.get("source");
+      if (src === "live") {
+        const org = qp.get("org_id");
+        const tok = qp.get("session");
+        const res = await fetch(`/v1/admin/dashboard/data?org_id=${encodeURIComponent(org)}`, {
+          headers: { Authorization: "Bearer " + tok },
+        });
+        return await res.json();
+      }
+      const opts = {};
+      const company = qp.get("company");
+      if (company) opts.company = company;
+      return window.AIAuthSynthetic.generateDashboardData(opts);
+    }
+
+    function pct(n) { return (Math.round(n * 1000) / 10).toFixed(1) + "%"; }
+    function fmt(n) { return (n || 0).toLocaleString(); }
+
+    async function render() {
+      const d = await getData();
+      const meta = d.meta || {};
+      document.getElementById("subhead").textContent =
+        `${meta.org_name || "Your organization"} · ${(meta.date_range?.from || "").slice(0,10)} to ${(meta.date_range?.to || "").slice(0,10)}`;
+      if (meta.synthetic) document.getElementById("syntheticNotice").style.display = "";
+      document.getElementById("gen").textContent = (meta.generated_at || "").slice(0, 19).replace("T", " ") + " UTC";
+      document.getElementById("sv").textContent = meta.schema_version || "—";
+
+      const s = d.summary || {};
+      document.getElementById("k_total").textContent = fmt(s.total_attestations);
+      document.getElementById("k_users").textContent = fmt(s.unique_users);
+      document.getElementById("k_rev").textContent = pct(s.review_rate || 0);
+      document.getElementById("k_rubber").textContent = fmt(s.rubber_stamp_count);
+      document.getElementById("k_ext").textContent = fmt(s.external_exposure_count);
+      document.getElementById("k_shadow").textContent = fmt(s.shadow_ai_alerts);
+      document.getElementById("k_ai").textContent = fmt(s.ai_authored_detected);
+      document.getElementById("k_prompt").textContent = pct(s.prompt_hash_coverage || 0);
+
+      const pv = s.policy_violations || { critical: 0, high: 0, medium: 0, low: 0 };
+      document.getElementById("v_crit").textContent = fmt(pv.critical);
+      document.getElementById("v_high").textContent = fmt(pv.high);
+      document.getElementById("v_med").textContent = fmt(pv.medium);
+      document.getElementById("v_low").textContent = fmt(pv.low);
+
+      const deptRows = document.getElementById("deptRows");
+      deptRows.innerHTML = "";
+      (d.by_department || []).forEach((x) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML =
+          `<td>${x.department}</td>` +
+          `<td>${fmt(x.total)}</td>` +
+          `<td>${fmt(x.unique_users)}</td>` +
+          `<td>${pct(x.review_rate || 0)}</td>` +
+          `<td>${pct(x.rubber_stamp_rate || 0)}</td>` +
+          `<td>${x.avg_tta != null ? x.avg_tta + "s" : "—"}</td>` +
+          `<td><span class="grade ${x.grade}">${x.grade}</span></td>`;
+        deptRows.appendChild(tr);
+      });
+
+      const modelBars = document.getElementById("modelBars");
+      modelBars.innerHTML = "";
+      const maxCount = Math.max(1, ...(d.by_model || []).map((m) => m.count));
+      (d.by_model || []).forEach((m) => {
+        const row = document.createElement("div");
+        row.className = "bar-row";
+        row.innerHTML =
+          `<div class="bar-label">${m.model || "unknown"}</div>` +
+          `<div class="bar-wrap"><div class="bar-fill" style="width:${(m.count / maxCount * 100).toFixed(0)}%"></div></div>` +
+          `<div class="bar-val">${fmt(m.count)}</div>`;
+        modelBars.appendChild(row);
+      });
+
+      const shadowRows = document.getElementById("shadowRows");
+      shadowRows.innerHTML = "";
+      (d.shadow_ai_heatmap?.by_app || []).forEach((s) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML =
+          `<td>${s.app}</td>` +
+          `<td>${fmt(s.times_open)}</td>` +
+          `<td>${fmt(s.times_attested_from)}</td>` +
+          `<td>${pct(s.shadow_ratio || 0)}</td>` +
+          `<td style="color:#64748b;font-size:12px;">${s.interpretation}</td>`;
+        shadowRows.appendChild(tr);
+      });
+    }
+
+    render().catch((e) => {
+      document.getElementById("subhead").textContent = "Error loading data: " + e.message;
+    });
+  </script>
+</body>
+</html>
