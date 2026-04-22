@@ -2,9 +2,9 @@
 AIAuth Server v4 — Chain-Aware Signing Authority
 
 The server does three things:
-  1. SIGN:   Hash in → signed receipt out → server forgets
-  2. VERIFY: Receipt in → yes/no out
-  3. CHAIN:  Receipts in → unbroken yes/no out
+  1. SIGN:   Hash in -> signed receipt out -> server forgets
+  2. VERIFY: Receipt in -> yes/no out
+  3. CHAIN:  Receipts in -> unbroken yes/no out
 
 No database. No user data. No storage. Fully stateless.
 The receipts themselves are the blockchain — each one references
@@ -19,19 +19,21 @@ Enterprise mode (adds storage, dashboard, review history):
   AIAUTH_MODE=enterprise uvicorn server:app --host 0.0.0.0 --port 8100
 """
 
+import hashlib
 import json
 import os
+import re
 import uuid
 import sqlite3
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
@@ -41,58 +43,381 @@ from cryptography.hazmat.primitives import serialization
 # CONFIG
 # ===================================================================
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
+SCHEMA_MIN = "0.4.0"   # server accepts receipts from any schema >= this
 MODE = os.getenv("AIAUTH_MODE", "public")
 KEY_DIR = Path(os.getenv("AIAUTH_KEY_DIR", "."))
 DB_PATH = os.getenv("AIAUTH_DB_PATH", "aiauth.db")
 LICENSE_KEY = os.getenv("AIAUTH_LICENSE_KEY", "")
-MASTER_KEY = os.getenv("AIAUTH_MASTER_KEY", "")  # Your admin key for issuing licenses
+MASTER_KEY = os.getenv("AIAUTH_MASTER_KEY", "")  # Admin key for license generation
+SERVER_SECRET = os.getenv("SERVER_SECRET", "")   # HMAC secret for magic-link + session tokens (v0.5.0+)
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")   # HMAC secret for extension client_integrity (Piece 9)
+PUBLIC_BASE_URL = os.getenv("AIAUTH_PUBLIC_URL", "https://aiauth.app")  # base URL for magic-link emails
+DEDUP_WINDOW = int(os.getenv("AIAUTH_DEDUP_WINDOW", "300"))  # seconds; 0 disables dedup
+
+# Regex for SHA-256 hex (lowercase or uppercase)
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 app = FastAPI(title="AIAuth", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 # ===================================================================
-# ED25519 KEYS
+# RATE LIMITING (v0.5.0+)
+# Per-IP sliding-window counters kept in memory. Per CLAUDE.md
+# "Rate Limiting and Abuse Prevention" — these protect the free
+# signing endpoint from DoS and enumeration attacks.
+#
+# Limits are per WORKER process (uvicorn --workers 2 doubles real
+# throughput vs. spec, which is acceptable — spec limits are caps
+# not exact). For stricter enforcement behind multiple workers,
+# substitute a shared store (Redis/memcached) in the future.
 # ===================================================================
 
-def load_or_create_keys():
-    priv_path = KEY_DIR / "aiauth_private.pem"
-    if priv_path.exists():
-        with open(priv_path, "rb") as f:
-            pk = serialization.load_pem_private_key(f.read(), password=None)
-    else:
-        pk = Ed25519PrivateKey.generate()
-        with open(priv_path, "wb") as f:
-            f.write(pk.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
-            ))
-        os.chmod(priv_path, 0o600)
-    pub = pk.public_key()
-    pub_pem = pub.public_bytes(
+import time
+import threading as _rl_threading
+from collections import deque
+
+RATE_LIMITS: Dict[str, Dict[str, int]] = {
+    "/v1/sign":           {"per_ip_per_min": 100},
+    "/v1/sign/batch":     {"per_ip_per_min": 10},
+    "/v1/account/create": {"per_ip_per_hour": 5},
+    "/v1/account/auth":   {"per_ip_per_hour": 10},
+    "/v1/discover":       {"per_ip_per_min": 60},
+    "/v1/verify/prompt":  {"per_ip_per_min": 30},
+}
+
+# Ordered longest-prefix-first for path matching below
+_RATE_PREFIXES = sorted(RATE_LIMITS.keys(), key=len, reverse=True)
+
+_RATE_BUCKETS: Dict[tuple, deque] = {}
+_RATE_LOCK = _rl_threading.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_check(key: tuple, window_seconds: int, limit: int) -> bool:
+    """Sliding-window counter. Returns True if under limit (and records
+    the hit), False if over. Thread-safe."""
+    now = time.time()
+    cutoff = now - window_seconds
+    with _RATE_LOCK:
+        dq = _RATE_BUCKETS.setdefault(key, deque())
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= limit:
+            return False
+        dq.append(now)
+        return True
+
+
+def _match_rate_endpoint(path: str) -> Optional[str]:
+    for prefix in _RATE_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return prefix
+    return None
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    endpoint_key = _match_rate_endpoint(request.url.path)
+    if endpoint_key is None:
+        return await call_next(request)
+
+    cfg = RATE_LIMITS[endpoint_key]
+    ip = _client_ip(request)
+
+    def _reject(window: int, limit: int):
+        return JSONResponse(
+            status_code=429,
+            content={"error": {
+                "code": "RATE_LIMITED",
+                "message": f"Rate limit exceeded for {endpoint_key}",
+                "details": {"window_seconds": window, "limit": limit, "endpoint": endpoint_key},
+            }},
+        )
+
+    if "per_ip_per_min" in cfg:
+        limit = cfg["per_ip_per_min"]
+        if not _rate_check((endpoint_key, "ip-min", ip), 60, limit):
+            return _reject(60, limit)
+    if "per_ip_per_hour" in cfg:
+        limit = cfg["per_ip_per_hour"]
+        if not _rate_check((endpoint_key, "ip-hr", ip), 3600, limit):
+            return _reject(3600, limit)
+
+    # X-AIAuth-Client header is advisory on /v1/sign* — we log absence but
+    # do NOT reject (preserves backward compat with curl tests and older
+    # clients). Enterprise tier may enforce in the future via policy engine.
+    # (Intentional no-op here.)
+
+    return await call_next(request)
+
+
+# ===================================================================
+# STANDARD ERROR RESPONSE FORMAT
+# Matches the contract in CLAUDE.md "Error Handling" section.
+# ===================================================================
+
+class AIAuthError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400, details: Optional[dict] = None):
+        self.code = code
+        self.message = message
+        self.status = status
+        self.details = details or {}
+        super().__init__(message)
+
+
+@app.exception_handler(AIAuthError)
+async def _aiauth_error_handler(request: Request, exc: AIAuthError):
+    return JSONResponse(
+        status_code=exc.status,
+        content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}},
+    )
+
+
+# ===================================================================
+# ED25519 KEY MANAGEMENT (versioned, v0.5.0+)
+# See CLAUDE.md "Key Management" section. Keys live under KEY_DIR/keys/
+# with a key_manifest.json mapping key_ids to validity windows. The
+# current signing key is identified by manifest.current_signing_key.
+# Every signed receipt embeds the key_id used, so verification stays
+# deterministic across key rotations.
+#
+# Migration: if a legacy KEY_DIR/aiauth_private.pem exists and no
+# keys/ subdirectory exists yet, it is copied (not moved) to
+# keys/key_000_active.pem on first startup. Historical receipts that
+# lack a key_id field still verify because check_sig falls back to
+# trying every known key.
+# ===================================================================
+
+import shutil  # used by legacy-key migration
+
+KEYS_SUBDIR = KEY_DIR / "keys"
+KEY_MANIFEST_PATH = KEYS_SUBDIR / "key_manifest.json"
+
+# In-memory registry: key_id -> {"private", "public", "public_pem", "meta"}
+KEY_REGISTRY: Dict[str, Dict[str, Any]] = {}
+CURRENT_KEY_ID: str = ""
+
+
+def _derive_public_pem(private_key) -> str:
+    return private_key.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode()
-    return pk, pub, pub_pem
 
-PRIV_KEY, PUB_KEY, PUB_PEM = load_or_create_keys()
+
+def _save_private_key(private_key, path: Path) -> None:
+    with open(path, "wb") as f:
+        f.write(private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def _save_public_key(private_key, path: Path) -> None:
+    with open(path, "wb") as f:
+        f.write(private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ))
+
+
+def _write_manifest(manifest: dict) -> None:
+    KEYS_SUBDIR.mkdir(parents=True, exist_ok=True)
+    with open(KEY_MANIFEST_PATH, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def _migrate_legacy_single_key() -> Optional[dict]:
+    """If a pre-v0.5.0 KEY_DIR/aiauth_private.pem exists, convert it
+    to key_000 under the versioned layout. Returns manifest or None."""
+    legacy_priv = KEY_DIR / "aiauth_private.pem"
+    if not legacy_priv.exists():
+        return None
+    KEYS_SUBDIR.mkdir(parents=True, exist_ok=True)
+    dst_priv = KEYS_SUBDIR / "key_000_active.pem"
+    if not dst_priv.exists():
+        shutil.copy2(legacy_priv, dst_priv)  # copy, don't remove legacy file
+        try:
+            os.chmod(dst_priv, 0o600)
+        except Exception:
+            pass
+    with open(dst_priv, "rb") as f:
+        pk = serialization.load_pem_private_key(f.read(), password=None)
+    _save_public_key(pk, KEYS_SUBDIR / "key_000_public.pem")
+    manifest = {
+        "keys": [{
+            "key_id": "key_000",
+            "algorithm": "Ed25519",
+            # Retrospective window — covers all historical receipts.
+            "valid_from": "2020-01-01T00:00:00Z",
+            "valid_until": None,
+            "status": "active",
+            "public_key_pem": _derive_public_pem(pk),
+        }],
+        "current_signing_key": "key_000",
+    }
+    _write_manifest(manifest)
+    print("[AIAuth] Migrated legacy aiauth_private.pem -> keys/key_000_active.pem")
+    return manifest
+
+
+def _load_or_init_manifest() -> dict:
+    if KEY_MANIFEST_PATH.exists():
+        with open(KEY_MANIFEST_PATH, "r") as f:
+            return json.load(f)
+    migrated = _migrate_legacy_single_key()
+    if migrated:
+        return migrated
+    # Fresh install — generate key_001
+    KEYS_SUBDIR.mkdir(parents=True, exist_ok=True)
+    pk = Ed25519PrivateKey.generate()
+    _save_private_key(pk, KEYS_SUBDIR / "key_001_active.pem")
+    _save_public_key(pk, KEYS_SUBDIR / "key_001_public.pem")
+    manifest = {
+        "keys": [{
+            "key_id": "key_001",
+            "algorithm": "Ed25519",
+            "valid_from": datetime.now(timezone.utc).isoformat(),
+            "valid_until": None,
+            "status": "active",
+            "public_key_pem": _derive_public_pem(pk),
+        }],
+        "current_signing_key": "key_001",
+    }
+    _write_manifest(manifest)
+    print("[AIAuth] Fresh install — generated keys/key_001_active.pem")
+    return manifest
+
+
+def _load_private_for(key_id: str):
+    """Try active then retired variants on disk. Returns None if the
+    private key is not available (e.g., historical key pruned from disk
+    but still in the manifest for verification)."""
+    for variant in ("active", "retired"):
+        p = KEYS_SUBDIR / f"{key_id}_{variant}.pem"
+        if p.exists():
+            with open(p, "rb") as f:
+                return serialization.load_pem_private_key(f.read(), password=None)
+    return None
+
+
+def initialize_keys() -> None:
+    global CURRENT_KEY_ID
+    manifest = _load_or_init_manifest()
+    CURRENT_KEY_ID = manifest.get("current_signing_key", "")
+    KEY_REGISTRY.clear()
+    for entry in manifest.get("keys", []):
+        kid = entry["key_id"]
+        priv = _load_private_for(kid)
+        if priv is None:
+            # Private pruned from disk — still loadable for verification
+            # from the manifest's public_key_pem field.
+            try:
+                pub = serialization.load_pem_public_key(entry["public_key_pem"].encode())
+            except Exception:
+                continue
+            KEY_REGISTRY[kid] = {
+                "private": None,
+                "public": pub,
+                "public_pem": entry["public_key_pem"],
+                "meta": entry,
+            }
+        else:
+            KEY_REGISTRY[kid] = {
+                "private": priv,
+                "public": priv.public_key(),
+                "public_pem": _derive_public_pem(priv),
+                "meta": entry,
+            }
+    if not CURRENT_KEY_ID or CURRENT_KEY_ID not in KEY_REGISTRY:
+        raise RuntimeError(f"Key manifest invalid: current_signing_key={CURRENT_KEY_ID} not in loaded set {list(KEY_REGISTRY.keys())}")
+    print(f"[AIAuth] Loaded {len(KEY_REGISTRY)} key(s); current = {CURRENT_KEY_ID}")
+
+
+initialize_keys()
+
+
+# Backward-compatible globals: any external code still referencing
+# PRIV_KEY / PUB_KEY / PUB_PEM resolves to the CURRENT signing key.
+PRIV_KEY = KEY_REGISTRY[CURRENT_KEY_ID]["private"]
+PUB_KEY = KEY_REGISTRY[CURRENT_KEY_ID]["public"]
+PUB_PEM = KEY_REGISTRY[CURRENT_KEY_ID]["public_pem"]
 
 
 def sign(data: dict) -> str:
+    """Sign with the current signing key. The caller is responsible for
+    embedding key_id in `data` before calling sign() — that way the
+    key_id becomes part of the signed payload and cannot be forged."""
     payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
-    sig = PRIV_KEY.sign(payload.encode())
+    priv = KEY_REGISTRY[CURRENT_KEY_ID]["private"]
+    if priv is None:
+        raise RuntimeError(f"Current signing key {CURRENT_KEY_ID} has no private key on disk")
+    sig = priv.sign(payload.encode())
     return base64.urlsafe_b64encode(sig).decode()
 
 
 def check_sig(data: dict, sig_b64: str) -> bool:
-    payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    """Verify signature. Uses key_id from `data` when present; otherwise
+    tries every known public key (supports pre-v0.5.0 receipts that have
+    no key_id field)."""
+    payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
     try:
-        PUB_KEY.verify(base64.urlsafe_b64decode(sig_b64), payload.encode())
-        return True
-    except:
+        sig_bytes = base64.urlsafe_b64decode(sig_b64)
+    except Exception:
         return False
+    kid = data.get("key_id") if isinstance(data, dict) else None
+    if kid and kid in KEY_REGISTRY:
+        try:
+            KEY_REGISTRY[kid]["public"].verify(sig_bytes, payload)
+            return True
+        except Exception:
+            return False
+    # Legacy fallback: try every loaded key
+    for entry in KEY_REGISTRY.values():
+        try:
+            entry["public"].verify(sig_bytes, payload)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def build_public_key_manifest(include_private_status: bool = False) -> dict:
+    """Return the manifest as served to clients via /v1/public-key.
+    Never includes private key material."""
+    keys = []
+    for kid, entry in KEY_REGISTRY.items():
+        meta = entry["meta"]
+        k = {
+            "key_id": kid,
+            "algorithm": meta.get("algorithm", "Ed25519"),
+            "valid_from": meta.get("valid_from"),
+            "valid_until": meta.get("valid_until"),
+            "status": meta.get("status", "active"),
+            "public_key_pem": entry["public_pem"],
+        }
+        if include_private_status:
+            k["private_key_available"] = entry["private"] is not None
+        keys.append(k)
+    return {
+        "algorithm": "Ed25519",
+        "keys": keys,
+        "current_signing_key": CURRENT_KEY_ID,
+        "version": VERSION,
+    }
 
 
 # ===================================================================
@@ -210,57 +535,354 @@ def init_registry():
         parent_hash   TEXT,
         registered_at TEXT NOT NULL
     )""")
+    # v0.5.0 migration: add doc_id column if missing (idempotent, safe to re-run)
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(hash_registry)").fetchall()}
+    if "doc_id" not in existing_cols:
+        conn.execute("ALTER TABLE hash_registry ADD COLUMN doc_id TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_hash ON hash_registry(content_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_parent ON hash_registry(parent_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_receipt ON hash_registry(receipt_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_doc_id ON hash_registry(doc_id)")
     conn.commit()
     conn.close()
 
 init_registry()
 
-def register_hash(content_hash: str, receipt_id: str, parent_hash: str = None):
-    """Add an entry to the public registry. No user data stored."""
+def register_hash(content_hash: str, receipt_id: str, parent_hash: str = None, doc_id: str = None):
+    """Add an entry to the public registry. No user data stored.
+
+    Five columns only (per Core Principle #3): content_hash, receipt_id,
+    parent_hash, doc_id, registered_at. No uid, no model, no prompt_hash.
+    """
     conn = get_registry()
     conn.execute(
-        "INSERT INTO hash_registry (content_hash, receipt_id, parent_hash, registered_at) VALUES (?,?,?,?)",
-        (content_hash, receipt_id, parent_hash, datetime.now(timezone.utc).isoformat())
+        "INSERT INTO hash_registry (content_hash, receipt_id, parent_hash, doc_id, registered_at) VALUES (?,?,?,?,?)",
+        (content_hash, receipt_id, parent_hash, doc_id, datetime.now(timezone.utc).isoformat())
     )
     conn.commit()
     conn.close()
 
 
+def find_recent_duplicate(content_hash: str, window_seconds: int) -> Optional[dict]:
+    """Return {receipt_id, registered_at} if this hash was registered within
+    the dedup window, else None. Used by /v1/sign to avoid double-registration
+    from accidental double-clicks or batched replay."""
+    if window_seconds <= 0:
+        return None
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat()
+    conn = get_registry()
+    row = conn.execute(
+        "SELECT receipt_id, registered_at FROM hash_registry "
+        "WHERE content_hash = ? AND registered_at > ? "
+        "ORDER BY registered_at DESC LIMIT 1",
+        (content_hash, cutoff)
+    ).fetchone()
+    conn.close()
+    return {"receipt_id": row["receipt_id"], "registered_at": row["registered_at"]} if row else None
+
+
 # ===================================================================
-# ENTERPRISE DB (optional)
+# APPLICATION DB — accounts, orgs, tokens, consent, enterprise store
+# (aiauth.db)
+# Per CLAUDE.md "Database Architecture": two DBs total, not three.
+# This single database holds everything that isn't the anonymous
+# registry. Account/auth tables are always present (public account
+# system is available in free tier). Enterprise tables are created
+# regardless of MODE so that hosted enterprise ingest works without
+# restart when a license is activated.
 # ===================================================================
 
+import hmac
+import secrets
+
+
 def get_db():
-    if MODE != "enterprise": return None
+    """Connection to aiauth.db. Opened fresh per call — SQLite with WAL
+    handles concurrency."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
+
 def init_db():
-    if MODE != "enterprise": return
     conn = get_db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS attestations (
-        id TEXT PRIMARY KEY, created_at TEXT, output_hash TEXT,
-        user_id TEXT, model TEXT, provider TEXT, source TEXT,
-        review_status TEXT DEFAULT 'pending', reviewer_id TEXT,
-        reviewed_at TEXT, review_note TEXT,
-        parent_hash TEXT, chain_root TEXT,
-        signature TEXT, receipt TEXT
+
+    # ---------------- Accounts (always, all modes) ----------------
+    conn.execute("""CREATE TABLE IF NOT EXISTS accounts (
+        account_id    TEXT PRIMARY KEY,
+        primary_email TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
     )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS review_history (
-        id TEXT PRIMARY KEY, attestation_id TEXT, reviewer_id TEXT,
-        status TEXT, note TEXT, reviewed_at TEXT
+    conn.execute("""CREATE TABLE IF NOT EXISTS account_emails (
+        email         TEXT PRIMARY KEY,
+        account_id    TEXT NOT NULL REFERENCES accounts(account_id),
+        email_type    TEXT NOT NULL,
+        org_id        TEXT,
+        verified      INTEGER NOT NULL DEFAULT 0,
+        added_at      TEXT NOT NULL,
+        verified_at   TEXT
     )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_chain ON attestations(chain_root)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON attestations(user_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON attestations(output_hash)")
-    conn.commit(); conn.close()
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_account ON account_emails(account_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_org ON account_emails(org_id)")
+
+    # ---------------- Organizations + membership ----------------
+    conn.execute("""CREATE TABLE IF NOT EXISTS organizations (
+        org_id        TEXT PRIMARY KEY,
+        name          TEXT NOT NULL,
+        domains       TEXT NOT NULL,
+        license_key   TEXT NOT NULL,
+        license_tier  TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        active        INTEGER NOT NULL DEFAULT 1
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS org_members (
+        account_id    TEXT NOT NULL REFERENCES accounts(account_id),
+        org_id        TEXT NOT NULL REFERENCES organizations(org_id),
+        role          TEXT NOT NULL DEFAULT 'member',
+        department    TEXT,
+        joined_at     TEXT NOT NULL,
+        left_at       TEXT,
+        consent_personal_history INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (account_id, org_id)
+    )""")
+
+    # ---------------- Immutable consent audit log ----------------
+    conn.execute("""CREATE TABLE IF NOT EXISTS consent_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id    TEXT NOT NULL,
+        org_id        TEXT NOT NULL,
+        action        TEXT NOT NULL,
+        timestamp     TEXT NOT NULL,
+        details       TEXT
+    )""")
+
+    # ---------------- Magic-link / session tokens ----------------
+    conn.execute("""CREATE TABLE IF NOT EXISTS used_tokens (
+        nonce         TEXT PRIMARY KEY,
+        used_at       TEXT NOT NULL,
+        purpose       TEXT NOT NULL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS revoked_sessions (
+        session_id    TEXT PRIMARY KEY,
+        revoked_at    TEXT NOT NULL,
+        reason        TEXT
+    )""")
+
+    # ---------------- v0.5.0 enterprise attestation store ----------------
+    # Full receipt metadata is stored here when enterprise clients POST
+    # to /v1/enterprise/ingest. Created unconditionally so switching
+    # modes doesn't require a migration. Populated only in enterprise
+    # flows; free-tier /v1/sign NEVER writes here (see Dual-Path Arch).
+    conn.execute("""CREATE TABLE IF NOT EXISTS enterprise_attestations (
+        id              TEXT PRIMARY KEY,
+        ts              TEXT NOT NULL,
+        hash            TEXT NOT NULL,
+        prompt_hash     TEXT,
+        uid             TEXT NOT NULL,
+        uid_pseudonym   TEXT,
+        src             TEXT,
+        model           TEXT,
+        provider        TEXT,
+        source_domain   TEXT,
+        source_app      TEXT,
+        concurrent_ai_apps TEXT,
+        ai_markers      TEXT,
+        doc_id          TEXT,
+        parent          TEXT,
+        file_type       TEXT,
+        len             INTEGER,
+        tta             INTEGER,
+        sid             TEXT,
+        dest            TEXT,
+        dest_ext        INTEGER,
+        classification  TEXT,
+        review_status   TEXT,
+        review_by       TEXT,
+        review_at       TEXT,
+        review_note     TEXT,
+        tags            TEXT,
+        schema_version  TEXT NOT NULL,
+        org_id          TEXT NOT NULL REFERENCES organizations(org_id),
+        client_integrity TEXT DEFAULT 'none',
+        ingested_at     TEXT NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_uid ON enterprise_attestations(uid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_ts ON enterprise_attestations(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_org ON enterprise_attestations(org_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_model ON enterprise_attestations(model)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_doc_id ON enterprise_attestations(doc_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_classification ON enterprise_attestations(classification)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_pseudonym ON enterprise_attestations(uid_pseudonym)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_prompt_hash ON enterprise_attestations(prompt_hash)")
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS policy_violations (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        attestation_id  TEXT NOT NULL REFERENCES enterprise_attestations(id),
+        policy_id       TEXT NOT NULL,
+        severity        TEXT NOT NULL,
+        details         TEXT,
+        detected_at     TEXT NOT NULL,
+        resolved_at     TEXT,
+        resolved_by     TEXT,
+        resolution_note TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pv_severity ON policy_violations(severity)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pv_detected ON policy_violations(detected_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pv_attest ON policy_violations(attestation_id)")
+
+    # ---------------- Legacy v0.4.0 attestations (enterprise only) ----------------
+    if MODE == "enterprise":
+        conn.execute("""CREATE TABLE IF NOT EXISTS attestations (
+            id TEXT PRIMARY KEY, created_at TEXT, output_hash TEXT,
+            user_id TEXT, model TEXT, provider TEXT, source TEXT,
+            review_status TEXT DEFAULT 'pending', reviewer_id TEXT,
+            reviewed_at TEXT, review_note TEXT,
+            parent_hash TEXT, chain_root TEXT,
+            signature TEXT, receipt TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS review_history (
+            id TEXT PRIMARY KEY, attestation_id TEXT, reviewer_id TEXT,
+            status TEXT, note TEXT, reviewed_at TEXT
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chain ON attestations(chain_root)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON attestations(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON attestations(output_hash)")
+
+    conn.commit()
+    conn.close()
+
 
 init_db()
+
+
+# ===================================================================
+# MAGIC-LINK + SESSION TOKEN HELPERS (v0.5.0+)
+# HMAC-signed JWT-style tokens: base64url(json).base64url(hmac).
+# The server holds SERVER_SECRET; any tampering invalidates the MAC.
+# ===================================================================
+
+def _b64url_no_pad(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _sign_token(payload: dict) -> str:
+    if not SERVER_SECRET:
+        raise AIAuthError(
+            "SERVER_MISCONFIGURED",
+            "SERVER_SECRET env var is not set; magic-link auth is disabled",
+            500,
+        )
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    mac = hmac.new(SERVER_SECRET.encode(), canonical, hashlib.sha256).digest()
+    return f"{_b64url_no_pad(canonical)}.{_b64url_no_pad(mac)}"
+
+
+def _verify_token(token: str) -> Optional[dict]:
+    if not SERVER_SECRET or not token or "." not in token:
+        return None
+    try:
+        data_b64, sig_b64 = token.split(".", 1)
+        canonical = _b64url_decode(data_b64)
+        expected = hmac.new(SERVER_SECRET.encode(), canonical, hashlib.sha256).digest()
+        actual = _b64url_decode(sig_b64)
+        if not hmac.compare_digest(expected, actual):
+            return None
+        payload = json.loads(canonical)
+        exp = payload.get("expires_at")
+        if exp:
+            exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            if exp_dt < datetime.now(timezone.utc):
+                return None
+        return payload
+    except Exception:
+        return None
+
+
+def _make_magic_token(account_id: str, email: str, purpose: str, ttl_minutes: int = 15) -> tuple:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "account_id": account_id,
+        "email": email,
+        "issued_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=ttl_minutes)).isoformat(),
+        "nonce": secrets.token_hex(16),
+        "purpose": purpose,
+    }
+    return _sign_token(payload), payload
+
+
+def _make_session_token(account_id: str, email: str, ttl_hours: int = 24) -> tuple:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "account_id": account_id,
+        "email": email,
+        "issued_at": now.isoformat(),
+        "expires_at": (now + timedelta(hours=ttl_hours)).isoformat(),
+        "session_id": secrets.token_hex(16),
+        "kind": "session",
+    }
+    return _sign_token(payload), payload
+
+
+def _send_magic_link(email: str, token: str, purpose: str) -> None:
+    """Email delivery is intentionally stubbed in v0.5.0. The link is
+    logged to stdout and to KEY_DIR/magic_links.log so an admin can
+    wire in a transactional email provider (Resend, Postmark, SES)
+    without touching server code."""
+    link = f"{PUBLIC_BASE_URL}/auth?token={token}&p={purpose}"
+    msg = f"[AIAuth magic-link] to={email} purpose={purpose} link={link}"
+    print(msg)
+    try:
+        log_path = KEY_DIR / "magic_links.log"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
+    except Exception:
+        pass
+
+
+def _require_session(authorization: Optional[str]) -> dict:
+    """Resolve a Bearer session token into its payload. Raises AIAuthError
+    on missing/invalid/revoked sessions."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise AIAuthError("UNAUTHENTICATED", "Missing Authorization: Bearer <session_token>", 401)
+    token = authorization[7:].strip()
+    payload = _verify_token(token)
+    if payload is None or payload.get("kind") != "session":
+        raise AIAuthError("SESSION_INVALID", "Session token is invalid or expired", 401)
+    sid = payload.get("session_id")
+    if sid:
+        conn = get_db()
+        row = conn.execute("SELECT session_id FROM revoked_sessions WHERE session_id = ?", (sid,)).fetchone()
+        conn.close()
+        if row:
+            raise AIAuthError("SESSION_INVALID", "Session has been revoked", 401)
+    return payload
+
+
+def _find_account_by_email(email: str) -> Optional[sqlite3.Row]:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT ae.*, a.primary_email FROM account_emails ae "
+        "JOIN accounts a ON ae.account_id = a.account_id "
+        "WHERE ae.email = ?",
+        (email,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _valid_email(email: str) -> bool:
+    return bool(email) and bool(_EMAIL_RE.match(email.strip())) and len(email) <= 254
 
 
 # ===================================================================
@@ -268,46 +890,181 @@ init_db()
 # ===================================================================
 
 class SignRequest(BaseModel):
-    output_hash: str              # SHA-256 of the content
-    user_id: str                  # Who is attesting
-    source: str = "unknown"       # Where it came from
-    model: Optional[str] = None   # AI model (if applicable)
+    # ----- Required (all schema versions) -----
+    output_hash: str              # SHA-256 of the content (64 hex chars)
+    user_id: str                  # Who is attesting (email or chosen uid)
+    source: str = "unknown"       # Surface: chrome-extension / desktop-agent / litellm-callback
+
+    # ----- v0.4.0 fields (retained) -----
+    model: Optional[str] = None
     provider: Optional[str] = None
-    review_status: Optional[str] = None  # approved/modified/rejected
+    review_status: Optional[str] = None  # approved / modified / rejected
     reviewer_id: Optional[str] = None
     note: Optional[str] = None
-    parent_hash: Optional[str] = None    # Previous version's OUTPUT hash
+    parent_hash: Optional[str] = None    # previous version's content hash
     tags: Optional[list] = None
-    register: bool = True         # Add to public hash registry for chain discovery
+    register: bool = True                # add to public hash registry
+
+    # ----- v0.5.0: free-tier additive fields -----
+    prompt_hash: Optional[str] = None           # SHA-256 of prompt text (free tier, see CLAUDE.md Prompt Hashing)
+    source_domain: Optional[str] = None         # e.g. "claude.ai"
+    source_app: Optional[str] = None            # active window/app title (desktop)
+    file_type: Optional[str] = None             # spreadsheet/document/pdf/code/image/prose/snippet/text/data
+    content_length: Optional[int] = Field(default=None, alias="len")   # character/byte count, NOT content
+    doc_id: Optional[str] = None                # persistent document identifier
+    ai_markers: Optional[Dict[str, Any]] = None # {"source": "...", "verified": bool}
+    client_integrity: Optional[str] = None      # "none" | "extension" | "os-verified"  (server may downgrade)
+
+    # ----- v0.5.0: commercial-tier fields (free-tier clients omit) -----
+    tta: Optional[int] = None                   # seconds between AI output and attestation
+    sid: Optional[str] = None                   # session id grouping same AI conversation
+    dest: Optional[str] = None                  # email / messaging / document-platform / code-repository
+    dest_ext: Optional[bool] = None             # destination external to org?
+    classification: Optional[str] = None        # financial / legal / client-facing / internal
+    concurrent_ai_apps: Optional[List[str]] = None  # AI processes running at attest moment
+
+    # Pydantic v2 config: allow "len" as alias; also tolerate extra fields for forward-compat
+    model_config = {"populate_by_name": True, "extra": "ignore"}
+
+
+def _validate_sign_request(req: SignRequest) -> None:
+    """Apply v0.5.0 schema-level validation, raising AIAuthError on failure."""
+    if not _SHA256_RE.match(req.output_hash or ""):
+        raise AIAuthError("INVALID_HASH", "output_hash must be a 64-character SHA-256 hex string", 400)
+    if req.prompt_hash is not None and not _SHA256_RE.match(req.prompt_hash):
+        raise AIAuthError("INVALID_PROMPT_HASH", "prompt_hash must be a 64-character SHA-256 hex string", 400)
+    if req.parent_hash is not None and not _SHA256_RE.match(req.parent_hash):
+        raise AIAuthError("INVALID_HASH", "parent_hash must be a 64-character SHA-256 hex string", 400)
+    if not (req.user_id or "").strip():
+        raise AIAuthError("INVALID_RECEIPT", "user_id (uid) is required", 400)
+    if req.client_integrity not in (None, "none", "extension", "os-verified"):
+        raise AIAuthError("INVALID_RECEIPT", "client_integrity must be one of: none, extension, os-verified", 400)
+
+
+def _validate_client_integrity(request: Request, claimed: Optional[str], content_hash: str) -> str:
+    """Return the ACTUAL client integrity level per CLAUDE.md "Metadata
+    Integrity". Downgrades invalid claims to 'none' — never upgrades.
+
+    Level 2 (extension): HMAC header X-AIAuth-Client-Hash over
+    <version>:<timestamp>:<content_hash> using CLIENT_SECRET. Requires
+    X-AIAuth-Extension-Version and X-AIAuth-Timestamp headers too.
+    """
+    if claimed != "extension" and claimed != "os-verified":
+        return "none"
+
+    if claimed == "extension":
+        if not CLIENT_SECRET:
+            return "none"  # server not configured for HMAC — cannot verify
+        ver = request.headers.get("x-aiauth-extension-version", "")
+        ts = request.headers.get("x-aiauth-timestamp", "")
+        supplied = request.headers.get("x-aiauth-client-hash", "")
+        if not ver or not ts or not supplied:
+            return "none"
+        # Timestamp freshness window: 5 minutes — prevents replay
+        try:
+            ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            drift = abs((datetime.now(timezone.utc) - ts_dt).total_seconds())
+            if drift > 300:
+                return "none"
+        except Exception:
+            return "none"
+        expected = hmac.new(
+            CLIENT_SECRET.encode(),
+            f"{ver}:{ts}:{content_hash}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(expected, supplied.lower()):
+            return "extension"
+        return "none"
+
+    # "os-verified" would require per-agent cert verification; deferred.
+    # Accept the claim only if the server has been configured to trust
+    # the agent out of band (not implemented in v0.5.0 — downgrade).
+    return "none"
+
 
 @app.post("/v1/sign")
-def sign_receipt(req: SignRequest):
+def sign_receipt(req: SignRequest, request: Request):
     """
     Sign an attestation receipt and return it.
 
     If register=true (default), the content hash and receipt ID are
     added to the public hash registry. This enables chain discovery —
     others can find out that a receipt exists for a given content hash.
-    The registry stores NO user data — only hash → receipt_id mappings.
+    The registry stores NO user data — only hash -> receipt_id mappings
+    (five columns: content_hash, receipt_id, parent_hash, doc_id, registered_at).
 
     If register=false, the server signs and forgets entirely.
+
+    v0.5.0 behavior:
+      - Accepts all v0.5.0 schema fields (additive; missing fields default to null).
+      - Applies a deduplication window (default 300s, configurable via AIAUTH_DEDUP_WINDOW):
+        re-submitting the same content_hash within the window returns HTTP 409 with
+        the original receipt_id, so the client can reuse its cached signature.
+      - Rejects malformed hashes with standardized error response.
+      - prompt_hash is signed into the receipt but NEVER added to the public registry
+        (see Integrity Rule #12 in CLAUDE.md).
     """
+    _validate_sign_request(req)
+
+    # Deduplication: if the same content_hash was registered recently, return 409.
+    # The public server does not store signatures, so we do not echo the prior signature —
+    # the client's local receipt store already has it (see Offline-First Client Architecture).
+    if req.register and DEDUP_WINDOW > 0:
+        existing = find_recent_duplicate(req.output_hash, DEDUP_WINDOW)
+        if existing:
+            raise AIAuthError(
+                code="RECEIPT_DUPLICATE",
+                message="This content was already attested within the deduplication window",
+                status=409,
+                details={
+                    "existing_receipt_id": existing["receipt_id"],
+                    "registered_at": existing["registered_at"],
+                    "window_seconds": DEDUP_WINDOW,
+                },
+            )
+
     receipt_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    receipt = {
+    # Build receipt: required fields first, then all populated optional fields.
+    # Null/empty fields are OMITTED (keeps receipt compact and backward-compatible).
+    # key_id is embedded so the signature covers it — cannot be forged after signing.
+    receipt: Dict[str, Any] = {
         "v": VERSION,
         "id": receipt_id,
         "ts": now,
         "hash": req.output_hash,
         "uid": req.user_id,
         "src": req.source,
+        "key_id": CURRENT_KEY_ID,
     }
 
+    # v0.4.0-compat optional fields
     if req.model: receipt["model"] = req.model
     if req.provider: receipt["provider"] = req.provider
     if req.parent_hash: receipt["parent"] = req.parent_hash
     if req.tags: receipt["tags"] = req.tags
+
+    # v0.5.0 free-tier additions
+    if req.prompt_hash: receipt["prompt_hash"] = req.prompt_hash
+    if req.source_domain: receipt["source_domain"] = req.source_domain
+    if req.source_app: receipt["source_app"] = req.source_app
+    if req.file_type: receipt["file_type"] = req.file_type
+    if req.content_length is not None: receipt["len"] = req.content_length
+    if req.doc_id: receipt["doc_id"] = req.doc_id
+    if req.ai_markers: receipt["ai_markers"] = req.ai_markers
+    # client_integrity: validate against HMAC header. Downgrades-only:
+    # an invalid claim becomes "none"; never upgrades above what client requested.
+    receipt["client_integrity"] = _validate_client_integrity(request, req.client_integrity, req.output_hash)
+
+    # v0.5.0 commercial-tier fields (server accepts whatever the client sends)
+    if req.tta is not None: receipt["tta"] = req.tta
+    if req.sid: receipt["sid"] = req.sid
+    if req.dest: receipt["dest"] = req.dest
+    if req.dest_ext is not None: receipt["dest_ext"] = req.dest_ext
+    if req.classification: receipt["classification"] = req.classification
+    if req.concurrent_ai_apps: receipt["concurrent_ai_apps"] = req.concurrent_ai_apps
 
     if req.review_status:
         receipt["review"] = {
@@ -319,9 +1076,9 @@ def sign_receipt(req: SignRequest):
 
     signature = sign(receipt)
 
-    # Public hash registry — stores hash→receipt_id only, no user data
+    # Public hash registry — stores hash->receipt_id mapping + doc_id only, no user data
     if req.register:
-        register_hash(req.output_hash, receipt_id, req.parent_hash)
+        register_hash(req.output_hash, receipt_id, req.parent_hash, req.doc_id)
 
     # Enterprise: also store full attestation
     if MODE == "enterprise":
@@ -356,6 +1113,1135 @@ def sign_receipt(req: SignRequest):
         "signature": signature,
         "short_id": receipt_id[:12],
         "receipt_code": f"[AIAuth:{receipt_id[:12]}]",
+    }
+
+
+# ===================================================================
+# ACCOUNT SYSTEM — magic-link authentication (v0.5.0+)
+# Endpoints: /v1/account/create, /auth, /verify, /confirm, /link,
+#            /me, /consent, /export, /logout
+# See CLAUDE.md "Authentication Model" for the full design. All
+# enumeration-sensitive endpoints return 200 whether or not the email
+# exists — callers can't tell.
+# ===================================================================
+
+class AccountCreateRequest(BaseModel):
+    email: str
+
+
+class AccountAuthRequest(BaseModel):
+    email: str
+
+
+class AccountVerifyRequest(BaseModel):
+    token: str
+
+
+class AccountLinkRequest(BaseModel):
+    email: str
+    email_type: str = "corporate"   # "personal" | "corporate"
+
+
+class AccountConfirmRequest(BaseModel):
+    token: str
+
+
+class AccountConsentRequest(BaseModel):
+    org_id: str
+    consent_personal_history: bool
+
+
+def _standard_enum_safe_ok():
+    """Response returned by enumeration-sensitive endpoints regardless
+    of whether the email exists. Keep wording identical to avoid side
+    channels."""
+    return {"message": "If the email is valid, a magic link has been sent. Link expires in 15 minutes."}
+
+
+@app.post("/v1/account/create")
+def account_create(body: AccountCreateRequest):
+    """Create a new AIAuth account and send a magic link. Idempotent:
+    if the email already maps to an account, behaves identically to
+    /v1/account/auth (no enumeration signal)."""
+    email = (body.email or "").strip().lower()
+    if not _valid_email(email):
+        raise AIAuthError("INVALID_EMAIL", "Email format is invalid", 400)
+
+    existing = _find_account_by_email(email)
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        account_id = existing["account_id"]
+    else:
+        account_id = "ACC_" + uuid.uuid4().hex[:12]
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO accounts (account_id, primary_email, created_at, updated_at) VALUES (?,?,?,?)",
+            (account_id, email, now, now),
+        )
+        conn.execute(
+            "INSERT INTO account_emails (email, account_id, email_type, verified, added_at) VALUES (?,?,?,?,?)",
+            (email, account_id, "personal", 0, now),
+        )
+        conn.commit()
+        conn.close()
+
+    token, _ = _make_magic_token(account_id, email, "login")
+    _send_magic_link(email, token, "login")
+    return _standard_enum_safe_ok()
+
+
+@app.post("/v1/account/auth")
+def account_auth(body: AccountAuthRequest):
+    """Request a magic link for an existing account. Does NOT reveal
+    whether the email exists. Rate-limited by middleware
+    (10/hour per IP)."""
+    email = (body.email or "").strip().lower()
+    if not _valid_email(email):
+        # Silent success to avoid enumeration
+        return _standard_enum_safe_ok()
+    existing = _find_account_by_email(email)
+    if existing:
+        token, _ = _make_magic_token(existing["account_id"], email, "login")
+        _send_magic_link(email, token, "login")
+    # else: silently do nothing
+    return _standard_enum_safe_ok()
+
+
+@app.post("/v1/account/verify")
+def account_verify(body: AccountVerifyRequest):
+    """Validate a magic-link token and return a session token. Tokens
+    are single-use: the nonce is recorded in used_tokens so replays
+    fail with TOKEN_USED."""
+    payload = _verify_token(body.token)
+    if payload is None:
+        raise AIAuthError("TOKEN_INVALID", "Magic link is invalid or expired", 400)
+    if payload.get("purpose") not in ("login", "verify_email", "link_email"):
+        raise AIAuthError("TOKEN_INVALID", "Token has unexpected purpose", 400)
+
+    nonce = payload.get("nonce")
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO used_tokens (nonce, used_at, purpose) VALUES (?,?,?)",
+            (nonce, now, payload.get("purpose", "")),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise AIAuthError("TOKEN_USED", "Magic link has already been used", 400)
+
+    # Mark email as verified if this is a login/verify_email token
+    conn.execute(
+        "UPDATE account_emails SET verified = 1, verified_at = ? "
+        "WHERE email = ? AND verified = 0",
+        (now, payload["email"]),
+    )
+    conn.commit()
+    conn.close()
+
+    session_token, sess_payload = _make_session_token(payload["account_id"], payload["email"])
+    return {
+        "session_token": session_token,
+        "expires_in": 86400,
+        "expires_at": sess_payload["expires_at"],
+        "account_id": payload["account_id"],
+        "email": payload["email"],
+    }
+
+
+@app.get("/v1/account/me")
+def account_me(authorization: Optional[str] = Header(default=None)):
+    """Return the authenticated caller's account info: emails linked,
+    verification status, org memberships."""
+    session = _require_session(authorization)
+    account_id = session["account_id"]
+    conn = get_db()
+    emails = [dict(r) for r in conn.execute(
+        "SELECT email, email_type, org_id, verified, added_at, verified_at "
+        "FROM account_emails WHERE account_id = ?",
+        (account_id,),
+    ).fetchall()]
+    orgs = [dict(r) for r in conn.execute(
+        "SELECT om.org_id, o.name, om.role, om.department, om.joined_at, "
+        "       om.left_at, om.consent_personal_history "
+        "FROM org_members om JOIN organizations o ON om.org_id = o.org_id "
+        "WHERE om.account_id = ?",
+        (account_id,),
+    ).fetchall()]
+    conn.close()
+    return {
+        "account_id": account_id,
+        "current_email": session["email"],
+        "emails": emails,
+        "organizations": orgs,
+    }
+
+
+@app.post("/v1/account/link")
+def account_link(body: AccountLinkRequest, authorization: Optional[str] = Header(default=None)):
+    """Link an additional email to the authenticated account. Sends a
+    magic link to the new email; completion happens via /v1/account/confirm."""
+    session = _require_session(authorization)
+    new_email = (body.email or "").strip().lower()
+    if not _valid_email(new_email):
+        raise AIAuthError("INVALID_EMAIL", "Email format is invalid", 400)
+    if body.email_type not in ("personal", "corporate"):
+        raise AIAuthError("INVALID_RECEIPT", "email_type must be personal or corporate", 400)
+
+    # If email already belongs to a DIFFERENT account, reject (enumeration-
+    # safe because the caller already has a session — no blind lookup).
+    existing = _find_account_by_email(new_email)
+    if existing and existing["account_id"] != session["account_id"]:
+        raise AIAuthError(
+            "EMAIL_ALREADY_LINKED",
+            "This email is already linked to another account",
+            409,
+        )
+    # The token carries target account_id; confirmation writes the link.
+    # We pre-encode email_type in purpose to avoid needing a state row.
+    token, _ = _make_magic_token(
+        session["account_id"], new_email,
+        purpose=f"link_email:{body.email_type}",
+    )
+    _send_magic_link(new_email, token, f"link_email:{body.email_type}")
+    return {"message": f"Magic link sent to {new_email}. Click it to confirm the link."}
+
+
+@app.post("/v1/account/confirm")
+def account_confirm(body: AccountConfirmRequest):
+    """Confirm an email-link token (sent via /v1/account/link). Adds
+    the new email to account_emails. Does not require a session — the
+    signed token is the proof of possession."""
+    payload = _verify_token(body.token)
+    if payload is None:
+        raise AIAuthError("TOKEN_INVALID", "Link-confirmation token is invalid or expired", 400)
+    purpose = payload.get("purpose", "")
+    if not purpose.startswith("link_email"):
+        raise AIAuthError("TOKEN_INVALID", "Token is not a link-email token", 400)
+
+    nonce = payload.get("nonce")
+    now = datetime.now(timezone.utc).isoformat()
+    email_type = "corporate"
+    if ":" in purpose:
+        email_type = purpose.split(":", 1)[1] or "corporate"
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO used_tokens (nonce, used_at, purpose) VALUES (?,?,?)",
+            (nonce, now, purpose),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise AIAuthError("TOKEN_USED", "Token has already been used", 400)
+
+    # Insert or update the email
+    try:
+        conn.execute(
+            "INSERT INTO account_emails (email, account_id, email_type, verified, added_at, verified_at) "
+            "VALUES (?,?,?,1,?,?)",
+            (payload["email"], payload["account_id"], email_type, now, now),
+        )
+    except sqlite3.IntegrityError:
+        # Already linked to same account — just ensure verified
+        conn.execute(
+            "UPDATE account_emails SET verified = 1, verified_at = ? "
+            "WHERE email = ? AND account_id = ?",
+            (now, payload["email"], payload["account_id"]),
+        )
+    conn.commit()
+    conn.close()
+    return {"linked": True, "email": payload["email"], "email_type": email_type}
+
+
+@app.post("/v1/account/consent")
+def account_consent(body: AccountConsentRequest, authorization: Optional[str] = Header(default=None)):
+    """Grant or revoke the authenticated account's consent for an
+    organization to see their PERSONAL-email attestations. Corporate-
+    email attestations are always visible to the org (that's the point
+    of having a corporate email) — this flag only controls the
+    personal-history sharing in the enterprise dashboard."""
+    session = _require_session(authorization)
+    account_id = session["account_id"]
+    conn = get_db()
+    # Must already be an org member
+    member = conn.execute(
+        "SELECT * FROM org_members WHERE account_id = ? AND org_id = ?",
+        (account_id, body.org_id),
+    ).fetchone()
+    if member is None:
+        conn.close()
+        raise AIAuthError("NOT_MEMBER", "You are not a member of that organization", 403)
+    new_val = 1 if body.consent_personal_history else 0
+    conn.execute(
+        "UPDATE org_members SET consent_personal_history = ? "
+        "WHERE account_id = ? AND org_id = ?",
+        (new_val, account_id, body.org_id),
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    action = "grant_personal" if new_val else "revoke_personal"
+    conn.execute(
+        "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
+        (account_id, body.org_id, action, now, json.dumps({"email": session["email"]})),
+    )
+    conn.commit()
+    conn.close()
+    return {"account_id": account_id, "org_id": body.org_id,
+            "consent_personal_history": bool(new_val)}
+
+
+@app.post("/v1/account/export")
+def account_export(authorization: Optional[str] = Header(default=None)):
+    """Export the authenticated account's data bundle. In v0.5.0 this
+    returns account metadata + org memberships + consent history.
+    Attestation receipts live on the user's device (free tier) and
+    under enterprise contract (enterprise tier) — we do not hold
+    personal-tier receipts to export."""
+    session = _require_session(authorization)
+    account_id = session["account_id"]
+    conn = get_db()
+    account = dict(conn.execute(
+        "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
+    ).fetchone() or {})
+    emails = [dict(r) for r in conn.execute(
+        "SELECT * FROM account_emails WHERE account_id = ?", (account_id,)
+    ).fetchall()]
+    orgs = [dict(r) for r in conn.execute(
+        "SELECT * FROM org_members WHERE account_id = ?", (account_id,)
+    ).fetchall()]
+    consent = [dict(r) for r in conn.execute(
+        "SELECT * FROM consent_log WHERE account_id = ? ORDER BY timestamp DESC",
+        (account_id,),
+    ).fetchall()]
+    conn.close()
+    return {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "account": account,
+        "emails": emails,
+        "organizations": orgs,
+        "consent_history": consent,
+        "note": "Free-tier attestation receipts are stored on your device, not on our server.",
+    }
+
+
+@app.post("/v1/account/logout")
+def account_logout(authorization: Optional[str] = Header(default=None)):
+    """Revoke the current session by adding its session_id to
+    revoked_sessions. Rate-limited by middleware via the auth path."""
+    session = _require_session(authorization)
+    sid = session.get("session_id")
+    if sid:
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT INTO revoked_sessions (session_id, revoked_at, reason) VALUES (?,?,?)",
+                (sid, datetime.now(timezone.utc).isoformat(), "logout"),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+        conn.close()
+    return {"logged_out": True}
+
+
+# ===================================================================
+# ENTERPRISE INGEST + POLICY ENGINE + ADMIN (v0.5.0+)
+# See CLAUDE.md "Enterprise Offboarding" + "Policy Engine" + "DSAR".
+# ===================================================================
+
+# ------------- License + domain helpers -------------
+
+def _require_license_header(request: Request) -> dict:
+    """Resolve X-AIAuth-License -> org row. Raises 401 on failure."""
+    lic = request.headers.get("x-aiauth-license", "").strip()
+    if not lic:
+        raise AIAuthError("LICENSE_MISSING", "X-AIAuth-License header required", 401)
+    data = validate_license(lic)
+    if data is None:
+        raise AIAuthError("LICENSE_INVALID", "License key invalid or expired", 401)
+    conn = get_db()
+    org = conn.execute(
+        "SELECT * FROM organizations WHERE license_key = ? AND active = 1", (lic,)
+    ).fetchone()
+    conn.close()
+    if org is None:
+        raise AIAuthError(
+            "LICENSE_NOT_ACTIVATED",
+            "License key is valid but not attached to an active organization. "
+            "An admin must claim a domain first via /v1/admin/org/claim.",
+            401,
+        )
+    return {"license_data": data, "org": dict(org)}
+
+
+def _require_admin_session(authorization: Optional[str], org_id: Optional[str] = None) -> dict:
+    """Return session payload if the caller is an admin of the given org
+    (or any org, when org_id is None). Raises 403 otherwise."""
+    session = _require_session(authorization)
+    conn = get_db()
+    if org_id:
+        row = conn.execute(
+            "SELECT * FROM org_members WHERE account_id = ? AND org_id = ? AND role = 'admin' AND left_at IS NULL",
+            (session["account_id"], org_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM org_members WHERE account_id = ? AND role = 'admin' AND left_at IS NULL",
+            (session["account_id"],),
+        ).fetchone()
+    conn.close()
+    if row is None:
+        raise AIAuthError("NOT_ADMIN", "Admin role required on the target organization", 403)
+    session["org_membership"] = dict(row)
+    return session
+
+
+def _org_domains(org: dict) -> List[str]:
+    try:
+        return json.loads(org.get("domains") or "[]")
+    except Exception:
+        return []
+
+
+def _uid_in_org_domain(uid: str, org: dict) -> bool:
+    if "@" not in (uid or ""):
+        return False
+    domain = uid.split("@", 1)[1].lower()
+    return domain in [d.lower() for d in _org_domains(org)]
+
+
+# ------------- Policy engine -------------
+
+DEFAULT_POLICIES = [
+    {"id": "dual-review-financial",
+     "severity": "high",
+     "match": lambda r, ctx: r.get("classification") == "financial"
+             and ctx.get("chain_unique_attesters", 1) < 2},
+    {"id": "no-rubber-stamping",
+     "severity": "medium",
+     "match": lambda r, ctx: (r.get("tta") or 999) < 10 and (r.get("len") or 0) > 500},
+    {"id": "external-must-attest",
+     "severity": "critical",
+     "match": lambda r, ctx: r.get("dest_ext") is True and not (r.get("review_status") or r.get("review", {}).get("status"))},
+    {"id": "unverified-financial",
+     "severity": "medium",
+     "match": lambda r, ctx: r.get("client_integrity") == "none" and r.get("classification") == "financial"},
+    {"id": "shadow-ai-detected",
+     "severity": "low",
+     "match": lambda r, ctx: _shadow_ai_hit(r)},
+    {"id": "ungoverned-ai-content",
+     "severity": "medium",
+     "match": lambda r, ctx: (r.get("ai_markers") or {}).get("verified") is True and not r.get("parent")},
+]
+
+
+def _shadow_ai_hit(r: dict) -> bool:
+    """Flag when concurrent_ai_apps includes a tool that is NOT the
+    source_app / model of the attestation — i.e., an AI app was open
+    but not the one that produced the attested content."""
+    apps = r.get("concurrent_ai_apps") or []
+    if not apps:
+        return False
+    src = (r.get("source_app") or r.get("source_domain") or "").lower()
+    model = (r.get("model") or "").lower()
+    for app in apps:
+        nm = str(app).lower()
+        if nm not in src and (not model or model not in nm):
+            return True
+    return False
+
+
+def evaluate_policies(receipt: dict, ctx: Optional[dict] = None) -> List[dict]:
+    """Evaluate DEFAULT_POLICIES against a receipt. Returns a list of
+    {policy_id, severity, details} for each rule that matched. ctx
+    carries cross-attestation signals (e.g. chain_unique_attesters)."""
+    ctx = ctx or {}
+    violations = []
+    for pol in DEFAULT_POLICIES:
+        try:
+            if pol["match"](receipt, ctx):
+                violations.append({
+                    "policy_id": pol["id"],
+                    "severity": pol["severity"],
+                    "details": {
+                        "classification": receipt.get("classification"),
+                        "tta": receipt.get("tta"),
+                        "len": receipt.get("len"),
+                        "client_integrity": receipt.get("client_integrity"),
+                        "dest_ext": receipt.get("dest_ext"),
+                        "model": receipt.get("model"),
+                    },
+                })
+        except Exception:
+            continue
+    return violations
+
+
+# ------------- Enterprise ingest -------------
+
+class EnterpriseIngestRequest(BaseModel):
+    receipt: dict
+    signature: str
+
+    model_config = {"extra": "ignore"}
+
+
+@app.post("/v1/enterprise/ingest")
+def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
+    """Receive a signed attestation from an enterprise client and store
+    it in enterprise_attestations. Must include a valid license key
+    (X-AIAuth-License header). The receipt's uid must end in one of
+    the org's claimed domains.
+    """
+    ctx = _require_license_header(request)
+    org = ctx["org"]
+
+    receipt = body.receipt or {}
+    # Verify the signature — anything unsigned is rejected outright.
+    if not check_sig(receipt, body.signature):
+        raise AIAuthError("INVALID_RECEIPT", "Receipt signature invalid", 400)
+
+    uid = receipt.get("uid") or ""
+    if not _uid_in_org_domain(uid, org):
+        raise AIAuthError(
+            "DOMAIN_MISMATCH",
+            "Receipt uid domain is not in this org's claimed domains",
+            403,
+            details={"uid": uid, "org_domains": _org_domains(org)},
+        )
+
+    # Block offboarded users. Two signals, either one suffices:
+    #   (a) org_members row with left_at set (known linked member who left)
+    #   (b) consent_log row with action dsar_pseudonymize or dsar_delete
+    #       for this (email, org) — covers users who were pseudonymized
+    #       without ever having linked a personal account.
+    conn = get_db()
+    left_member = conn.execute(
+        "SELECT om.left_at FROM org_members om "
+        "JOIN account_emails ae ON ae.account_id = om.account_id "
+        "WHERE ae.email = ? AND om.org_id = ? AND om.left_at IS NOT NULL",
+        (uid, org["org_id"]),
+    ).fetchone()
+    dsar_out = conn.execute(
+        "SELECT id FROM consent_log "
+        "WHERE org_id = ? AND action IN ('dsar_pseudonymize','dsar_delete') "
+        "AND details LIKE ? LIMIT 1",
+        (org["org_id"], f'%"email": "{uid}"%'),
+    ).fetchone()
+    if left_member is not None or dsar_out is not None:
+        conn.close()
+        raise AIAuthError("EMAIL_OFFBOARDED", "This uid has been offboarded from the organization", 403)
+
+    # Idempotent: if already ingested, return existing row
+    existing = conn.execute(
+        "SELECT id FROM enterprise_attestations WHERE id = ?",
+        (receipt.get("id"),),
+    ).fetchone()
+    if existing is not None:
+        conn.close()
+        return {"stored": True, "deduplicated": True, "attestation_id": receipt.get("id"), "violations": []}
+
+    review = receipt.get("review") or {}
+    row = (
+        receipt.get("id"),
+        receipt.get("ts"),
+        receipt.get("hash"),
+        receipt.get("prompt_hash"),
+        uid,
+        None,  # uid_pseudonym
+        receipt.get("src"),
+        receipt.get("model"),
+        receipt.get("provider"),
+        receipt.get("source_domain"),
+        receipt.get("source_app"),
+        json.dumps(receipt.get("concurrent_ai_apps")) if receipt.get("concurrent_ai_apps") is not None else None,
+        json.dumps(receipt.get("ai_markers")) if receipt.get("ai_markers") is not None else None,
+        receipt.get("doc_id"),
+        receipt.get("parent"),
+        receipt.get("file_type"),
+        receipt.get("len"),
+        receipt.get("tta"),
+        receipt.get("sid"),
+        receipt.get("dest"),
+        int(receipt["dest_ext"]) if isinstance(receipt.get("dest_ext"), bool) else None,
+        receipt.get("classification"),
+        review.get("status"),
+        review.get("by"),
+        review.get("at"),
+        review.get("note"),
+        json.dumps(receipt.get("tags")) if receipt.get("tags") is not None else None,
+        receipt.get("v", VERSION),
+        org["org_id"],
+        receipt.get("client_integrity", "none"),
+        datetime.now(timezone.utc).isoformat(),
+    )
+    conn.execute(
+        "INSERT INTO enterprise_attestations ("
+        "id, ts, hash, prompt_hash, uid, uid_pseudonym, src, model, provider, "
+        "source_domain, source_app, concurrent_ai_apps, ai_markers, doc_id, parent, "
+        "file_type, len, tta, sid, dest, dest_ext, classification, "
+        "review_status, review_by, review_at, review_note, tags, "
+        "schema_version, org_id, client_integrity, ingested_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        row,
+    )
+
+    # Policy evaluation
+    violations = evaluate_policies(receipt)
+    now = datetime.now(timezone.utc).isoformat()
+    for v in violations:
+        conn.execute(
+            "INSERT INTO policy_violations (attestation_id, policy_id, severity, details, detected_at) "
+            "VALUES (?,?,?,?,?)",
+            (receipt.get("id"), v["policy_id"], v["severity"], json.dumps(v["details"]), now),
+        )
+    conn.commit()
+    conn.close()
+    return {
+        "stored": True,
+        "attestation_id": receipt.get("id"),
+        "org_id": org["org_id"],
+        "violations": violations,
+    }
+
+
+# ------------- Admin: org claim -------------
+
+class OrgClaimRequest(BaseModel):
+    name: str
+    domains: List[str]
+    license_key: str
+    license_tier: str = "hosted"
+
+
+@app.post("/v1/admin/org/claim")
+def admin_org_claim(body: OrgClaimRequest, authorization: Optional[str] = Header(default=None)):
+    """Claim one or more email domains for an organization and attach a
+    license key. The authenticated user becomes the first admin member.
+
+    Domains must match emails the calling account has VERIFIED — this
+    proves the caller owns (or at least controls accounts on) the
+    domain. Simplified proof — production deployments should require
+    DNS TXT verification, which we can add via a follow-up piece.
+    """
+    session = _require_session(authorization)
+    # Verify license first
+    lic = validate_license(body.license_key)
+    if lic is None:
+        raise AIAuthError("LICENSE_INVALID", "License key is invalid or expired", 400)
+
+    domains = [d.strip().lower() for d in body.domains if d.strip()]
+    if not domains:
+        raise AIAuthError("INVALID_RECEIPT", "At least one domain is required", 400)
+
+    # Proof-of-control: the caller must have a verified email in each domain
+    conn = get_db()
+    verified = {row["email"].split("@", 1)[1].lower()
+                for row in conn.execute(
+                    "SELECT email FROM account_emails WHERE account_id = ? AND verified = 1",
+                    (session["account_id"],),
+                ).fetchall() if "@" in row["email"]}
+    missing = [d for d in domains if d not in verified]
+    if missing:
+        conn.close()
+        raise AIAuthError(
+            "DOMAIN_NOT_VERIFIED",
+            "You must have a verified email in each claimed domain",
+            403,
+            details={"missing_domains": missing},
+        )
+
+    org_id = "ORG_" + uuid.uuid4().hex[:12]
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO organizations (org_id, name, domains, license_key, license_tier, created_at, active) "
+        "VALUES (?,?,?,?,?,?,1)",
+        (org_id, body.name, json.dumps(domains), body.license_key, body.license_tier, now),
+    )
+    conn.execute(
+        "INSERT INTO org_members (account_id, org_id, role, joined_at) VALUES (?,?,?,?)",
+        (session["account_id"], org_id, "admin", now),
+    )
+    # Also mark each of the caller's verified emails matching a claimed
+    # domain as corporate emails under this org.
+    for domain in domains:
+        conn.execute(
+            "UPDATE account_emails SET email_type = 'corporate', org_id = ? "
+            "WHERE account_id = ? AND email LIKE ? AND email_type != 'corporate'",
+            (org_id, session["account_id"], f"%@{domain}"),
+        )
+    conn.commit()
+    conn.close()
+    return {"org_id": org_id, "name": body.name, "domains": domains, "tier": body.license_tier,
+            "note": "You are the first admin. Invite members via /v1/admin/org/invite (future)."}
+
+
+# ------------- Admin: member list + DSAR + pseudonymize -------------
+
+@app.get("/v1/admin/org/members")
+def admin_org_members(org_id: str = Query(...), authorization: Optional[str] = Header(default=None)):
+    """List members of an org (admin-authed). Shows link status:
+    which members have a personal email linked, which consented to
+    personal-history sharing, who has left."""
+    session = _require_admin_session(authorization, org_id)
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT om.*, a.primary_email, "
+        "       (SELECT COUNT(*) FROM account_emails ae "
+        "        WHERE ae.account_id = om.account_id AND ae.email_type = 'personal') AS has_personal "
+        "FROM org_members om JOIN accounts a ON om.account_id = a.account_id "
+        "WHERE om.org_id = ? ORDER BY om.joined_at DESC",
+        (org_id,),
+    ).fetchall()
+    conn.close()
+    return {"org_id": org_id, "members": [dict(r) for r in rows]}
+
+
+class DSARRequest(BaseModel):
+    email: str
+    action: str              # "export" | "pseudonymize" | "delete"
+    org_id: str
+
+
+@app.post("/v1/admin/dsar")
+def admin_dsar(body: DSARRequest, authorization: Optional[str] = Header(default=None)):
+    """Process a Data Subject Access Request. Export returns all data
+    tied to this email; pseudonymize replaces uid with a one-way hash
+    while preserving audit rows; delete nukes personal data entirely
+    (registry entries are NOT touched — they contain no PII).
+
+    Actions are logged to consent_log (immutable)."""
+    session = _require_admin_session(authorization, body.org_id)
+    email = (body.email or "").strip().lower()
+    if body.action not in ("export", "pseudonymize", "delete"):
+        raise AIAuthError("INVALID_RECEIPT", "action must be export/pseudonymize/delete", 400)
+
+    conn = get_db()
+    member = conn.execute(
+        "SELECT om.account_id FROM org_members om "
+        "JOIN account_emails ae ON ae.account_id = om.account_id "
+        "WHERE ae.email = ? AND om.org_id = ?",
+        (email, body.org_id),
+    ).fetchone()
+    account_id = member["account_id"] if member else None
+
+    now = datetime.now(timezone.utc).isoformat()
+    if body.action == "export":
+        attests = [dict(r) for r in conn.execute(
+            "SELECT * FROM enterprise_attestations WHERE uid = ? AND org_id = ?",
+            (email, body.org_id),
+        ).fetchall()]
+        emails = [dict(r) for r in conn.execute(
+            "SELECT * FROM account_emails WHERE email = ?", (email,)
+        ).fetchall()]
+        conn.execute(
+            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_export", now, json.dumps({"email": email})),
+        )
+        conn.commit()
+        conn.close()
+        return {"action": "export", "email": email, "attestations": attests, "emails": emails}
+
+    if body.action == "pseudonymize":
+        # One-way pseudonym: SHA-256(email + org_salt + "pseudonymize")
+        # org_salt = org_id (stable, org-specific)
+        pseud = hashlib.sha256(f"{email}{body.org_id}pseudonymize".encode()).hexdigest()[:24]
+        conn.execute(
+            "UPDATE enterprise_attestations "
+            "SET uid_pseudonym = ?, uid = '[pseudonymized]' "
+            "WHERE uid = ? AND org_id = ?",
+            (pseud, email, body.org_id),
+        )
+        # Mark user as left
+        if account_id:
+            conn.execute(
+                "UPDATE org_members SET left_at = ? WHERE account_id = ? AND org_id = ? AND left_at IS NULL",
+                (now, account_id, body.org_id),
+            )
+        conn.execute(
+            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_pseudonymize", now, json.dumps({"email": email, "pseudonym": pseud})),
+        )
+        conn.commit()
+        conn.close()
+        return {"action": "pseudonymize", "email": email, "pseudonym": pseud}
+
+    if body.action == "delete":
+        # Nuclear. Remove attestations entirely. Registry entries untouched (no PII).
+        deleted = conn.execute(
+            "DELETE FROM enterprise_attestations WHERE uid = ? AND org_id = ?",
+            (email, body.org_id),
+        ).rowcount
+        conn.execute(
+            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_delete", now, json.dumps({"email": email, "deleted_rows": deleted})),
+        )
+        conn.commit()
+        conn.close()
+        return {"action": "delete", "email": email, "deleted_rows": deleted,
+                "warning": "Registry entries preserved (contain no PII). Chain integrity may be affected."}
+
+
+class OffboardRequest(BaseModel):
+    email: str
+    org_id: str
+
+
+@app.post("/v1/admin/pseudonymize")
+def admin_offboard(body: OffboardRequest, authorization: Optional[str] = Header(default=None)):
+    """Offboarding convenience wrapper around DSAR pseudonymize. Most
+    common admin action when an employee leaves the company."""
+    dsar = DSARRequest(email=body.email, action="pseudonymize", org_id=body.org_id)
+    return admin_dsar(dsar, authorization=authorization)
+
+
+# ------------- Admin: policy violations feed -------------
+
+@app.get("/v1/violations")
+def violations_feed(
+    org_id: str = Query(...),
+    severity: Optional[str] = Query(default=None, description="Filter: critical|high|medium|low"),
+    limit: int = Query(default=100, le=500),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Recent policy violations for the org (admin-authed)."""
+    _require_admin_session(authorization, org_id)
+    conn = get_db()
+    where = "ea.org_id = ?"
+    params: list = [org_id]
+    if severity:
+        where += " AND pv.severity = ?"
+        params.append(severity)
+    rows = conn.execute(
+        f"SELECT pv.*, ea.uid, ea.ts AS attestation_ts "
+        f"FROM policy_violations pv "
+        f"JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
+        f"WHERE {where} ORDER BY pv.detected_at DESC LIMIT ?",
+        params + [limit],
+    ).fetchall()
+    conn.close()
+    return {"org_id": org_id, "count": len(rows), "violations": [dict(r) for r in rows]}
+
+
+# ===================================================================
+# DASHBOARD DATA CONTRACT (v0.5.0+)
+# GET /v1/admin/dashboard/data returns the exact schema documented in
+# CLAUDE.md "Dashboard Data Contract". Aggregations use NULL-safe SQL
+# per Schema Versioning Rule #3.
+# ===================================================================
+
+def _grade_for(review_rate: float, critical_violations: int) -> str:
+    if critical_violations > 0 and review_rate < 0.95:
+        return "F"
+    if review_rate >= 0.95 and critical_violations == 0: return "A"
+    if review_rate >= 0.85: return "B"
+    if review_rate >= 0.70: return "C"
+    if review_rate >= 0.50: return "D"
+    return "F"
+
+
+@app.get("/v1/admin/dashboard/data")
+def dashboard_data(
+    org_id: str = Query(...),
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = Query(default=None),
+    department: Optional[str] = Query(default=None),
+    model: Optional[str] = Query(default=None),
+    classification: Optional[str] = Query(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Aggregated enterprise dashboard data. See Dashboard Data Contract
+    in CLAUDE.md for response schema. Every key in the shape appears in
+    every response (null/0/[] when empty) — no consumer has to null-check."""
+    _require_admin_session(authorization, org_id)
+
+    conn = get_db()
+    org_row = conn.execute("SELECT * FROM organizations WHERE org_id = ?", (org_id,)).fetchone()
+    if org_row is None:
+        conn.close()
+        raise AIAuthError("ORG_NOT_FOUND", "Organization not found", 404)
+
+    # Build WHERE clause + params shared by most queries
+    where = "ea.org_id = :org"
+    params: dict = {"org": org_id}
+    if from_:
+        where += " AND ea.ts >= :from_"; params["from_"] = from_
+    if to:
+        where += " AND ea.ts <= :to"; params["to"] = to
+    if model:
+        where += " AND ea.model = :model"; params["model"] = model
+    if classification:
+        where += " AND ea.classification = :cls"; params["cls"] = classification
+
+    # Join to get department (NULL-safe via LEFT JOIN)
+    join = (
+        "LEFT JOIN account_emails ae ON ea.uid = ae.email "
+        "LEFT JOIN org_members om ON ae.account_id = om.account_id AND om.org_id = ea.org_id "
+    )
+
+    dept_filter = ""
+    if department:
+        dept_filter = " AND IFNULL(om.department, 'Unmapped') = :dept"
+        params["dept"] = department
+
+    # Summary counts
+    summary_row = conn.execute(
+        f"SELECT COUNT(*) AS total, "
+        f"       COUNT(DISTINCT ea.uid) AS unique_users, "
+        f"       COUNT(DISTINCT ea.sid) AS unique_sessions, "
+        f"       AVG(ea.tta) AS avg_tta, "
+        f"       SUM(CASE WHEN ea.review_status IS NOT NULL THEN 1 ELSE 0 END) AS reviewed, "
+        f"       SUM(CASE WHEN COALESCE(ea.tta, 999) < 10 AND COALESCE(ea.len, 0) > 500 THEN 1 ELSE 0 END) AS rubber_stamps, "
+        f"       SUM(CASE WHEN ea.dest_ext = 1 THEN 1 ELSE 0 END) AS external_exposure, "
+        f"       SUM(CASE WHEN ea.ai_markers IS NOT NULL THEN 1 ELSE 0 END) AS ai_authored, "
+        f"       SUM(CASE WHEN ea.prompt_hash IS NOT NULL THEN 1 ELSE 0 END) AS with_prompt_hash "
+        f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter}",
+        params,
+    ).fetchone()
+    total = summary_row["total"] or 0
+    reviewed = summary_row["reviewed"] or 0
+    review_rate = (reviewed / total) if total else 0.0
+    rubber_stamp = summary_row["rubber_stamps"] or 0
+
+    # Median TTA via quantile (SQLite has no native MEDIAN — approximate)
+    median_tta = None
+    tta_rows = [r["tta"] for r in conn.execute(
+        f"SELECT ea.tta FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} AND ea.tta IS NOT NULL ORDER BY ea.tta",
+        params,
+    ).fetchall() if r["tta"] is not None]
+    if tta_rows:
+        mid = len(tta_rows) // 2
+        median_tta = tta_rows[mid]
+
+    # Policy violations by severity
+    violations_by_sev = {k: 0 for k in ("critical", "high", "medium", "low")}
+    for sev_row in conn.execute(
+        f"SELECT pv.severity, COUNT(*) AS n "
+        f"FROM policy_violations pv JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
+        f"{join} WHERE {where} {dept_filter} GROUP BY pv.severity",
+        params,
+    ).fetchall():
+        if sev_row["severity"] in violations_by_sev:
+            violations_by_sev[sev_row["severity"]] = sev_row["n"]
+
+    # Chain-break detection: receipts with parent_hash that isn't in registry
+    chain_breaks_rows = conn.execute(
+        f"SELECT COUNT(DISTINCT ea.doc_id) AS total_chains, "
+        f"       COUNT(DISTINCT CASE WHEN ea.parent IS NOT NULL "
+        f"              AND NOT EXISTS (SELECT 1 FROM enterprise_attestations ea2 "
+        f"              WHERE ea2.hash = ea.parent AND ea2.org_id = ea.org_id) "
+        f"              THEN ea.doc_id END) AS broken "
+        f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} AND ea.doc_id IS NOT NULL",
+        params,
+    ).fetchone()
+    total_chains = chain_breaks_rows["total_chains"] or 0
+    broken_chains = chain_breaks_rows["broken"] or 0
+    complete_chains = max(0, total_chains - broken_chains)
+
+    # By department (NULL-safe: "Unmapped")
+    by_department = []
+    for dept_row in conn.execute(
+        f"SELECT IFNULL(om.department, 'Unmapped') AS dept, "
+        f"       COUNT(*) AS total, COUNT(DISTINCT ea.uid) AS unique_users, "
+        f"       AVG(ea.tta) AS avg_tta, "
+        f"       SUM(CASE WHEN ea.review_status IS NOT NULL THEN 1 ELSE 0 END) AS reviewed, "
+        f"       SUM(CASE WHEN COALESCE(ea.tta,999)<10 AND COALESCE(ea.len,0)>500 THEN 1 ELSE 0 END) AS rubber, "
+        f"       SUM(CASE WHEN ea.dest_ext = 1 THEN 1 ELSE 0 END) AS ext_exposure "
+        f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
+        f"GROUP BY dept ORDER BY total DESC",
+        params,
+    ).fetchall():
+        t = dept_row["total"] or 0
+        r_rate = (dept_row["reviewed"] / t) if t else 0.0
+        # violation counts per dept
+        v_per_dept = {k: 0 for k in ("critical", "high", "medium", "low")}
+        vp_params = {**params, "dept_name": dept_row["dept"]}
+        for sev in conn.execute(
+            f"SELECT pv.severity, COUNT(*) AS n "
+            f"FROM policy_violations pv JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
+            f"{join} WHERE {where} AND IFNULL(om.department, 'Unmapped') = :dept_name "
+            f"GROUP BY pv.severity",
+            vp_params,
+        ).fetchall():
+            if sev["severity"] in v_per_dept:
+                v_per_dept[sev["severity"]] = sev["n"]
+        by_department.append({
+            "department": dept_row["dept"],
+            "total": t,
+            "unique_users": dept_row["unique_users"] or 0,
+            "review_rate": round(r_rate, 3),
+            "rubber_stamp_rate": round((dept_row["rubber"] / t) if t else 0.0, 4),
+            "avg_tta": round(dept_row["avg_tta"], 1) if dept_row["avg_tta"] else None,
+            "external_exposure": dept_row["ext_exposure"] or 0,
+            "violations": v_per_dept,
+            "grade": _grade_for(r_rate, v_per_dept["critical"]),
+        })
+
+    # By model
+    by_model = [
+        {"model": r["model"], "provider": r["provider"], "count": r["n"],
+         "avg_tta": round(r["avg_tta"], 1) if r["avg_tta"] else None}
+        for r in conn.execute(
+            f"SELECT ea.model, ea.provider, COUNT(*) AS n, AVG(ea.tta) AS avg_tta "
+            f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
+            f"GROUP BY ea.model, ea.provider ORDER BY n DESC",
+            params,
+        ).fetchall()
+    ]
+
+    # TTA distribution
+    def _bucket(tta):
+        if tta is None: return None
+        if tta < 10: return "0-10s"
+        if tta < 30: return "10-30s"
+        if tta < 60: return "30-60s"
+        if tta < 300: return "1-5m"
+        if tta < 900: return "5-15m"
+        return "15m+"
+
+    tta_buckets = {"0-10s": 0, "10-30s": 0, "30-60s": 0, "1-5m": 0, "5-15m": 0, "15m+": 0}
+    for t in tta_rows:
+        key = _bucket(t)
+        if key: tta_buckets[key] = tta_buckets.get(key, 0) + 1
+
+    tta_distribution = {
+        "buckets": [
+            {"range": k, "count": v, "flagged": k == "0-10s"}
+            for k, v in tta_buckets.items()
+        ],
+        "rubber_stamps": {
+            "count": rubber_stamp,
+            "threshold": {"tta_under": 10, "len_over": 500},
+            "top_offenders": [dict(r) for r in conn.execute(
+                f"SELECT ea.uid, COUNT(*) AS count, IFNULL(om.department, 'Unmapped') AS department "
+                f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
+                f"AND COALESCE(ea.tta,999) < 10 AND COALESCE(ea.len,0) > 500 "
+                f"GROUP BY ea.uid ORDER BY count DESC LIMIT 5",
+                params,
+            ).fetchall()],
+        },
+    }
+
+    # Shadow AI heatmap (commercial-tier field)
+    shadow_by_app = []
+    for r in conn.execute(
+        f"SELECT json_each.value AS app, COUNT(*) AS times_open, "
+        f"       SUM(CASE WHEN ea.source_app LIKE '%' || json_each.value || '%' THEN 1 ELSE 0 END) AS times_used "
+        f"FROM enterprise_attestations ea, json_each(IFNULL(ea.concurrent_ai_apps, '[]')) "
+        f"{join} WHERE {where} {dept_filter} "
+        f"GROUP BY json_each.value ORDER BY (times_open - times_used) DESC LIMIT 10",
+        params,
+    ).fetchall():
+        t_open = r["times_open"] or 0
+        t_used = r["times_used"] or 0
+        shadow_by_app.append({
+            "app": r["app"],
+            "times_open": t_open,
+            "times_attested_from": t_used,
+            "shadow_ratio": round((t_open - t_used) / t_open, 3) if t_open else 0.0,
+            "interpretation": ("open but not attesting — potential ungoverned use"
+                               if t_open > t_used else "aligned"),
+        })
+
+    # AI authorship detection
+    ai_by_source = [
+        {"source": r["source"], "count": r["n"]}
+        for r in conn.execute(
+            f"SELECT json_extract(ea.ai_markers, '$.source') AS source, COUNT(*) AS n "
+            f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
+            f"AND ea.ai_markers IS NOT NULL "
+            f"GROUP BY source ORDER BY n DESC",
+            params,
+        ).fetchall() if r["source"]
+    ]
+    ai_unattested = conn.execute(
+        f"SELECT COUNT(*) AS n FROM enterprise_attestations ea {join} "
+        f"WHERE {where} {dept_filter} "
+        f"AND ea.ai_markers IS NOT NULL AND ea.parent IS NULL",
+        params,
+    ).fetchone()["n"] or 0
+
+    # Recent violations feed (last 20)
+    recent_vios = [
+        {**dict(r), "details": json.loads(r["details"] or "{}")}
+        for r in conn.execute(
+            f"SELECT pv.id, pv.attestation_id, pv.policy_id, pv.severity, "
+            f"       pv.details, pv.detected_at, pv.resolved_at "
+            f"FROM policy_violations pv JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
+            f"{join} WHERE {where} {dept_filter} "
+            f"ORDER BY pv.detected_at DESC LIMIT 20",
+            params,
+        ).fetchall()
+    ]
+
+    file_type_rows = [
+        {"type": r["file_type"] or "unknown", "count": r["n"]}
+        for r in conn.execute(
+            f"SELECT ea.file_type, COUNT(*) AS n FROM enterprise_attestations ea {join} "
+            f"WHERE {where} {dept_filter} GROUP BY ea.file_type ORDER BY n DESC",
+            params,
+        ).fetchall()
+    ]
+    conn.close()
+
+    # Prompt-hash coverage as a rate (useful "chain of AI custody" KPI)
+    prompt_cov = (summary_row["with_prompt_hash"] / total) if total else 0.0
+
+    return {
+        "meta": {
+            "org_id": org_id,
+            "org_name": org_row["name"],
+            "date_range": {"from": from_, "to": to},
+            "filters_applied": {"department": department, "model": model, "classification": classification},
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "schema_version": VERSION,
+        },
+        "summary": {
+            "total_attestations": total,
+            "unique_users": summary_row["unique_users"] or 0,
+            "unique_sessions": summary_row["unique_sessions"] or 0,
+            "review_rate": round(review_rate, 3),
+            "rubber_stamp_count": rubber_stamp,
+            "rubber_stamp_rate": round((rubber_stamp / total) if total else 0.0, 4),
+            "external_exposure_count": summary_row["external_exposure"] or 0,
+            "chain_break_count": broken_chains,
+            "policy_violations": violations_by_sev,
+            "avg_tta_seconds": round(summary_row["avg_tta"], 1) if summary_row["avg_tta"] else None,
+            "median_tta_seconds": median_tta,
+            "prompt_hash_coverage": round(prompt_cov, 3),
+            "ai_authored_detected": summary_row["ai_authored"] or 0,
+            "shadow_ai_alerts": sum(1 for s in shadow_by_app if s["shadow_ratio"] > 0.2),
+        },
+        "by_department": by_department,
+        "by_model": by_model,
+        "by_time": {"bucket_size": "week", "buckets": []},  # simplified; full time-series in Piece 11b
+        "tta_distribution": tta_distribution,
+        "file_types": file_type_rows,
+        "external_exposure": {
+            "total": summary_row["external_exposure"] or 0,
+            "by_destination": [],
+            "by_classification": [],
+        },
+        "chain_integrity": {
+            "total_chains": total_chains,
+            "complete_chains": complete_chains,
+            "broken_chains": broken_chains,
+            "breaks": [],
+        },
+        "recent_violations": recent_vios,
+        "shadow_ai_heatmap": {
+            "total_unique_apps_detected": len(shadow_by_app),
+            "by_app": shadow_by_app,
+            "by_department": [],
+        },
+        "ai_authorship": {
+            "total_with_markers": summary_row["ai_authored"] or 0,
+            "by_source": ai_by_source,
+            "unattested_with_markers": {
+                "count": ai_unattested,
+                "interpretation": "AI-authored content appearing in chain without attestation",
+            },
+        },
     }
 
 
@@ -430,13 +2316,129 @@ class ContentVerifyRequest(BaseModel):
 
 @app.post("/v1/verify/content")
 def verify_content(req: ContentVerifyRequest):
-    """Is this receipt authentic AND does the content match? Y/N."""
+    """Is this receipt authentic AND does the content match? Y/N.
+
+    Caller supplies a content_hash. The server compares against the
+    receipt's hash. Per CLAUDE.md Content Hashing Rules, browser text
+    attestations (>= v0.5.0) hash the NORMALIZED text while files hash
+    raw bytes. If the receipt predates v0.5.0 or was produced by a
+    normalization-inconsistent client, the supplied hash may not match
+    on the first try. The server currently accepts a single hash from
+    the caller — clients that want to verify text content should try
+    both raw and normalized hashing on their side and call this
+    endpoint twice if the first call returns content_matches=false.
+    """
     sig_ok = check_sig(req.receipt, req.signature)
     hash_ok = req.receipt.get("hash") == req.content_hash
     return {
         "authentic": sig_ok and hash_ok,
         "signature_valid": sig_ok,
         "content_matches": hash_ok,
+        "note": "For text receipts, try both raw and normalized hashing on the client if the first call returns content_matches=false.",
+    }
+
+
+# ===================================================================
+# TEXT NORMALIZATION + PROMPT VERIFICATION
+# Per CLAUDE.md "Content Hashing Rules" — browser text selections and
+# prompt text MUST be normalized identically on client and server so the
+# same logical input produces the same hash regardless of where it is
+# computed. Rules: collapse all whitespace runs to single spaces, trim,
+# encode UTF-8, SHA-256. Files are NOT normalized (they hash raw bytes).
+# ===================================================================
+
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_text(text: str) -> str:
+    """Apply the canonical text-normalization rules used for prompt and
+    browser-selection hashing. Returns a UTF-8-safe, whitespace-collapsed,
+    trimmed string suitable for SHA-256."""
+    if text is None:
+        return ""
+    return _WS_RE.sub(" ", text).strip()
+
+
+def hash_normalized(text: str) -> str:
+    """Normalize and SHA-256. Hex-encoded lowercase."""
+    import hashlib
+    return hashlib.sha256(normalize_text(text).encode("utf-8")).hexdigest()
+
+
+class PromptVerifyRequest(BaseModel):
+    receipt: dict                       # full receipt JSON (must include prompt_hash)
+    signature: str                      # server signature over receipt
+    prompt_text: Optional[str] = None   # the prompt text to verify; normalized then hashed
+    prompt_hash: Optional[str] = None   # OR a pre-computed hash (verifier already has it)
+
+
+@app.post("/v1/verify/prompt")
+def verify_prompt(req: PromptVerifyRequest):
+    """
+    Verify that a given prompt text (or pre-computed prompt hash) matches
+    the `prompt_hash` field inside a signed AIAuth receipt.
+
+    This is stateless: the server stores NO prompt text. The verifier
+    supplies either the prompt text (which the server normalizes + hashes
+    on the fly) OR a pre-computed prompt_hash (for verifiers that want to
+    keep the text local). In either case the server does not persist the
+    input.
+
+    Use case: a downstream reviewer has the original prompt and the
+    attested receipt. They call this endpoint to prove that the same
+    prompt produced the attested output — without ever revealing the
+    prompt content to AIAuth.
+
+    Errors:
+      400 INVALID_RECEIPT      — signature invalid (can't trust any field)
+      400 MISSING_PROMPT_HASH  — receipt has no prompt_hash field
+      400 INVALID_PROMPT_HASH  — supplied prompt_hash is not SHA-256 hex
+      400 INVALID_RECEIPT      — neither prompt_text nor prompt_hash provided
+    """
+    # Signature must verify first — otherwise the receipt can't be trusted
+    sig_ok = check_sig(req.receipt, req.signature)
+    if not sig_ok:
+        raise AIAuthError(
+            "INVALID_RECEIPT",
+            "Receipt signature is not valid — cannot verify fields inside it",
+            400,
+        )
+
+    receipt_prompt_hash = req.receipt.get("prompt_hash")
+    if not receipt_prompt_hash:
+        raise AIAuthError(
+            "MISSING_PROMPT_HASH",
+            "This receipt was attested without a prompt_hash; nothing to compare against",
+            400,
+            details={"receipt_id": req.receipt.get("id")},
+        )
+
+    # Compute the comparison hash from whichever input the caller provided
+    if req.prompt_hash is not None:
+        if not _SHA256_RE.match(req.prompt_hash):
+            raise AIAuthError(
+                "INVALID_PROMPT_HASH",
+                "Supplied prompt_hash must be a 64-character SHA-256 hex string",
+                400,
+            )
+        computed = req.prompt_hash.lower()
+    elif req.prompt_text is not None:
+        computed = hash_normalized(req.prompt_text)
+    else:
+        raise AIAuthError(
+            "INVALID_RECEIPT",
+            "Must supply either prompt_text or prompt_hash for comparison",
+            400,
+        )
+
+    matches = computed == receipt_prompt_hash.lower()
+
+    return {
+        "matches": matches,
+        "receipt_id": req.receipt.get("id"),
+        "signature_valid": sig_ok,
+        "receipt_prompt_hash": receipt_prompt_hash,
+        "note": "Prompt text was not stored. This verification is stateless.",
     }
 
 
@@ -613,8 +2615,25 @@ def lookup_by_code(code: str):
 # ===================================================================
 
 @app.get("/v1/public-key")
+def public_key(format: Optional[str] = Query(default=None, description="'legacy' returns v0.4.0 single-key shape; default is v0.5.0 manifest")):
+    """Public key distribution.
+
+    v0.5.0 default: returns the full key manifest with all known keys,
+    their validity windows, and the current signing key.
+    ?format=legacy: returns the v0.4.0 single-key JSON for
+    backward compatibility with old verifiers.
+    """
+    if format == "legacy":
+        return {"algorithm": "Ed25519", "public_key_pem": PUB_PEM, "version": VERSION}
+    return build_public_key_manifest()
+
+
 @app.get("/.well-known/aiauth-public-key")
-def public_key():
+def well_known_public_key():
+    """Legacy well-known path. Returns the CURRENT public key as a
+    single-key JSON for maximum compatibility with generic verifiers
+    that don't understand the manifest shape. Use /v1/public-key for
+    the full manifest."""
     return {"algorithm": "Ed25519", "public_key_pem": PUB_PEM, "version": VERSION}
 
 
@@ -758,6 +2777,47 @@ def verification_page():
     if verify_path.exists():
         return HTMLResponse(verify_path.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>AIAuth</h1><p>Verification page not found. Place verify.html alongside server.py.</p>")
+
+
+@app.get("/demo", response_class=HTMLResponse)
+def demo_dashboard():
+    """Interactive commercial demo using synthetic data. Prospects can
+    add ?company=... to personalize. The template lives at
+    templates/commercial/executive-summary.html and uses
+    synthetic-data.js for fake but realistic data."""
+    tpl = Path(__file__).parent / "templates" / "commercial" / "executive-summary.html"
+    if tpl.exists():
+        return HTMLResponse(tpl.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>AIAuth Demo</h1><p>Demo template not found.</p>", status_code=404)
+
+
+@app.get("/static/synthetic-data.js")
+def static_synthetic_data_js():
+    """Served alongside /demo so the template's <script src="synthetic-data.js"></script>
+    resolves (the template references it relative to its own path)."""
+    p = Path(__file__).parent / "templates" / "commercial" / "synthetic-data.js"
+    if p.exists():
+        return FileResponse(str(p), media_type="application/javascript")
+    raise AIAuthError("NOT_FOUND", "synthetic-data.js not deployed", 404)
+
+
+@app.get("/synthetic-data.js")
+def synthetic_data_js_at_root():
+    """Alias so the template's relative <script src="synthetic-data.js"> works
+    when served via the HTMLResponse path (the request comes back to the
+    server root, not to templates/commercial/)."""
+    return static_synthetic_data_js()
+
+
+@app.get("/v1/admin/dashboard", response_class=HTMLResponse)
+def admin_dashboard_html():
+    """Enterprise compliance dashboard entry point. Renders the
+    executive-summary template. Future versions will swap in a richer
+    SPA; the data contract remains stable so the template works today."""
+    tpl = Path(__file__).parent / "templates" / "commercial" / "executive-summary.html"
+    if tpl.exists():
+        return HTMLResponse(tpl.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>Dashboard</h1><p>Template not deployed.</p>", status_code=404)
 
 def _page_shell(title: str, body_html: str, active: str = "") -> str:
     """Shared page chrome matching index.html."""

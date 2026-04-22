@@ -2460,6 +2460,241 @@ Synthetic data generator must output all v0.5.0 fields including the new three. 
 
 -----
 
+## Operations & Deployment
+
+This section consolidates the operational procedures previously tracked in CLAUDE_1.md. It is the authoritative deployment reference.
+
+### Environment Variables
+
+| Variable | Where | Purpose | Required |
+|----------|-------|---------|----------|
+| `AIAUTH_MODE` | Server | `public` or `enterprise` | No (defaults to `public`) |
+| `AIAUTH_MASTER_KEY` | Server `.env` | Admin key for license generation | Yes |
+| `AIAUTH_KEY_DIR` | Server | Directory for signing keys | No (defaults to `/opt/aiauth/keys` in v0.5.0, `.` prior) |
+| `AIAUTH_DB_PATH` | Server | Enterprise database path | No (defaults to `aiauth.db`) |
+| `AIAUTH_REGISTRY_PATH` | Server | Hash registry database path | No (defaults to `aiauth_registry.db`) |
+| `AIAUTH_LICENSE_KEY` | Customer server | Enterprise license key | Only for enterprise mode |
+| `AIAUTH_DEDUP_WINDOW` | Server | Seconds to dedup identical content_hash | No (defaults to `300`) |
+| `AIAUTH_REGISTRY_PRUNE` | Server | Enable 180-day registry pruning | No (defaults to `false`) |
+| `SERVER_SECRET` | Server `.env` | HMAC secret for magic-link / session tokens | Yes (v0.5.0+) |
+| `CLIENT_SECRET` | Server `.env` | HMAC secret for client-integrity validation | Yes (v0.5.0+) |
+
+### Deployment Target
+
+Production host: DigitalOcean droplet `167.172.250.174` (Ubuntu 24.04, 1 vCPU, 1 GB RAM). Application root: `/opt/aiauth/`. Service managed by `systemd` as unit `aiauth`. Reverse proxy via `nginx` with Let's Encrypt TLS.
+
+### Troubleshooting Checklist
+
+Run these from an SSH session on the server to diagnose state:
+
+```bash
+# 1. File inventory
+ls -la /opt/aiauth/
+ls -la /opt/aiauth/keys/ 2>/dev/null || echo "No keys directory (pre-v0.5.0 layout)"
+ls -la /opt/aiauth/docs/ 2>/dev/null
+
+# 2. Version and schema check
+head -20 /opt/aiauth/server.py
+grep "VERSION\|schema_version" /opt/aiauth/server.py | head -5
+grep "prompt_hash\|ai_markers\|concurrent_ai_apps" /opt/aiauth/server.py | head -5
+grep "hash_registry" /opt/aiauth/server.py | head -3
+grep "key_manifest\|key_id" /opt/aiauth/server.py | head -3
+grep "rate.limit\|throttle\|DEDUP_WINDOW" /opt/aiauth/server.py | head -3
+
+# 3. Service status
+systemctl status aiauth
+ps aux | grep uvicorn
+
+# 4. Local health check
+curl -s http://localhost:8100/health
+curl -s http://localhost:8100/v1/public-key | head -c 200
+
+# 5. nginx and SSL
+nginx -t
+systemctl status nginx
+cat /etc/nginx/sites-enabled/aiauth 2>/dev/null || echo "No nginx config"
+certbot certificates 2>/dev/null
+
+# 6. Firewall (check BOTH UFW on the host AND the DigitalOcean cloud firewall via dashboard)
+ufw status
+
+# 7. DNS resolution
+dig aiauth.app +short  # expect 167.172.250.174
+```
+
+### Deploying an Update (Standard Flow)
+
+Every update to `server.py`, HTML pages, docs, or the Chrome extension follows this pattern. Run commands **from Windows PowerShell** for scp (the file paths are Windows), and **from the SSH session** for everything else.
+
+```powershell
+# From Windows PowerShell — upload changed files
+scp C:\Users\ChaseFinch\Downloads\aiauth\server.py root@167.172.250.174:/opt/aiauth/server.py
+scp C:\Users\ChaseFinch\Downloads\aiauth\verify.html root@167.172.250.174:/opt/aiauth/verify.html
+scp C:\Users\ChaseFinch\Downloads\aiauth\index.html root@167.172.250.174:/opt/aiauth/index.html
+# Repeat for any other files changed
+```
+
+```bash
+# From SSH — reload and verify
+systemctl restart aiauth
+systemctl status aiauth
+curl -s http://localhost:8100/health
+journalctl -u aiauth -n 50 --no-pager    # check for errors in the last 50 log lines
+```
+
+If the health check fails, run the Troubleshooting Checklist above and inspect `journalctl -u aiauth -n 200 --no-pager` for the traceback.
+
+### nginx Reverse Proxy Configuration
+
+```nginx
+# /etc/nginx/sites-available/aiauth
+server {
+    listen 80;
+    server_name aiauth.app www.aiauth.app api.aiauth.app;
+
+    location / {
+        proxy_pass http://127.0.0.1:8100;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+After editing:
+```bash
+ln -sf /etc/nginx/sites-available/aiauth /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+```
+
+### systemd Service Definition
+
+```ini
+# /etc/systemd/system/aiauth.service
+[Unit]
+Description=AIAuth Signing Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/aiauth
+EnvironmentFile=/opt/aiauth/.env
+Environment=AIAUTH_MODE=public
+Environment=AIAUTH_KEY_DIR=/opt/aiauth/keys
+ExecStart=/opt/aiauth/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8100 --workers 2
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Apply:
+```bash
+systemctl daemon-reload
+systemctl enable aiauth
+systemctl restart aiauth
+systemctl status aiauth
+```
+
+### SSL Certificate (Let's Encrypt)
+
+Initial issuance:
+```bash
+certbot --nginx -d aiauth.app -d www.aiauth.app -d api.aiauth.app
+```
+
+Renewal is automatic via the `certbot.timer` systemd unit. Verify with `certbot renew --dry-run`.
+
+### Key Backup (CRITICAL)
+
+The signing keys at `/opt/aiauth/keys/` are the root of trust. If lost, every receipt signed with that key becomes unverifiable forever. There is no recovery path.
+
+```bash
+# On the server
+tar czf /root/aiauth_keys_backup_$(date +%Y%m%d).tar.gz -C /opt/aiauth keys/
+```
+
+```powershell
+# From Windows PowerShell — pull the backup off the server
+scp root@167.172.250.174:/root/aiauth_keys_backup_*.tar.gz C:\aiauth-backups\
+```
+
+Store the backup on an encrypted USB drive and in a separate offline location. Rotate keys annually per the Key Management section; retain all historical private keys so that historical receipts remain verifiable.
+
+### License Key Generation (Enterprise)
+
+```bash
+curl -X POST https://aiauth.app/v1/admin/license/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "company": "Acme Corp",
+    "tier": "enterprise",
+    "expires": "2027-12-31",
+    "master_key": "<value from /opt/aiauth/.env>"
+  }'
+```
+
+Returns a license key string. Record it in the enterprise accounts database and deliver to the customer alongside their activation instructions.
+
+### Chrome Extension Deployment (Developer Flow)
+
+```
+1. Open chrome://extensions/
+2. Enable "Developer mode" (toggle, top right)
+3. Click "Load unpacked"
+4. Select C:\Users\ChaseFinch\Downloads\aiauth\chrome-extension
+5. AIAuth icon appears in toolbar
+6. Click it → enter work email + server URL → verify
+7. Reload after any code change: click the circular arrow on the extension card
+```
+
+For production distribution: zip the `chrome-extension/` folder, upload at https://chrome.google.com/webstore/devconsole. Expect 1–3 business days review.
+
+### Desktop Agent Build (Windows)
+
+```powershell
+cd C:\aiauth
+.\venv\Scripts\Activate
+pip install -r requirements.txt pyinstaller
+pyinstaller --onefile --noconsole --name AIAuth aiauth.py
+# Output: dist\AIAuth.exe
+```
+
+Package as MSIX for Microsoft Store submission using the MSIX Packaging Tool, then submit via Partner Center.
+
+### Infrastructure Costs (Current)
+
+| Item | Cost |
+|------|------|
+| DigitalOcean droplet | $6 / month |
+| Domain (aiauth.app) | ~$12 / year |
+| Chrome Web Store developer account | $5 one-time |
+| Microsoft Partner Center developer account | $19 one-time |
+| Let's Encrypt SSL | Free |
+| Email transactional (magic links, v0.5.0+) | ~$0–10 / month (e.g., Resend, Postmark) |
+| **Total launch cost** | ~$42 one-time + $6–16 / month |
+
+### Common Issues
+
+**"Could not resolve hostname C:" error during scp** — you're running a Windows command from the Linux SSH session. scp commands with `C:\...` paths must run from Windows PowerShell on your laptop, not on the server.
+
+**Browser can't reach the server** — the DigitalOcean cloud firewall is separate from UFW on the host. Check Networking → Firewalls in the DigitalOcean dashboard. It must allow inbound TCP 80 and 443.
+
+**`Field name register shadows an attribute` Pydantic warning** — harmless in v0.4.0. Ignore. Resolved in v0.5.0 when the field is renamed as part of schema cleanup.
+
+**certbot fails on first issuance** — DNS hasn't propagated yet. Wait 10–30 minutes after adding A records. Confirm with `dig aiauth.app +short`.
+
+**nginx returns 502 Bad Gateway** — the uvicorn process isn't running. `systemctl start aiauth && systemctl status aiauth`. If it crashes on start, check `journalctl -u aiauth -n 200 --no-pager`.
+
+**Signing key lost** — all historical receipts signed with that key become permanently unverifiable. There is no recovery. This is why key backup is non-negotiable. See Key Management section.
+
+**Magic link never arrives (v0.5.0+)** — check the transactional email provider's dashboard for delivery logs. Common causes: missing SPF/DKIM records for the sending domain, the recipient's spam filter, or a typo in the email address. The server does NOT reveal whether an email is registered (enumeration protection), so a silent failure is expected behavior from the user's perspective.
+
+-----
+
 ## MANDATORY: Pre-Work Audit Protocol
 
 **Before writing any code, creating any file, or modifying any existing file, Claude MUST complete the following audit. No exceptions.**

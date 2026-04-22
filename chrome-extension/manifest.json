@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AIAuth — Notarize Your AI Work",
   "short_name": "AI Attest",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Cryptographic receipts for AI-generated work. One keystroke proves what AI produced and that you reviewed it.",
   "permissions": [
     "activeTab",
