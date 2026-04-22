@@ -3353,6 +3353,88 @@ def demo_dashboard():
     return HTMLResponse("<h1>AIAuth Demo</h1><p>Demo template not found.</p>", status_code=404)
 
 
+@app.get("/admin/license/issue", response_class=HTMLResponse)
+def admin_license_issuer_page(master_key: Optional[str] = Query(default=None)):
+    """License issuer admin page (Phase C.2).
+
+    Gated behind AIAUTH_MASTER_KEY. This is the sales-side tool used
+    to issue signed license keys to new enterprise customers. Not
+    linked from any public nav; reached by explicit URL with master_key
+    query param.
+    """
+    if not MASTER_KEY or master_key != MASTER_KEY:
+        return HTMLResponse(_site_shell(
+            "Not Found", "<h1 class='page-title'>Not Found</h1>"
+            "<p class='lead'>This page requires administrative access.</p>",
+            active=""), status_code=404)
+
+    body = """<span class="eyebrow">Admin: License Issuer</span>
+<h1 class="page-title">Issue Enterprise License</h1>
+<p class="lead">Generate a signed license key for a new customer. Key is validated offline against this server's signing key; no phone-home required.</p>
+
+<div class="card">
+  <form id="issueForm" style="display:grid;gap:12px;">
+    <label>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Company name</div>
+      <input name="company" required style="width:100%;padding:10px;border:1px solid #e5e7eb;border-radius:8px;font:inherit;" placeholder="Acme Corp" />
+    </label>
+    <label>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Tier</div>
+      <select name="tier" style="width:100%;padding:10px;border:1px solid #e5e7eb;border-radius:8px;font:inherit;">
+        <option value="enterprise">enterprise (self-hosted)</option>
+        <option value="compliance">compliance (self-hosted + policy engine + DSAR)</option>
+      </select>
+    </label>
+    <label>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Max users (0 = unlimited)</div>
+      <input type="number" name="max_users" value="0" min="0" style="width:100%;padding:10px;border:1px solid #e5e7eb;border-radius:8px;font:inherit;" />
+    </label>
+    <label>
+      <div style="font-size:12px;color:#64748b;margin-bottom:4px;">Expires (ISO date, blank = never)</div>
+      <input type="date" name="expires" style="width:100%;padding:10px;border:1px solid #e5e7eb;border-radius:8px;font:inherit;" />
+    </label>
+    <button type="submit" style="padding:12px;background:var(--accent);color:white;border:0;border-radius:8px;font:inherit;font-weight:600;cursor:pointer;">Generate License Key</button>
+  </form>
+  <pre id="result" style="display:none;margin-top:20px;padding:16px;background:#0b1220;color:#e6edf6;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;line-height:1.5;"></pre>
+  <div id="copyRow" style="display:none;margin-top:10px;">
+    <button id="copyBtn" class="copy-btn" type="button">Copy License Key</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  const urlKey = new URLSearchParams(location.search).get('master_key');
+  document.getElementById('issueForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const payload = {
+      company: fd.get('company'),
+      tier: fd.get('tier'),
+      max_users: Number(fd.get('max_users') || 0),
+      expires: fd.get('expires') ? fd.get('expires') + 'T23:59:59+00:00' : '',
+      master_key: urlKey,
+    };
+    const res = await fetch('/v1/admin/license/generate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    const pre = document.getElementById('result');
+    pre.style.display = 'block';
+    if (res.ok) {
+      pre.textContent = data.license_key;
+      document.getElementById('copyRow').style.display = 'block';
+      document.getElementById('copyBtn').onclick = () => navigator.clipboard.writeText(data.license_key);
+    } else {
+      pre.textContent = 'Error: ' + JSON.stringify(data, null, 2);
+    }
+  });
+})();
+</script>
+"""
+    return HTMLResponse(_site_shell("Issue License", body, active=""))
+
+
 @app.get("/enterprise-guide", response_class=HTMLResponse)
 def enterprise_guide():
     """Two-part enterprise documentation: Admin Guide | User Guide (Phase B.11).

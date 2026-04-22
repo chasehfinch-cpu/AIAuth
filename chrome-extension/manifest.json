@@ -1,9 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "AIAuth — Notarize Your AI Work",
-  "short_name": "AI Attest",
-  "version": "1.1.0",
-  "description": "Cryptographic receipts for AI-generated work. One keystroke proves what AI produced and that you reviewed it.",
+  "name": "AIAuth — Chain of Custody for AI Work",
+  "short_name": "AIAuth",
+  "version": "1.2.0",
+  "description": "Tamper-proof chain-of-custody receipts for AI-generated work. One key press. Content never leaves your device.",
+  "storage": {
+    "managed_schema": "managed_schema.json"
+  },
   "permissions": [
     "activeTab",
     "storage",
