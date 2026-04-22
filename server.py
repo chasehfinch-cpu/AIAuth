@@ -586,6 +586,110 @@ def verify_content(req: ContentVerifyRequest):
 
 
 # ===================================================================
+# TEXT NORMALIZATION + PROMPT VERIFICATION
+# Per CLAUDE.md "Content Hashing Rules" — browser text selections and
+# prompt text MUST be normalized identically on client and server so the
+# same logical input produces the same hash regardless of where it is
+# computed. Rules: collapse all whitespace runs to single spaces, trim,
+# encode UTF-8, SHA-256. Files are NOT normalized (they hash raw bytes).
+# ===================================================================
+
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_text(text: str) -> str:
+    """Apply the canonical text-normalization rules used for prompt and
+    browser-selection hashing. Returns a UTF-8-safe, whitespace-collapsed,
+    trimmed string suitable for SHA-256."""
+    if text is None:
+        return ""
+    return _WS_RE.sub(" ", text).strip()
+
+
+def hash_normalized(text: str) -> str:
+    """Normalize and SHA-256. Hex-encoded lowercase."""
+    import hashlib
+    return hashlib.sha256(normalize_text(text).encode("utf-8")).hexdigest()
+
+
+class PromptVerifyRequest(BaseModel):
+    receipt: dict                       # full receipt JSON (must include prompt_hash)
+    signature: str                      # server signature over receipt
+    prompt_text: Optional[str] = None   # the prompt text to verify; normalized then hashed
+    prompt_hash: Optional[str] = None   # OR a pre-computed hash (verifier already has it)
+
+
+@app.post("/v1/verify/prompt")
+def verify_prompt(req: PromptVerifyRequest):
+    """
+    Verify that a given prompt text (or pre-computed prompt hash) matches
+    the `prompt_hash` field inside a signed AIAuth receipt.
+
+    This is stateless: the server stores NO prompt text. The verifier
+    supplies either the prompt text (which the server normalizes + hashes
+    on the fly) OR a pre-computed prompt_hash (for verifiers that want to
+    keep the text local). In either case the server does not persist the
+    input.
+
+    Use case: a downstream reviewer has the original prompt and the
+    attested receipt. They call this endpoint to prove that the same
+    prompt produced the attested output — without ever revealing the
+    prompt content to AIAuth.
+
+    Errors:
+      400 INVALID_RECEIPT      — signature invalid (can't trust any field)
+      400 MISSING_PROMPT_HASH  — receipt has no prompt_hash field
+      400 INVALID_PROMPT_HASH  — supplied prompt_hash is not SHA-256 hex
+      400 INVALID_RECEIPT      — neither prompt_text nor prompt_hash provided
+    """
+    # Signature must verify first — otherwise the receipt can't be trusted
+    sig_ok = check_sig(req.receipt, req.signature)
+    if not sig_ok:
+        raise AIAuthError(
+            "INVALID_RECEIPT",
+            "Receipt signature is not valid — cannot verify fields inside it",
+            400,
+        )
+
+    receipt_prompt_hash = req.receipt.get("prompt_hash")
+    if not receipt_prompt_hash:
+        raise AIAuthError(
+            "MISSING_PROMPT_HASH",
+            "This receipt was attested without a prompt_hash; nothing to compare against",
+            400,
+            details={"receipt_id": req.receipt.get("id")},
+        )
+
+    # Compute the comparison hash from whichever input the caller provided
+    if req.prompt_hash is not None:
+        if not _SHA256_RE.match(req.prompt_hash):
+            raise AIAuthError(
+                "INVALID_PROMPT_HASH",
+                "Supplied prompt_hash must be a 64-character SHA-256 hex string",
+                400,
+            )
+        computed = req.prompt_hash.lower()
+    elif req.prompt_text is not None:
+        computed = hash_normalized(req.prompt_text)
+    else:
+        raise AIAuthError(
+            "INVALID_RECEIPT",
+            "Must supply either prompt_text or prompt_hash for comparison",
+            400,
+        )
+
+    matches = computed == receipt_prompt_hash.lower()
+
+    return {
+        "matches": matches,
+        "receipt_id": req.receipt.get("id"),
+        "signature_valid": sig_ok,
+        "receipt_prompt_hash": receipt_prompt_hash,
+        "note": "Prompt text was not stored. This verification is stateless.",
+    }
+
+
+# ===================================================================
 # 3. CHAIN VERIFY — validate an entire provenance chain (stateless)
 # ===================================================================
 
