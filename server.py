@@ -671,9 +671,69 @@ def init_db():
         reason        TEXT
     )""")
 
+    # ---------------- v0.5.0 enterprise attestation store ----------------
+    # Full receipt metadata is stored here when enterprise clients POST
+    # to /v1/enterprise/ingest. Created unconditionally so switching
+    # modes doesn't require a migration. Populated only in enterprise
+    # flows; free-tier /v1/sign NEVER writes here (see Dual-Path Arch).
+    conn.execute("""CREATE TABLE IF NOT EXISTS enterprise_attestations (
+        id              TEXT PRIMARY KEY,
+        ts              TEXT NOT NULL,
+        hash            TEXT NOT NULL,
+        prompt_hash     TEXT,
+        uid             TEXT NOT NULL,
+        uid_pseudonym   TEXT,
+        src             TEXT,
+        model           TEXT,
+        provider        TEXT,
+        source_domain   TEXT,
+        source_app      TEXT,
+        concurrent_ai_apps TEXT,
+        ai_markers      TEXT,
+        doc_id          TEXT,
+        parent          TEXT,
+        file_type       TEXT,
+        len             INTEGER,
+        tta             INTEGER,
+        sid             TEXT,
+        dest            TEXT,
+        dest_ext        INTEGER,
+        classification  TEXT,
+        review_status   TEXT,
+        review_by       TEXT,
+        review_at       TEXT,
+        review_note     TEXT,
+        tags            TEXT,
+        schema_version  TEXT NOT NULL,
+        org_id          TEXT NOT NULL REFERENCES organizations(org_id),
+        client_integrity TEXT DEFAULT 'none',
+        ingested_at     TEXT NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_uid ON enterprise_attestations(uid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_ts ON enterprise_attestations(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_org ON enterprise_attestations(org_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_model ON enterprise_attestations(model)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_doc_id ON enterprise_attestations(doc_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_classification ON enterprise_attestations(classification)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_pseudonym ON enterprise_attestations(uid_pseudonym)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_prompt_hash ON enterprise_attestations(prompt_hash)")
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS policy_violations (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        attestation_id  TEXT NOT NULL REFERENCES enterprise_attestations(id),
+        policy_id       TEXT NOT NULL,
+        severity        TEXT NOT NULL,
+        details         TEXT,
+        detected_at     TEXT NOT NULL,
+        resolved_at     TEXT,
+        resolved_by     TEXT,
+        resolution_note TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pv_severity ON policy_violations(severity)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pv_detected ON policy_violations(detected_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pv_attest ON policy_violations(attestation_id)")
+
     # ---------------- Legacy v0.4.0 attestations (enterprise only) ----------------
-    # Retained for backward compatibility. Piece 10 will introduce the
-    # new enterprise_attestations table with the full v0.5.0 schema.
     if MODE == "enterprise":
         conn.execute("""CREATE TABLE IF NOT EXISTS attestations (
             id TEXT PRIMARY KEY, created_at TEXT, output_hash TEXT,
@@ -1379,9 +1439,488 @@ def account_logout(authorization: Optional[str] = Header(default=None)):
             )
             conn.commit()
         except sqlite3.IntegrityError:
-            pass  # already revoked
+            pass
         conn.close()
     return {"logged_out": True}
+
+
+# ===================================================================
+# ENTERPRISE INGEST + POLICY ENGINE + ADMIN (v0.5.0+)
+# See CLAUDE.md "Enterprise Offboarding" + "Policy Engine" + "DSAR".
+# ===================================================================
+
+# ------------- License + domain helpers -------------
+
+def _require_license_header(request: Request) -> dict:
+    """Resolve X-AIAuth-License -> org row. Raises 401 on failure."""
+    lic = request.headers.get("x-aiauth-license", "").strip()
+    if not lic:
+        raise AIAuthError("LICENSE_MISSING", "X-AIAuth-License header required", 401)
+    data = validate_license(lic)
+    if data is None:
+        raise AIAuthError("LICENSE_INVALID", "License key invalid or expired", 401)
+    conn = get_db()
+    org = conn.execute(
+        "SELECT * FROM organizations WHERE license_key = ? AND active = 1", (lic,)
+    ).fetchone()
+    conn.close()
+    if org is None:
+        raise AIAuthError(
+            "LICENSE_NOT_ACTIVATED",
+            "License key is valid but not attached to an active organization. "
+            "An admin must claim a domain first via /v1/admin/org/claim.",
+            401,
+        )
+    return {"license_data": data, "org": dict(org)}
+
+
+def _require_admin_session(authorization: Optional[str], org_id: Optional[str] = None) -> dict:
+    """Return session payload if the caller is an admin of the given org
+    (or any org, when org_id is None). Raises 403 otherwise."""
+    session = _require_session(authorization)
+    conn = get_db()
+    if org_id:
+        row = conn.execute(
+            "SELECT * FROM org_members WHERE account_id = ? AND org_id = ? AND role = 'admin' AND left_at IS NULL",
+            (session["account_id"], org_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM org_members WHERE account_id = ? AND role = 'admin' AND left_at IS NULL",
+            (session["account_id"],),
+        ).fetchone()
+    conn.close()
+    if row is None:
+        raise AIAuthError("NOT_ADMIN", "Admin role required on the target organization", 403)
+    session["org_membership"] = dict(row)
+    return session
+
+
+def _org_domains(org: dict) -> List[str]:
+    try:
+        return json.loads(org.get("domains") or "[]")
+    except Exception:
+        return []
+
+
+def _uid_in_org_domain(uid: str, org: dict) -> bool:
+    if "@" not in (uid or ""):
+        return False
+    domain = uid.split("@", 1)[1].lower()
+    return domain in [d.lower() for d in _org_domains(org)]
+
+
+# ------------- Policy engine -------------
+
+DEFAULT_POLICIES = [
+    {"id": "dual-review-financial",
+     "severity": "high",
+     "match": lambda r, ctx: r.get("classification") == "financial"
+             and ctx.get("chain_unique_attesters", 1) < 2},
+    {"id": "no-rubber-stamping",
+     "severity": "medium",
+     "match": lambda r, ctx: (r.get("tta") or 999) < 10 and (r.get("len") or 0) > 500},
+    {"id": "external-must-attest",
+     "severity": "critical",
+     "match": lambda r, ctx: r.get("dest_ext") is True and not (r.get("review_status") or r.get("review", {}).get("status"))},
+    {"id": "unverified-financial",
+     "severity": "medium",
+     "match": lambda r, ctx: r.get("client_integrity") == "none" and r.get("classification") == "financial"},
+    {"id": "shadow-ai-detected",
+     "severity": "low",
+     "match": lambda r, ctx: _shadow_ai_hit(r)},
+    {"id": "ungoverned-ai-content",
+     "severity": "medium",
+     "match": lambda r, ctx: (r.get("ai_markers") or {}).get("verified") is True and not r.get("parent")},
+]
+
+
+def _shadow_ai_hit(r: dict) -> bool:
+    """Flag when concurrent_ai_apps includes a tool that is NOT the
+    source_app / model of the attestation — i.e., an AI app was open
+    but not the one that produced the attested content."""
+    apps = r.get("concurrent_ai_apps") or []
+    if not apps:
+        return False
+    src = (r.get("source_app") or r.get("source_domain") or "").lower()
+    model = (r.get("model") or "").lower()
+    for app in apps:
+        nm = str(app).lower()
+        if nm not in src and (not model or model not in nm):
+            return True
+    return False
+
+
+def evaluate_policies(receipt: dict, ctx: Optional[dict] = None) -> List[dict]:
+    """Evaluate DEFAULT_POLICIES against a receipt. Returns a list of
+    {policy_id, severity, details} for each rule that matched. ctx
+    carries cross-attestation signals (e.g. chain_unique_attesters)."""
+    ctx = ctx or {}
+    violations = []
+    for pol in DEFAULT_POLICIES:
+        try:
+            if pol["match"](receipt, ctx):
+                violations.append({
+                    "policy_id": pol["id"],
+                    "severity": pol["severity"],
+                    "details": {
+                        "classification": receipt.get("classification"),
+                        "tta": receipt.get("tta"),
+                        "len": receipt.get("len"),
+                        "client_integrity": receipt.get("client_integrity"),
+                        "dest_ext": receipt.get("dest_ext"),
+                        "model": receipt.get("model"),
+                    },
+                })
+        except Exception:
+            continue
+    return violations
+
+
+# ------------- Enterprise ingest -------------
+
+class EnterpriseIngestRequest(BaseModel):
+    receipt: dict
+    signature: str
+
+    model_config = {"extra": "ignore"}
+
+
+@app.post("/v1/enterprise/ingest")
+def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
+    """Receive a signed attestation from an enterprise client and store
+    it in enterprise_attestations. Must include a valid license key
+    (X-AIAuth-License header). The receipt's uid must end in one of
+    the org's claimed domains.
+    """
+    ctx = _require_license_header(request)
+    org = ctx["org"]
+
+    receipt = body.receipt or {}
+    # Verify the signature — anything unsigned is rejected outright.
+    if not check_sig(receipt, body.signature):
+        raise AIAuthError("INVALID_RECEIPT", "Receipt signature invalid", 400)
+
+    uid = receipt.get("uid") or ""
+    if not _uid_in_org_domain(uid, org):
+        raise AIAuthError(
+            "DOMAIN_MISMATCH",
+            "Receipt uid domain is not in this org's claimed domains",
+            403,
+            details={"uid": uid, "org_domains": _org_domains(org)},
+        )
+
+    # Block offboarded users. Two signals, either one suffices:
+    #   (a) org_members row with left_at set (known linked member who left)
+    #   (b) consent_log row with action dsar_pseudonymize or dsar_delete
+    #       for this (email, org) — covers users who were pseudonymized
+    #       without ever having linked a personal account.
+    conn = get_db()
+    left_member = conn.execute(
+        "SELECT om.left_at FROM org_members om "
+        "JOIN account_emails ae ON ae.account_id = om.account_id "
+        "WHERE ae.email = ? AND om.org_id = ? AND om.left_at IS NOT NULL",
+        (uid, org["org_id"]),
+    ).fetchone()
+    dsar_out = conn.execute(
+        "SELECT id FROM consent_log "
+        "WHERE org_id = ? AND action IN ('dsar_pseudonymize','dsar_delete') "
+        "AND details LIKE ? LIMIT 1",
+        (org["org_id"], f'%"email": "{uid}"%'),
+    ).fetchone()
+    if left_member is not None or dsar_out is not None:
+        conn.close()
+        raise AIAuthError("EMAIL_OFFBOARDED", "This uid has been offboarded from the organization", 403)
+
+    # Idempotent: if already ingested, return existing row
+    existing = conn.execute(
+        "SELECT id FROM enterprise_attestations WHERE id = ?",
+        (receipt.get("id"),),
+    ).fetchone()
+    if existing is not None:
+        conn.close()
+        return {"stored": True, "deduplicated": True, "attestation_id": receipt.get("id"), "violations": []}
+
+    review = receipt.get("review") or {}
+    row = (
+        receipt.get("id"),
+        receipt.get("ts"),
+        receipt.get("hash"),
+        receipt.get("prompt_hash"),
+        uid,
+        None,  # uid_pseudonym
+        receipt.get("src"),
+        receipt.get("model"),
+        receipt.get("provider"),
+        receipt.get("source_domain"),
+        receipt.get("source_app"),
+        json.dumps(receipt.get("concurrent_ai_apps")) if receipt.get("concurrent_ai_apps") is not None else None,
+        json.dumps(receipt.get("ai_markers")) if receipt.get("ai_markers") is not None else None,
+        receipt.get("doc_id"),
+        receipt.get("parent"),
+        receipt.get("file_type"),
+        receipt.get("len"),
+        receipt.get("tta"),
+        receipt.get("sid"),
+        receipt.get("dest"),
+        int(receipt["dest_ext"]) if isinstance(receipt.get("dest_ext"), bool) else None,
+        receipt.get("classification"),
+        review.get("status"),
+        review.get("by"),
+        review.get("at"),
+        review.get("note"),
+        json.dumps(receipt.get("tags")) if receipt.get("tags") is not None else None,
+        receipt.get("v", VERSION),
+        org["org_id"],
+        receipt.get("client_integrity", "none"),
+        datetime.now(timezone.utc).isoformat(),
+    )
+    conn.execute(
+        "INSERT INTO enterprise_attestations ("
+        "id, ts, hash, prompt_hash, uid, uid_pseudonym, src, model, provider, "
+        "source_domain, source_app, concurrent_ai_apps, ai_markers, doc_id, parent, "
+        "file_type, len, tta, sid, dest, dest_ext, classification, "
+        "review_status, review_by, review_at, review_note, tags, "
+        "schema_version, org_id, client_integrity, ingested_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        row,
+    )
+
+    # Policy evaluation
+    violations = evaluate_policies(receipt)
+    now = datetime.now(timezone.utc).isoformat()
+    for v in violations:
+        conn.execute(
+            "INSERT INTO policy_violations (attestation_id, policy_id, severity, details, detected_at) "
+            "VALUES (?,?,?,?,?)",
+            (receipt.get("id"), v["policy_id"], v["severity"], json.dumps(v["details"]), now),
+        )
+    conn.commit()
+    conn.close()
+    return {
+        "stored": True,
+        "attestation_id": receipt.get("id"),
+        "org_id": org["org_id"],
+        "violations": violations,
+    }
+
+
+# ------------- Admin: org claim -------------
+
+class OrgClaimRequest(BaseModel):
+    name: str
+    domains: List[str]
+    license_key: str
+    license_tier: str = "hosted"
+
+
+@app.post("/v1/admin/org/claim")
+def admin_org_claim(body: OrgClaimRequest, authorization: Optional[str] = Header(default=None)):
+    """Claim one or more email domains for an organization and attach a
+    license key. The authenticated user becomes the first admin member.
+
+    Domains must match emails the calling account has VERIFIED — this
+    proves the caller owns (or at least controls accounts on) the
+    domain. Simplified proof — production deployments should require
+    DNS TXT verification, which we can add via a follow-up piece.
+    """
+    session = _require_session(authorization)
+    # Verify license first
+    lic = validate_license(body.license_key)
+    if lic is None:
+        raise AIAuthError("LICENSE_INVALID", "License key is invalid or expired", 400)
+
+    domains = [d.strip().lower() for d in body.domains if d.strip()]
+    if not domains:
+        raise AIAuthError("INVALID_RECEIPT", "At least one domain is required", 400)
+
+    # Proof-of-control: the caller must have a verified email in each domain
+    conn = get_db()
+    verified = {row["email"].split("@", 1)[1].lower()
+                for row in conn.execute(
+                    "SELECT email FROM account_emails WHERE account_id = ? AND verified = 1",
+                    (session["account_id"],),
+                ).fetchall() if "@" in row["email"]}
+    missing = [d for d in domains if d not in verified]
+    if missing:
+        conn.close()
+        raise AIAuthError(
+            "DOMAIN_NOT_VERIFIED",
+            "You must have a verified email in each claimed domain",
+            403,
+            details={"missing_domains": missing},
+        )
+
+    org_id = "ORG_" + uuid.uuid4().hex[:12]
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO organizations (org_id, name, domains, license_key, license_tier, created_at, active) "
+        "VALUES (?,?,?,?,?,?,1)",
+        (org_id, body.name, json.dumps(domains), body.license_key, body.license_tier, now),
+    )
+    conn.execute(
+        "INSERT INTO org_members (account_id, org_id, role, joined_at) VALUES (?,?,?,?)",
+        (session["account_id"], org_id, "admin", now),
+    )
+    # Also mark each of the caller's verified emails matching a claimed
+    # domain as corporate emails under this org.
+    for domain in domains:
+        conn.execute(
+            "UPDATE account_emails SET email_type = 'corporate', org_id = ? "
+            "WHERE account_id = ? AND email LIKE ? AND email_type != 'corporate'",
+            (org_id, session["account_id"], f"%@{domain}"),
+        )
+    conn.commit()
+    conn.close()
+    return {"org_id": org_id, "name": body.name, "domains": domains, "tier": body.license_tier,
+            "note": "You are the first admin. Invite members via /v1/admin/org/invite (future)."}
+
+
+# ------------- Admin: member list + DSAR + pseudonymize -------------
+
+@app.get("/v1/admin/org/members")
+def admin_org_members(org_id: str = Query(...), authorization: Optional[str] = Header(default=None)):
+    """List members of an org (admin-authed). Shows link status:
+    which members have a personal email linked, which consented to
+    personal-history sharing, who has left."""
+    session = _require_admin_session(authorization, org_id)
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT om.*, a.primary_email, "
+        "       (SELECT COUNT(*) FROM account_emails ae "
+        "        WHERE ae.account_id = om.account_id AND ae.email_type = 'personal') AS has_personal "
+        "FROM org_members om JOIN accounts a ON om.account_id = a.account_id "
+        "WHERE om.org_id = ? ORDER BY om.joined_at DESC",
+        (org_id,),
+    ).fetchall()
+    conn.close()
+    return {"org_id": org_id, "members": [dict(r) for r in rows]}
+
+
+class DSARRequest(BaseModel):
+    email: str
+    action: str              # "export" | "pseudonymize" | "delete"
+    org_id: str
+
+
+@app.post("/v1/admin/dsar")
+def admin_dsar(body: DSARRequest, authorization: Optional[str] = Header(default=None)):
+    """Process a Data Subject Access Request. Export returns all data
+    tied to this email; pseudonymize replaces uid with a one-way hash
+    while preserving audit rows; delete nukes personal data entirely
+    (registry entries are NOT touched — they contain no PII).
+
+    Actions are logged to consent_log (immutable)."""
+    session = _require_admin_session(authorization, body.org_id)
+    email = (body.email or "").strip().lower()
+    if body.action not in ("export", "pseudonymize", "delete"):
+        raise AIAuthError("INVALID_RECEIPT", "action must be export/pseudonymize/delete", 400)
+
+    conn = get_db()
+    member = conn.execute(
+        "SELECT om.account_id FROM org_members om "
+        "JOIN account_emails ae ON ae.account_id = om.account_id "
+        "WHERE ae.email = ? AND om.org_id = ?",
+        (email, body.org_id),
+    ).fetchone()
+    account_id = member["account_id"] if member else None
+
+    now = datetime.now(timezone.utc).isoformat()
+    if body.action == "export":
+        attests = [dict(r) for r in conn.execute(
+            "SELECT * FROM enterprise_attestations WHERE uid = ? AND org_id = ?",
+            (email, body.org_id),
+        ).fetchall()]
+        emails = [dict(r) for r in conn.execute(
+            "SELECT * FROM account_emails WHERE email = ?", (email,)
+        ).fetchall()]
+        conn.execute(
+            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_export", now, json.dumps({"email": email})),
+        )
+        conn.commit()
+        conn.close()
+        return {"action": "export", "email": email, "attestations": attests, "emails": emails}
+
+    if body.action == "pseudonymize":
+        # One-way pseudonym: SHA-256(email + org_salt + "pseudonymize")
+        # org_salt = org_id (stable, org-specific)
+        pseud = hashlib.sha256(f"{email}{body.org_id}pseudonymize".encode()).hexdigest()[:24]
+        conn.execute(
+            "UPDATE enterprise_attestations "
+            "SET uid_pseudonym = ?, uid = '[pseudonymized]' "
+            "WHERE uid = ? AND org_id = ?",
+            (pseud, email, body.org_id),
+        )
+        # Mark user as left
+        if account_id:
+            conn.execute(
+                "UPDATE org_members SET left_at = ? WHERE account_id = ? AND org_id = ? AND left_at IS NULL",
+                (now, account_id, body.org_id),
+            )
+        conn.execute(
+            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_pseudonymize", now, json.dumps({"email": email, "pseudonym": pseud})),
+        )
+        conn.commit()
+        conn.close()
+        return {"action": "pseudonymize", "email": email, "pseudonym": pseud}
+
+    if body.action == "delete":
+        # Nuclear. Remove attestations entirely. Registry entries untouched (no PII).
+        deleted = conn.execute(
+            "DELETE FROM enterprise_attestations WHERE uid = ? AND org_id = ?",
+            (email, body.org_id),
+        ).rowcount
+        conn.execute(
+            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_delete", now, json.dumps({"email": email, "deleted_rows": deleted})),
+        )
+        conn.commit()
+        conn.close()
+        return {"action": "delete", "email": email, "deleted_rows": deleted,
+                "warning": "Registry entries preserved (contain no PII). Chain integrity may be affected."}
+
+
+class OffboardRequest(BaseModel):
+    email: str
+    org_id: str
+
+
+@app.post("/v1/admin/pseudonymize")
+def admin_offboard(body: OffboardRequest, authorization: Optional[str] = Header(default=None)):
+    """Offboarding convenience wrapper around DSAR pseudonymize. Most
+    common admin action when an employee leaves the company."""
+    dsar = DSARRequest(email=body.email, action="pseudonymize", org_id=body.org_id)
+    return admin_dsar(dsar, authorization=authorization)
+
+
+# ------------- Admin: policy violations feed -------------
+
+@app.get("/v1/violations")
+def violations_feed(
+    org_id: str = Query(...),
+    severity: Optional[str] = Query(default=None, description="Filter: critical|high|medium|low"),
+    limit: int = Query(default=100, le=500),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Recent policy violations for the org (admin-authed)."""
+    _require_admin_session(authorization, org_id)
+    conn = get_db()
+    where = "ea.org_id = ?"
+    params: list = [org_id]
+    if severity:
+        where += " AND pv.severity = ?"
+        params.append(severity)
+    rows = conn.execute(
+        f"SELECT pv.*, ea.uid, ea.ts AS attestation_ts "
+        f"FROM policy_violations pv "
+        f"JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
+        f"WHERE {where} ORDER BY pv.detected_at DESC LIMIT ?",
+        params + [limit],
+    ).fetchall()
+    conn.close()
+    return {"org_id": org_id, "count": len(rows), "violations": [dict(r) for r in rows]}
 
 
 # ===================================================================
