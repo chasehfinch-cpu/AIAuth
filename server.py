@@ -698,29 +698,41 @@ def init_registry():
         parent_hash   TEXT,
         registered_at TEXT NOT NULL
     )""")
-    # v0.5.0 migration: add doc_id column if missing (idempotent, safe to re-run)
+    # v0.5.0 migration: add doc_id column if missing (idempotent)
+    # v0.5.1 migration: add content_hash_canonical column (6th col)
     existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(hash_registry)").fetchall()}
     if "doc_id" not in existing_cols:
         conn.execute("ALTER TABLE hash_registry ADD COLUMN doc_id TEXT")
+    if "content_hash_canonical" not in existing_cols:
+        conn.execute("ALTER TABLE hash_registry ADD COLUMN content_hash_canonical TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_hash ON hash_registry(content_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_parent ON hash_registry(parent_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_receipt ON hash_registry(receipt_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_doc_id ON hash_registry(doc_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reg_canonical ON hash_registry(content_hash_canonical)")
     conn.commit()
     conn.close()
 
 init_registry()
 
-def register_hash(content_hash: str, receipt_id: str, parent_hash: str = None, doc_id: str = None):
+def register_hash(content_hash: str, receipt_id: str, parent_hash: str = None,
+                  doc_id: str = None, content_hash_canonical: str = None):
     """Add an entry to the public registry. No user data stored.
 
-    Five columns only (per Core Principle #3): content_hash, receipt_id,
-    parent_hash, doc_id, registered_at. No uid, no model, no prompt_hash.
+    Six columns (per Integrity Rule #3, post v0.5.1): content_hash,
+    receipt_id, parent_hash, doc_id, content_hash_canonical, registered_at.
+    All are hashes — still PII-free. The sixth column enables cross-format
+    chain discovery (Piece 14): xlsx -> csv -> pdf of the same logical
+    content share a content_hash_canonical, even though their byte
+    hashes all differ.
     """
     conn = get_registry()
     conn.execute(
-        "INSERT INTO hash_registry (content_hash, receipt_id, parent_hash, doc_id, registered_at) VALUES (?,?,?,?,?)",
-        (content_hash, receipt_id, parent_hash, doc_id, datetime.now(timezone.utc).isoformat())
+        "INSERT INTO hash_registry "
+        "(content_hash, receipt_id, parent_hash, doc_id, content_hash_canonical, registered_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (content_hash, receipt_id, parent_hash, doc_id, content_hash_canonical,
+         datetime.now(timezone.utc).isoformat())
     )
     conn.commit()
     conn.close()
@@ -1153,6 +1165,11 @@ class SignRequest(BaseModel):
     classification: Optional[str] = None        # financial / legal / client-facing / internal
     concurrent_ai_apps: Optional[List[str]] = None  # AI processes running at attest moment
 
+    # ----- v0.5.1: cross-format chain integrity (Piece 14) -----
+    content_hash_canonical: Optional[str] = None  # SHA-256 of canonical text extraction (xlsx/csv/pdf chain)
+    perceptual_hashes: Optional[Dict[str, Any]] = None  # {dhash, phash} for images
+    canonical_extraction_failed: Optional[bool] = None  # set by client when format extractor was unavailable
+
     # Pydantic v2 config: allow "len" as alias; also tolerate extra fields for forward-compat
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
@@ -1169,6 +1186,8 @@ def _validate_sign_request(req: SignRequest) -> None:
         raise AIAuthError("INVALID_RECEIPT", "user_id (uid) is required", 400)
     if req.client_integrity not in (None, "none", "extension", "os-verified"):
         raise AIAuthError("INVALID_RECEIPT", "client_integrity must be one of: none, extension, os-verified", 400)
+    if req.content_hash_canonical is not None and not _SHA256_RE.match(req.content_hash_canonical):
+        raise AIAuthError("INVALID_HASH", "content_hash_canonical must be a 64-character SHA-256 hex string", 400)
 
 
 def _validate_client_integrity(request: Request, claimed: Optional[str], content_hash: str) -> str:
@@ -1296,6 +1315,14 @@ def sign_receipt(req: SignRequest, request: Request):
     if req.classification: receipt["classification"] = req.classification
     if req.concurrent_ai_apps: receipt["concurrent_ai_apps"] = req.concurrent_ai_apps
 
+    # v0.5.1 cross-format chain fields (Piece 14)
+    if req.content_hash_canonical:
+        receipt["content_hash_canonical"] = req.content_hash_canonical
+    if req.perceptual_hashes:
+        receipt["perceptual_hashes"] = req.perceptual_hashes
+    if req.canonical_extraction_failed is True:
+        receipt["canonical_extraction_failed"] = True
+
     if req.review_status:
         receipt["review"] = {
             "status": req.review_status,
@@ -1306,9 +1333,11 @@ def sign_receipt(req: SignRequest, request: Request):
 
     signature = sign(receipt)
 
-    # Public hash registry — stores hash->receipt_id mapping + doc_id only, no user data
+    # Public hash registry — 6 anonymous columns (still PII-free):
+    # content_hash, receipt_id, parent_hash, doc_id, content_hash_canonical, registered_at
     if req.register:
-        register_hash(req.output_hash, receipt_id, req.parent_hash, req.doc_id)
+        register_hash(req.output_hash, receipt_id, req.parent_hash, req.doc_id,
+                      req.content_hash_canonical)
 
     # Enterprise: also store full attestation
     if MODE == "enterprise":
@@ -2833,6 +2862,135 @@ def verify_chain(req: ChainVerifyRequest):
 # ===================================================================
 # 4. CHAIN DISCOVERY — find related receipts via hash registry
 # ===================================================================
+
+class ContentDiscoveryRequest(BaseModel):
+    """Body for POST /v1/discover/content."""
+    content_hash_canonical: str
+
+
+@app.post("/v1/discover/content")
+def discover_by_canonical(req: ContentDiscoveryRequest):
+    """Cross-format chain discovery (Piece 14).
+
+    Given a canonical-text hash (same for xlsx -> csv -> pdf of the
+    same logical content), return every registered receipt that shares
+    it. Enables "find every receipt whose content is equivalent to
+    this file, regardless of format".
+
+    The public registry stores only the hash and the receipt_id — no
+    file-type, no uid, no model. The response explicitly nulls
+    any format-identifying field. Enterprise customers with access to
+    their own enterprise_attestations table can JOIN on receipt_id to
+    get file_type and user context within their data.
+    """
+    if not _SHA256_RE.match(req.content_hash_canonical or ""):
+        raise AIAuthError(
+            "INVALID_HASH",
+            "content_hash_canonical must be a 64-character SHA-256 hex string",
+            400,
+        )
+    conn = get_registry()
+    rows = conn.execute(
+        "SELECT receipt_id, content_hash, registered_at "
+        "FROM hash_registry WHERE content_hash_canonical = ? "
+        "ORDER BY registered_at ASC",
+        (req.content_hash_canonical,),
+    ).fetchall()
+    conn.close()
+    return {
+        "canonical_hash": req.content_hash_canonical,
+        "found": len(rows) > 0,
+        "receipt_count": len(rows),
+        "receipts": [
+            {"receipt_id": r["receipt_id"],
+             "content_hash": r["content_hash"],
+             "registered_at": r["registered_at"],
+             "file_type": None}  # explicit null — registry is anonymous
+            for r in rows
+        ],
+        "note": (f"{len(rows)} receipts share this canonical content. "
+                 "Different byte representations (likely format conversions) of "
+                 "the same logical document."),
+    }
+
+
+class SimilarImageRequest(BaseModel):
+    phash: Optional[str] = None
+    dhash: Optional[str] = None
+    distance: int = 5
+    org_id: str
+
+
+def _hamming_distance_hex(a: str, b: str) -> int:
+    """Hamming distance between two hex strings of equal length. Used
+    for perceptual-hash similarity scoring."""
+    if not a or not b or len(a) != len(b):
+        return 10**9
+    try:
+        ai = int(a, 16); bi = int(b, 16)
+    except ValueError:
+        return 10**9
+    return bin(ai ^ bi).count("1")
+
+
+@app.get("/v1/discover/similar-image")
+def discover_similar_image(
+    phash: Optional[str] = Query(default=None),
+    dhash: Optional[str] = Query(default=None),
+    distance: int = Query(default=5, ge=0, le=32),
+    org_id: str = Query(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    """Enterprise-only perceptual-hash similarity search (Piece 14).
+
+    Admin-authenticated against a specific org. Scans the org's
+    enterprise_attestations for receipts whose ai_markers.perceptual_hashes
+    are within Hamming distance `distance` of the supplied phash/dhash.
+
+    Used for cases like 'find every receipt whose image is a resized
+    or watermarked copy of this one'. Not exposed in the public
+    anonymous registry — perceptual hashes CAN sometimes identify an
+    image without revealing its content, which is a privacy concern
+    for free-tier users; limiting to enterprise admins makes the
+    consent context explicit.
+    """
+    if not (phash or dhash):
+        raise AIAuthError("INVALID_RECEIPT", "Must supply phash and/or dhash", 400)
+    _require_admin_session(authorization, org_id)
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, ts, hash, ai_markers, file_type, doc_id "
+        "FROM enterprise_attestations "
+        "WHERE org_id = ? AND ai_markers IS NOT NULL",
+        (org_id,),
+    ).fetchall()
+    conn.close()
+
+    matches = []
+    for r in rows:
+        try:
+            markers = json.loads(r["ai_markers"] or "{}")
+        except Exception:
+            continue
+        ph = markers.get("perceptual_hashes") or {}
+        if not isinstance(ph, dict):
+            continue
+        best = 10**9
+        if phash and ph.get("phash"):
+            best = min(best, _hamming_distance_hex(phash, ph["phash"]))
+        if dhash and ph.get("dhash"):
+            best = min(best, _hamming_distance_hex(dhash, ph["dhash"]))
+        if best <= distance:
+            matches.append({
+                "id": r["id"], "ts": r["ts"], "hash": r["hash"],
+                "file_type": r["file_type"], "doc_id": r["doc_id"],
+                "similarity_distance": best,
+            })
+
+    return {"org_id": org_id, "matches": sorted(matches, key=lambda x: x["similarity_distance"]),
+            "distance_threshold": distance, "note": "Lower distance = more similar; 0 = identical."}
+
 
 @app.get("/v1/discover/{content_hash}")
 def discover_chain(content_hash: str):
