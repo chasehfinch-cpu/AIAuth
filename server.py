@@ -58,6 +58,96 @@ DEDUP_WINDOW = int(os.getenv("AIAUTH_DEDUP_WINDOW", "300"))  # seconds; 0 disabl
 # Regex for SHA-256 hex (lowercase or uppercase)
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
+
+# ===================================================================
+# ANTI-FORENSIC HARDENING (Piece 12, v0.5.1)
+# The account system (Piece 7) stored emails in plaintext. If the
+# server is compromised, an attacker should get HMAC hashes and
+# ciphertext — not readable emails. See CLAUDE.md "Data Hardening".
+#
+# Keys are DERIVED from SERVER_SECRET at startup — nothing extra in
+# .env to manage, nothing extra to rotate. If SERVER_SECRET itself
+# leaks or rotates, see scripts/rotate_server_secret.py (Piece 13).
+# ===================================================================
+
+import hmac as _hmac_mod
+import hashlib as _hashlib_mod
+
+_EMAIL_HASH_SALT: bytes = b""        # populated at startup (if SERVER_SECRET set)
+_DB_ENCRYPTION_KEY: bytes = b""      # populated at startup
+_FERNET = None                        # populated at startup
+
+
+def _derive_hardening_keys() -> None:
+    """Derive email-hash salt and DB encryption key from SERVER_SECRET.
+    Called once at import time AFTER SERVER_SECRET is known. Safe to
+    re-run; idempotent."""
+    global _EMAIL_HASH_SALT, _DB_ENCRYPTION_KEY, _FERNET
+    if not SERVER_SECRET:
+        # Not configured — hardening helpers degrade to passthrough
+        # so dev/test without SERVER_SECRET still works. Production
+        # MUST set SERVER_SECRET.
+        return
+    _EMAIL_HASH_SALT = _hmac_mod.new(
+        SERVER_SECRET.encode(), b"email-hash-v1", _hashlib_mod.sha256
+    ).digest()
+    _DB_ENCRYPTION_KEY = _hmac_mod.new(
+        SERVER_SECRET.encode(), b"db-encrypt-v1", _hashlib_mod.sha256
+    ).digest()  # 32 bytes
+    try:
+        from cryptography.fernet import Fernet as _Fernet
+        _FERNET = _Fernet(base64.urlsafe_b64encode(_DB_ENCRYPTION_KEY))
+    except Exception:
+        _FERNET = None
+
+
+def email_hash(email: str) -> str:
+    """Return a deterministic, salt-HMAC hash suitable for use as a
+    lookup index for an email address. Normalizes (lowercase + trim)
+    before hashing. 64-char hex. If SERVER_SECRET is not configured,
+    returns a SHA-256 of the normalized email (dev/test fallback — not
+    for production)."""
+    norm = (email or "").strip().lower()
+    if not norm:
+        return ""
+    if _EMAIL_HASH_SALT:
+        return _hmac_mod.new(_EMAIL_HASH_SALT, norm.encode("utf-8"), _hashlib_mod.sha256).hexdigest()
+    return _hashlib_mod.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def encrypt_value(plaintext: str) -> str:
+    """Fernet-encrypt a string. Returns base64 ciphertext (URL-safe).
+    If Fernet is unavailable, returns the plaintext prefixed with
+    `NOENC:` so it's obviously NOT ciphertext in a DB dump — but this
+    is only for dev/test; production MUST have SERVER_SECRET set."""
+    if not plaintext:
+        return ""
+    if _FERNET is not None:
+        return _FERNET.encrypt(plaintext.encode("utf-8")).decode("ascii")
+    return "NOENC:" + plaintext
+
+
+def decrypt_value(ciphertext: str) -> str:
+    """Inverse of encrypt_value. Returns empty string on decryption
+    failure — caller should treat that as "data unavailable" rather
+    than erroring out."""
+    if not ciphertext:
+        return ""
+    if ciphertext.startswith("NOENC:"):
+        return ciphertext[6:]
+    if _FERNET is None:
+        return ""
+    try:
+        return _FERNET.decrypt(ciphertext.encode("ascii")).decode("utf-8")
+    except Exception:
+        return ""
+
+
+# Derive now. If SERVER_SECRET is set later (e.g., env loaded after import),
+# call _derive_hardening_keys() again manually.
+_derive_hardening_keys()
+
+
 app = FastAPI(title="AIAuth", version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -611,22 +701,24 @@ def init_db():
 
     # ---------------- Accounts (always, all modes) ----------------
     conn.execute("""CREATE TABLE IF NOT EXISTS accounts (
-        account_id    TEXT PRIMARY KEY,
-        primary_email TEXT NOT NULL,
-        created_at    TEXT NOT NULL,
-        updated_at    TEXT NOT NULL
+        account_id         TEXT PRIMARY KEY,
+        primary_email_hash TEXT NOT NULL,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS account_emails (
-        email         TEXT PRIMARY KEY,
+        email_hash    TEXT PRIMARY KEY,
         account_id    TEXT NOT NULL REFERENCES accounts(account_id),
         email_type    TEXT NOT NULL,
         org_id        TEXT,
         verified      INTEGER NOT NULL DEFAULT 0,
         added_at      TEXT NOT NULL,
-        verified_at   TEXT
+        verified_at   TEXT,
+        email_domain_plain TEXT  -- domain-only (e.g. "acme.com") for org-claim matching; never a full email
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_account ON account_emails(account_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_org ON account_emails(org_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ae_domain ON account_emails(email_domain_plain)")
 
     # ---------------- Organizations + membership ----------------
     conn.execute("""CREATE TABLE IF NOT EXISTS organizations (
@@ -651,13 +743,15 @@ def init_db():
 
     # ---------------- Immutable consent audit log ----------------
     conn.execute("""CREATE TABLE IF NOT EXISTS consent_log (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        account_id    TEXT NOT NULL,
-        org_id        TEXT NOT NULL,
-        action        TEXT NOT NULL,
-        timestamp     TEXT NOT NULL,
-        details       TEXT
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id          TEXT NOT NULL,
+        org_id              TEXT NOT NULL,
+        action              TEXT NOT NULL,
+        timestamp           TEXT NOT NULL,
+        subject_email_hash  TEXT,
+        details_encrypted   TEXT
     )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cl_subject ON consent_log(subject_email_hash)")
 
     # ---------------- Magic-link / session tokens ----------------
     conn.execute("""CREATE TABLE IF NOT EXISTS used_tokens (
@@ -681,7 +775,8 @@ def init_db():
         ts              TEXT NOT NULL,
         hash            TEXT NOT NULL,
         prompt_hash     TEXT,
-        uid             TEXT NOT NULL,
+        uid_hash        TEXT NOT NULL,
+        uid_encrypted   TEXT,
         uid_pseudonym   TEXT,
         src             TEXT,
         model           TEXT,
@@ -709,7 +804,7 @@ def init_db():
         client_integrity TEXT DEFAULT 'none',
         ingested_at     TEXT NOT NULL
     )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_uid ON enterprise_attestations(uid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_uid_hash ON enterprise_attestations(uid_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_ts ON enterprise_attestations(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_org ON enterprise_attestations(org_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_model ON enterprise_attestations(model)")
@@ -832,19 +927,60 @@ def _make_session_token(account_id: str, email: str, ttl_hours: int = 24) -> tup
 
 
 def _send_magic_link(email: str, token: str, purpose: str) -> None:
-    """Email delivery is intentionally stubbed in v0.5.0. The link is
-    logged to stdout and to KEY_DIR/magic_links.log so an admin can
-    wire in a transactional email provider (Resend, Postmark, SES)
-    without touching server code."""
+    """Email delivery path (v0.5.1+).
+
+    Preferred: transactional email provider (Resend) when RESEND_API_KEY
+    is set in the environment. Email is never persisted to disk.
+
+    Fallback: stdout-only logging. A file-based log is available but
+    DISABLED BY DEFAULT — operators must explicitly opt in via
+    AIAUTH_LOG_MAGIC_LINKS=true (dev/test only; never production).
+
+    The magic-link URL contains the token, which is HMAC-signed by
+    SERVER_SECRET and expires in 15 minutes. The recipient email is
+    in-memory for the duration of this call and never stored in our
+    databases — see Integrity Rule #12 (Data Hardening)."""
     link = f"{PUBLIC_BASE_URL}/auth?token={token}&p={purpose}"
-    msg = f"[AIAuth magic-link] to={email} purpose={purpose} link={link}"
-    print(msg)
-    try:
-        log_path = KEY_DIR / "magic_links.log"
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
-    except Exception:
-        pass
+
+    # Track what was logged for return/test visibility (without leaking email)
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if api_key:
+        try:
+            import resend
+            resend.api_key = api_key
+            resend.Emails.send({
+                "from": os.getenv("RESEND_FROM", "AIAuth <auth@aiauth.app>"),
+                "to": email,
+                "subject": {
+                    "login": "Your AIAuth login link",
+                    "verify_email": "Verify your AIAuth email",
+                }.get(purpose, "Your AIAuth link"),
+                "text": (
+                    f"Click to complete sign-in: {link}\n\n"
+                    "This link expires in 15 minutes and can only be used once. "
+                    "If you didn't request it, ignore this email."
+                ),
+            })
+            print(f"[AIAuth magic-link] delivered via Resend; purpose={purpose}")
+            return
+        except Exception as exc:
+            # Log the failure (not the email) and fall through to stdout
+            print(f"[AIAuth magic-link] Resend delivery failed: {type(exc).__name__}; falling back to stdout log")
+
+    # Stdout — operator can retrieve from systemd journal for testing
+    print(f"[AIAuth magic-link] purpose={purpose} link={link}")
+
+    # Opt-in file log (dev/test only)
+    if os.getenv("AIAUTH_LOG_MAGIC_LINKS", "").strip().lower() == "true":
+        try:
+            log_path = KEY_DIR / "magic_links.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{datetime.now(timezone.utc).isoformat()} "
+                    f"purpose={purpose} link={link}\n"
+                )
+        except Exception:
+            pass
 
 
 def _require_session(authorization: Optional[str]) -> dict:
@@ -867,15 +1003,29 @@ def _require_session(authorization: Optional[str]) -> dict:
 
 
 def _find_account_by_email(email: str) -> Optional[sqlite3.Row]:
+    """Look up an account_emails row by plaintext email. Hashes the
+    email with the server-side salt and queries by email_hash. Returns
+    None if not found."""
+    h = email_hash(email)
+    if not h:
+        return None
     conn = get_db()
     row = conn.execute(
-        "SELECT ae.*, a.primary_email FROM account_emails ae "
+        "SELECT ae.*, a.account_id AS acct_id FROM account_emails ae "
         "JOIN accounts a ON ae.account_id = a.account_id "
-        "WHERE ae.email = ?",
-        (email,),
+        "WHERE ae.email_hash = ?",
+        (h,),
     ).fetchone()
     conn.close()
     return row
+
+
+def _email_domain(email: str) -> str:
+    """Extract the lowercase domain part of an email address, or "" on malformed input."""
+    norm = (email or "").strip().lower()
+    if "@" not in norm:
+        return ""
+    return norm.split("@", 1)[1]
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -1173,14 +1323,18 @@ def account_create(body: AccountCreateRequest):
         account_id = existing["account_id"]
     else:
         account_id = "ACC_" + uuid.uuid4().hex[:12]
+        eh = email_hash(email)
+        domain = _email_domain(email)
         conn = get_db()
         conn.execute(
-            "INSERT INTO accounts (account_id, primary_email, created_at, updated_at) VALUES (?,?,?,?)",
-            (account_id, email, now, now),
+            "INSERT INTO accounts (account_id, primary_email_hash, created_at, updated_at) VALUES (?,?,?,?)",
+            (account_id, eh, now, now),
         )
         conn.execute(
-            "INSERT INTO account_emails (email, account_id, email_type, verified, added_at) VALUES (?,?,?,?,?)",
-            (email, account_id, "personal", 0, now),
+            "INSERT INTO account_emails "
+            "(email_hash, account_id, email_type, verified, added_at, email_domain_plain) "
+            "VALUES (?,?,?,?,?,?)",
+            (eh, account_id, "personal", 0, now, domain),
         )
         conn.commit()
         conn.close()
@@ -1233,8 +1387,8 @@ def account_verify(body: AccountVerifyRequest):
     # Mark email as verified if this is a login/verify_email token
     conn.execute(
         "UPDATE account_emails SET verified = 1, verified_at = ? "
-        "WHERE email = ? AND verified = 0",
-        (now, payload["email"]),
+        "WHERE email_hash = ? AND verified = 0",
+        (now, email_hash(payload["email"])),
     )
     conn.commit()
     conn.close()
@@ -1251,13 +1405,21 @@ def account_verify(body: AccountVerifyRequest):
 
 @app.get("/v1/account/me")
 def account_me(authorization: Optional[str] = Header(default=None)):
-    """Return the authenticated caller's account info: emails linked,
-    verification status, org memberships."""
+    """Return the authenticated caller's account info: linked emails
+    (by hash + domain), verification status, org memberships.
+
+    The server does NOT store plaintext emails — we return only the
+    caller's CURRENT email (from their session token) plus metadata
+    about OTHER linked emails: their domain, type, verification status.
+    Full plaintext of additional linked emails is unavailable post-
+    hardening; if you need to re-display the list, either the client
+    caches it locally or the user re-verifies each (link flow)."""
     session = _require_session(authorization)
     account_id = session["account_id"]
     conn = get_db()
-    emails = [dict(r) for r in conn.execute(
-        "SELECT email, email_type, org_id, verified, added_at, verified_at "
+    raw_emails = [dict(r) for r in conn.execute(
+        "SELECT email_hash, email_type, org_id, verified, added_at, verified_at, "
+        "       email_domain_plain "
         "FROM account_emails WHERE account_id = ?",
         (account_id,),
     ).fetchall()]
@@ -1269,10 +1431,28 @@ def account_me(authorization: Optional[str] = Header(default=None)):
         (account_id,),
     ).fetchall()]
     conn.close()
+
+    # Only the CURRENT session's email can be returned in full (came in with the request).
+    current_eh = email_hash(session.get("email", ""))
+    emails_out = []
+    for r in raw_emails:
+        entry = {
+            "email_hash": r["email_hash"],
+            "email_type": r["email_type"],
+            "org_id": r["org_id"],
+            "verified": r["verified"],
+            "added_at": r["added_at"],
+            "verified_at": r["verified_at"],
+            "domain": r["email_domain_plain"],
+        }
+        if r["email_hash"] == current_eh:
+            entry["email"] = session["email"]  # current session's email is safe to echo
+        emails_out.append(entry)
+
     return {
         "account_id": account_id,
         "current_email": session["email"],
-        "emails": emails,
+        "emails": emails_out,
         "organizations": orgs,
     }
 
@@ -1335,19 +1515,22 @@ def account_confirm(body: AccountConfirmRequest):
         conn.close()
         raise AIAuthError("TOKEN_USED", "Token has already been used", 400)
 
-    # Insert or update the email
+    # Insert or update the email (hashed)
+    eh = email_hash(payload["email"])
+    domain = _email_domain(payload["email"])
     try:
         conn.execute(
-            "INSERT INTO account_emails (email, account_id, email_type, verified, added_at, verified_at) "
-            "VALUES (?,?,?,1,?,?)",
-            (payload["email"], payload["account_id"], email_type, now, now),
+            "INSERT INTO account_emails "
+            "(email_hash, account_id, email_type, verified, added_at, verified_at, email_domain_plain) "
+            "VALUES (?,?,?,1,?,?,?)",
+            (eh, payload["account_id"], email_type, now, now, domain),
         )
     except sqlite3.IntegrityError:
         # Already linked to same account — just ensure verified
         conn.execute(
             "UPDATE account_emails SET verified = 1, verified_at = ? "
-            "WHERE email = ? AND account_id = ?",
-            (now, payload["email"], payload["account_id"]),
+            "WHERE email_hash = ? AND account_id = ?",
+            (now, eh, payload["account_id"]),
         )
     conn.commit()
     conn.close()
@@ -1381,8 +1564,12 @@ def account_consent(body: AccountConsentRequest, authorization: Optional[str] = 
     now = datetime.now(timezone.utc).isoformat()
     action = "grant_personal" if new_val else "revoke_personal"
     conn.execute(
-        "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
-        (account_id, body.org_id, action, now, json.dumps({"email": session["email"]})),
+        "INSERT INTO consent_log "
+        "(account_id, org_id, action, timestamp, subject_email_hash, details_encrypted) "
+        "VALUES (?,?,?,?,?,?)",
+        (account_id, body.org_id, action, now,
+         email_hash(session["email"]),
+         encrypt_value(json.dumps({"email": session["email"]}))),
     )
     conn.commit()
     conn.close()
@@ -1404,23 +1591,35 @@ def account_export(authorization: Optional[str] = Header(default=None)):
         "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
     ).fetchone() or {})
     emails = [dict(r) for r in conn.execute(
-        "SELECT * FROM account_emails WHERE account_id = ?", (account_id,)
+        "SELECT email_hash, email_type, org_id, verified, added_at, verified_at, email_domain_plain "
+        "FROM account_emails WHERE account_id = ?", (account_id,)
     ).fetchall()]
     orgs = [dict(r) for r in conn.execute(
         "SELECT * FROM org_members WHERE account_id = ?", (account_id,)
     ).fetchall()]
-    consent = [dict(r) for r in conn.execute(
-        "SELECT * FROM consent_log WHERE account_id = ? ORDER BY timestamp DESC",
+    consent_raw = [dict(r) for r in conn.execute(
+        "SELECT id, account_id, org_id, action, timestamp, details_encrypted "
+        "FROM consent_log WHERE account_id = ? ORDER BY timestamp DESC",
         (account_id,),
     ).fetchall()]
     conn.close()
+    # Decrypt consent details for the owner (they're authenticated)
+    consent = []
+    for r in consent_raw:
+        dec = decrypt_value(r.pop("details_encrypted") or "")
+        try:
+            r["details"] = json.loads(dec) if dec else None
+        except Exception:
+            r["details"] = None
+        consent.append(r)
     return {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "account": account,
+        "current_email": session["email"],
         "emails": emails,
         "organizations": orgs,
         "consent_history": consent,
-        "note": "Free-tier attestation receipts are stored on your device, not on our server.",
+        "note": "Free-tier attestation receipts are stored on your device, not on our server. Stored emails are hashed; we return only hashes + domains for linked emails.",
     }
 
 
@@ -1611,22 +1810,22 @@ def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
         )
 
     # Block offboarded users. Two signals, either one suffices:
-    #   (a) org_members row with left_at set (known linked member who left)
+    #   (a) org_members row with left_at set
     #   (b) consent_log row with action dsar_pseudonymize or dsar_delete
-    #       for this (email, org) — covers users who were pseudonymized
-    #       without ever having linked a personal account.
+    #       for this (email_hash, org)
+    uid_h = email_hash(uid)
     conn = get_db()
     left_member = conn.execute(
         "SELECT om.left_at FROM org_members om "
         "JOIN account_emails ae ON ae.account_id = om.account_id "
-        "WHERE ae.email = ? AND om.org_id = ? AND om.left_at IS NOT NULL",
-        (uid, org["org_id"]),
+        "WHERE ae.email_hash = ? AND om.org_id = ? AND om.left_at IS NOT NULL",
+        (uid_h, org["org_id"]),
     ).fetchone()
     dsar_out = conn.execute(
         "SELECT id FROM consent_log "
         "WHERE org_id = ? AND action IN ('dsar_pseudonymize','dsar_delete') "
-        "AND details LIKE ? LIMIT 1",
-        (org["org_id"], f'%"email": "{uid}"%'),
+        "AND subject_email_hash = ? LIMIT 1",
+        (org["org_id"], uid_h),
     ).fetchone()
     if left_member is not None or dsar_out is not None:
         conn.close()
@@ -1647,8 +1846,9 @@ def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
         receipt.get("ts"),
         receipt.get("hash"),
         receipt.get("prompt_hash"),
-        uid,
-        None,  # uid_pseudonym
+        uid_h,                          # uid_hash (HMAC-SHA256 of normalized uid)
+        encrypt_value(uid),             # uid_encrypted (Fernet ciphertext)
+        None,                           # uid_pseudonym
         receipt.get("src"),
         receipt.get("model"),
         receipt.get("provider"),
@@ -1677,12 +1877,13 @@ def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
     )
     conn.execute(
         "INSERT INTO enterprise_attestations ("
-        "id, ts, hash, prompt_hash, uid, uid_pseudonym, src, model, provider, "
-        "source_domain, source_app, concurrent_ai_apps, ai_markers, doc_id, parent, "
+        "id, ts, hash, prompt_hash, uid_hash, uid_encrypted, uid_pseudonym, "
+        "src, model, provider, source_domain, source_app, "
+        "concurrent_ai_apps, ai_markers, doc_id, parent, "
         "file_type, len, tta, sid, dest, dest_ext, classification, "
         "review_status, review_by, review_at, review_note, tags, "
         "schema_version, org_id, client_integrity, ingested_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         row,
     )
 
@@ -1734,13 +1935,16 @@ def admin_org_claim(body: OrgClaimRequest, authorization: Optional[str] = Header
     if not domains:
         raise AIAuthError("INVALID_RECEIPT", "At least one domain is required", 400)
 
-    # Proof-of-control: the caller must have a verified email in each domain
+    # Proof-of-control: the caller must have a verified email in each domain.
+    # Post-Piece 12, emails are not stored plaintext — we use the separate
+    # email_domain_plain column for domain matching.
     conn = get_db()
-    verified = {row["email"].split("@", 1)[1].lower()
+    verified = {row["email_domain_plain"]
                 for row in conn.execute(
-                    "SELECT email FROM account_emails WHERE account_id = ? AND verified = 1",
+                    "SELECT email_domain_plain FROM account_emails "
+                    "WHERE account_id = ? AND verified = 1 AND email_domain_plain IS NOT NULL",
                     (session["account_id"],),
-                ).fetchall() if "@" in row["email"]}
+                ).fetchall()}
     missing = [d for d in domains if d not in verified]
     if missing:
         conn.close()
@@ -1763,12 +1967,12 @@ def admin_org_claim(body: OrgClaimRequest, authorization: Optional[str] = Header
         (session["account_id"], org_id, "admin", now),
     )
     # Also mark each of the caller's verified emails matching a claimed
-    # domain as corporate emails under this org.
+    # domain as corporate emails under this org (match by domain column).
     for domain in domains:
         conn.execute(
             "UPDATE account_emails SET email_type = 'corporate', org_id = ? "
-            "WHERE account_id = ? AND email LIKE ? AND email_type != 'corporate'",
-            (org_id, session["account_id"], f"%@{domain}"),
+            "WHERE account_id = ? AND email_domain_plain = ? AND email_type != 'corporate'",
+            (org_id, session["account_id"], domain),
         )
     conn.commit()
     conn.close()
@@ -1781,12 +1985,22 @@ def admin_org_claim(body: OrgClaimRequest, authorization: Optional[str] = Header
 @app.get("/v1/admin/org/members")
 def admin_org_members(org_id: str = Query(...), authorization: Optional[str] = Header(default=None)):
     """List members of an org (admin-authed). Shows link status:
-    which members have a personal email linked, which consented to
-    personal-history sharing, who has left."""
+    who has a personal email linked, who consented to personal-history
+    sharing, who has left.
+
+    Post-hardening: we return the primary-email HASH and the account's
+    corporate-email DOMAIN (never the full plaintext email). Admins who
+    need to contact a specific member go through the invite list kept
+    in their own IT system."""
     session = _require_admin_session(authorization, org_id)
     conn = get_db()
     rows = conn.execute(
-        "SELECT om.*, a.primary_email, "
+        "SELECT om.account_id, om.org_id, om.role, om.department, "
+        "       om.joined_at, om.left_at, om.consent_personal_history, "
+        "       a.primary_email_hash, "
+        "       (SELECT email_domain_plain FROM account_emails ae "
+        "        WHERE ae.account_id = om.account_id AND ae.org_id = om.org_id "
+        "        LIMIT 1) AS corporate_domain, "
         "       (SELECT COUNT(*) FROM account_emails ae "
         "        WHERE ae.account_id = om.account_id AND ae.email_type = 'personal') AS has_personal "
         "FROM org_members om JOIN accounts a ON om.account_id = a.account_id "
@@ -1816,65 +2030,86 @@ def admin_dsar(body: DSARRequest, authorization: Optional[str] = Header(default=
     if body.action not in ("export", "pseudonymize", "delete"):
         raise AIAuthError("INVALID_RECEIPT", "action must be export/pseudonymize/delete", 400)
 
+    uid_h = email_hash(email)
+
     conn = get_db()
     member = conn.execute(
         "SELECT om.account_id FROM org_members om "
         "JOIN account_emails ae ON ae.account_id = om.account_id "
-        "WHERE ae.email = ? AND om.org_id = ?",
-        (email, body.org_id),
+        "WHERE ae.email_hash = ? AND om.org_id = ?",
+        (uid_h, body.org_id),
     ).fetchone()
     account_id = member["account_id"] if member else None
 
     now = datetime.now(timezone.utc).isoformat()
     if body.action == "export":
-        attests = [dict(r) for r in conn.execute(
-            "SELECT * FROM enterprise_attestations WHERE uid = ? AND org_id = ?",
-            (email, body.org_id),
-        ).fetchall()]
+        # Pull attestations by uid_hash; decrypt uid_encrypted for the admin's view.
+        raw = conn.execute(
+            "SELECT * FROM enterprise_attestations WHERE uid_hash = ? AND org_id = ?",
+            (uid_h, body.org_id),
+        ).fetchall()
+        attests = []
+        for r in raw:
+            d = dict(r)
+            if d.get("uid_encrypted"):
+                d["uid"] = decrypt_value(d["uid_encrypted"])   # admin view, in-memory only
+            attests.append(d)
         emails = [dict(r) for r in conn.execute(
-            "SELECT * FROM account_emails WHERE email = ?", (email,)
+            "SELECT email_hash, email_type, org_id, verified, added_at, verified_at, email_domain_plain "
+            "FROM account_emails WHERE email_hash = ?",
+            (uid_h,),
         ).fetchall()]
         conn.execute(
-            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
-            (account_id or "unknown", body.org_id, "dsar_export", now, json.dumps({"email": email})),
+            "INSERT INTO consent_log "
+            "(account_id, org_id, action, timestamp, subject_email_hash, details_encrypted) "
+            "VALUES (?,?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_export", now, uid_h,
+             encrypt_value(json.dumps({"email": email, "requested_by": session["email"]}))),
         )
         conn.commit()
         conn.close()
         return {"action": "export", "email": email, "attestations": attests, "emails": emails}
 
     if body.action == "pseudonymize":
-        # One-way pseudonym: SHA-256(email + org_salt + "pseudonymize")
-        # org_salt = org_id (stable, org-specific)
+        # One-way pseudonym derived from email + org salt. Deterministic so
+        # re-running doesn't produce a new pseudonym each time.
         pseud = hashlib.sha256(f"{email}{body.org_id}pseudonymize".encode()).hexdigest()[:24]
+        # Clear the uid_encrypted column and set the pseudonym; uid_hash
+        # remains so offboarded-check queries keep working.
         conn.execute(
             "UPDATE enterprise_attestations "
-            "SET uid_pseudonym = ?, uid = '[pseudonymized]' "
-            "WHERE uid = ? AND org_id = ?",
-            (pseud, email, body.org_id),
+            "SET uid_pseudonym = ?, uid_encrypted = NULL "
+            "WHERE uid_hash = ? AND org_id = ?",
+            (pseud, uid_h, body.org_id),
         )
-        # Mark user as left
+        # Mark user as left (if they were linked as a member)
         if account_id:
             conn.execute(
                 "UPDATE org_members SET left_at = ? WHERE account_id = ? AND org_id = ? AND left_at IS NULL",
                 (now, account_id, body.org_id),
             )
         conn.execute(
-            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
-            (account_id or "unknown", body.org_id, "dsar_pseudonymize", now, json.dumps({"email": email, "pseudonym": pseud})),
+            "INSERT INTO consent_log "
+            "(account_id, org_id, action, timestamp, subject_email_hash, details_encrypted) "
+            "VALUES (?,?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_pseudonymize", now, uid_h,
+             encrypt_value(json.dumps({"email": email, "pseudonym": pseud, "requested_by": session["email"]}))),
         )
         conn.commit()
         conn.close()
         return {"action": "pseudonymize", "email": email, "pseudonym": pseud}
 
     if body.action == "delete":
-        # Nuclear. Remove attestations entirely. Registry entries untouched (no PII).
         deleted = conn.execute(
-            "DELETE FROM enterprise_attestations WHERE uid = ? AND org_id = ?",
-            (email, body.org_id),
+            "DELETE FROM enterprise_attestations WHERE uid_hash = ? AND org_id = ?",
+            (uid_h, body.org_id),
         ).rowcount
         conn.execute(
-            "INSERT INTO consent_log (account_id, org_id, action, timestamp, details) VALUES (?,?,?,?,?)",
-            (account_id or "unknown", body.org_id, "dsar_delete", now, json.dumps({"email": email, "deleted_rows": deleted})),
+            "INSERT INTO consent_log "
+            "(account_id, org_id, action, timestamp, subject_email_hash, details_encrypted) "
+            "VALUES (?,?,?,?,?,?)",
+            (account_id or "unknown", body.org_id, "dsar_delete", now, uid_h,
+             encrypt_value(json.dumps({"email": email, "deleted_rows": deleted, "requested_by": session["email"]}))),
         )
         conn.commit()
         conn.close()
@@ -1913,7 +2148,7 @@ def violations_feed(
         where += " AND pv.severity = ?"
         params.append(severity)
     rows = conn.execute(
-        f"SELECT pv.*, ea.uid, ea.ts AS attestation_ts "
+        f"SELECT pv.*, ea.uid_hash, ea.uid_pseudonym, ea.ts AS attestation_ts "
         f"FROM policy_violations pv "
         f"JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
         f"WHERE {where} ORDER BY pv.detected_at DESC LIMIT ?",
@@ -1975,7 +2210,7 @@ def dashboard_data(
 
     # Join to get department (NULL-safe via LEFT JOIN)
     join = (
-        "LEFT JOIN account_emails ae ON ea.uid = ae.email "
+        "LEFT JOIN account_emails ae ON ea.uid_hash = ae.email_hash "
         "LEFT JOIN org_members om ON ae.account_id = om.account_id AND om.org_id = ea.org_id "
     )
 
@@ -1987,7 +2222,7 @@ def dashboard_data(
     # Summary counts
     summary_row = conn.execute(
         f"SELECT COUNT(*) AS total, "
-        f"       COUNT(DISTINCT ea.uid) AS unique_users, "
+        f"       COUNT(DISTINCT ea.uid_hash) AS unique_users, "
         f"       COUNT(DISTINCT ea.sid) AS unique_sessions, "
         f"       AVG(ea.tta) AS avg_tta, "
         f"       SUM(CASE WHEN ea.review_status IS NOT NULL THEN 1 ELSE 0 END) AS reviewed, "
@@ -2042,7 +2277,7 @@ def dashboard_data(
     by_department = []
     for dept_row in conn.execute(
         f"SELECT IFNULL(om.department, 'Unmapped') AS dept, "
-        f"       COUNT(*) AS total, COUNT(DISTINCT ea.uid) AS unique_users, "
+        f"       COUNT(*) AS total, COUNT(DISTINCT ea.uid_hash) AS unique_users, "
         f"       AVG(ea.tta) AS avg_tta, "
         f"       SUM(CASE WHEN ea.review_status IS NOT NULL THEN 1 ELSE 0 END) AS reviewed, "
         f"       SUM(CASE WHEN COALESCE(ea.tta,999)<10 AND COALESCE(ea.len,0)>500 THEN 1 ELSE 0 END) AS rubber, "
@@ -2113,10 +2348,10 @@ def dashboard_data(
             "count": rubber_stamp,
             "threshold": {"tta_under": 10, "len_over": 500},
             "top_offenders": [dict(r) for r in conn.execute(
-                f"SELECT ea.uid, COUNT(*) AS count, IFNULL(om.department, 'Unmapped') AS department "
+                f"SELECT ea.uid_hash, ea.uid_pseudonym, COUNT(*) AS count, IFNULL(om.department, 'Unmapped') AS department "
                 f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter} "
                 f"AND COALESCE(ea.tta,999) < 10 AND COALESCE(ea.len,0) > 500 "
-                f"GROUP BY ea.uid ORDER BY count DESC LIMIT 5",
+                f"GROUP BY ea.uid_hash ORDER BY count DESC LIMIT 5",
                 params,
             ).fetchall()],
         },
