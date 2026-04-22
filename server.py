@@ -2,9 +2,9 @@
 AIAuth Server v4 — Chain-Aware Signing Authority
 
 The server does three things:
-  1. SIGN:   Hash in → signed receipt out → server forgets
-  2. VERIFY: Receipt in → yes/no out
-  3. CHAIN:  Receipts in → unbroken yes/no out
+  1. SIGN:   Hash in -> signed receipt out -> server forgets
+  2. VERIFY: Receipt in -> yes/no out
+  3. CHAIN:  Receipts in -> unbroken yes/no out
 
 No database. No user data. No storage. Fully stateless.
 The receipts themselves are the blockchain — each one references
@@ -81,46 +81,242 @@ async def _aiauth_error_handler(request: Request, exc: AIAuthError):
 
 
 # ===================================================================
-# ED25519 KEYS
+# ED25519 KEY MANAGEMENT (versioned, v0.5.0+)
+# See CLAUDE.md "Key Management" section. Keys live under KEY_DIR/keys/
+# with a key_manifest.json mapping key_ids to validity windows. The
+# current signing key is identified by manifest.current_signing_key.
+# Every signed receipt embeds the key_id used, so verification stays
+# deterministic across key rotations.
+#
+# Migration: if a legacy KEY_DIR/aiauth_private.pem exists and no
+# keys/ subdirectory exists yet, it is copied (not moved) to
+# keys/key_000_active.pem on first startup. Historical receipts that
+# lack a key_id field still verify because check_sig falls back to
+# trying every known key.
 # ===================================================================
 
-def load_or_create_keys():
-    priv_path = KEY_DIR / "aiauth_private.pem"
-    if priv_path.exists():
-        with open(priv_path, "rb") as f:
-            pk = serialization.load_pem_private_key(f.read(), password=None)
-    else:
-        pk = Ed25519PrivateKey.generate()
-        with open(priv_path, "wb") as f:
-            f.write(pk.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
-            ))
-        os.chmod(priv_path, 0o600)
-    pub = pk.public_key()
-    pub_pem = pub.public_bytes(
+import shutil  # used by legacy-key migration
+
+KEYS_SUBDIR = KEY_DIR / "keys"
+KEY_MANIFEST_PATH = KEYS_SUBDIR / "key_manifest.json"
+
+# In-memory registry: key_id -> {"private", "public", "public_pem", "meta"}
+KEY_REGISTRY: Dict[str, Dict[str, Any]] = {}
+CURRENT_KEY_ID: str = ""
+
+
+def _derive_public_pem(private_key) -> str:
+    return private_key.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode()
-    return pk, pub, pub_pem
 
-PRIV_KEY, PUB_KEY, PUB_PEM = load_or_create_keys()
+
+def _save_private_key(private_key, path: Path) -> None:
+    with open(path, "wb") as f:
+        f.write(private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ))
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def _save_public_key(private_key, path: Path) -> None:
+    with open(path, "wb") as f:
+        f.write(private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        ))
+
+
+def _write_manifest(manifest: dict) -> None:
+    KEYS_SUBDIR.mkdir(parents=True, exist_ok=True)
+    with open(KEY_MANIFEST_PATH, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def _migrate_legacy_single_key() -> Optional[dict]:
+    """If a pre-v0.5.0 KEY_DIR/aiauth_private.pem exists, convert it
+    to key_000 under the versioned layout. Returns manifest or None."""
+    legacy_priv = KEY_DIR / "aiauth_private.pem"
+    if not legacy_priv.exists():
+        return None
+    KEYS_SUBDIR.mkdir(parents=True, exist_ok=True)
+    dst_priv = KEYS_SUBDIR / "key_000_active.pem"
+    if not dst_priv.exists():
+        shutil.copy2(legacy_priv, dst_priv)  # copy, don't remove legacy file
+        try:
+            os.chmod(dst_priv, 0o600)
+        except Exception:
+            pass
+    with open(dst_priv, "rb") as f:
+        pk = serialization.load_pem_private_key(f.read(), password=None)
+    _save_public_key(pk, KEYS_SUBDIR / "key_000_public.pem")
+    manifest = {
+        "keys": [{
+            "key_id": "key_000",
+            "algorithm": "Ed25519",
+            # Retrospective window — covers all historical receipts.
+            "valid_from": "2020-01-01T00:00:00Z",
+            "valid_until": None,
+            "status": "active",
+            "public_key_pem": _derive_public_pem(pk),
+        }],
+        "current_signing_key": "key_000",
+    }
+    _write_manifest(manifest)
+    print("[AIAuth] Migrated legacy aiauth_private.pem -> keys/key_000_active.pem")
+    return manifest
+
+
+def _load_or_init_manifest() -> dict:
+    if KEY_MANIFEST_PATH.exists():
+        with open(KEY_MANIFEST_PATH, "r") as f:
+            return json.load(f)
+    migrated = _migrate_legacy_single_key()
+    if migrated:
+        return migrated
+    # Fresh install — generate key_001
+    KEYS_SUBDIR.mkdir(parents=True, exist_ok=True)
+    pk = Ed25519PrivateKey.generate()
+    _save_private_key(pk, KEYS_SUBDIR / "key_001_active.pem")
+    _save_public_key(pk, KEYS_SUBDIR / "key_001_public.pem")
+    manifest = {
+        "keys": [{
+            "key_id": "key_001",
+            "algorithm": "Ed25519",
+            "valid_from": datetime.now(timezone.utc).isoformat(),
+            "valid_until": None,
+            "status": "active",
+            "public_key_pem": _derive_public_pem(pk),
+        }],
+        "current_signing_key": "key_001",
+    }
+    _write_manifest(manifest)
+    print("[AIAuth] Fresh install — generated keys/key_001_active.pem")
+    return manifest
+
+
+def _load_private_for(key_id: str):
+    """Try active then retired variants on disk. Returns None if the
+    private key is not available (e.g., historical key pruned from disk
+    but still in the manifest for verification)."""
+    for variant in ("active", "retired"):
+        p = KEYS_SUBDIR / f"{key_id}_{variant}.pem"
+        if p.exists():
+            with open(p, "rb") as f:
+                return serialization.load_pem_private_key(f.read(), password=None)
+    return None
+
+
+def initialize_keys() -> None:
+    global CURRENT_KEY_ID
+    manifest = _load_or_init_manifest()
+    CURRENT_KEY_ID = manifest.get("current_signing_key", "")
+    KEY_REGISTRY.clear()
+    for entry in manifest.get("keys", []):
+        kid = entry["key_id"]
+        priv = _load_private_for(kid)
+        if priv is None:
+            # Private pruned from disk — still loadable for verification
+            # from the manifest's public_key_pem field.
+            try:
+                pub = serialization.load_pem_public_key(entry["public_key_pem"].encode())
+            except Exception:
+                continue
+            KEY_REGISTRY[kid] = {
+                "private": None,
+                "public": pub,
+                "public_pem": entry["public_key_pem"],
+                "meta": entry,
+            }
+        else:
+            KEY_REGISTRY[kid] = {
+                "private": priv,
+                "public": priv.public_key(),
+                "public_pem": _derive_public_pem(priv),
+                "meta": entry,
+            }
+    if not CURRENT_KEY_ID or CURRENT_KEY_ID not in KEY_REGISTRY:
+        raise RuntimeError(f"Key manifest invalid: current_signing_key={CURRENT_KEY_ID} not in loaded set {list(KEY_REGISTRY.keys())}")
+    print(f"[AIAuth] Loaded {len(KEY_REGISTRY)} key(s); current = {CURRENT_KEY_ID}")
+
+
+initialize_keys()
+
+
+# Backward-compatible globals: any external code still referencing
+# PRIV_KEY / PUB_KEY / PUB_PEM resolves to the CURRENT signing key.
+PRIV_KEY = KEY_REGISTRY[CURRENT_KEY_ID]["private"]
+PUB_KEY = KEY_REGISTRY[CURRENT_KEY_ID]["public"]
+PUB_PEM = KEY_REGISTRY[CURRENT_KEY_ID]["public_pem"]
 
 
 def sign(data: dict) -> str:
+    """Sign with the current signing key. The caller is responsible for
+    embedding key_id in `data` before calling sign() — that way the
+    key_id becomes part of the signed payload and cannot be forged."""
     payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
-    sig = PRIV_KEY.sign(payload.encode())
+    priv = KEY_REGISTRY[CURRENT_KEY_ID]["private"]
+    if priv is None:
+        raise RuntimeError(f"Current signing key {CURRENT_KEY_ID} has no private key on disk")
+    sig = priv.sign(payload.encode())
     return base64.urlsafe_b64encode(sig).decode()
 
 
 def check_sig(data: dict, sig_b64: str) -> bool:
-    payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    """Verify signature. Uses key_id from `data` when present; otherwise
+    tries every known public key (supports pre-v0.5.0 receipts that have
+    no key_id field)."""
+    payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
     try:
-        PUB_KEY.verify(base64.urlsafe_b64decode(sig_b64), payload.encode())
-        return True
-    except:
+        sig_bytes = base64.urlsafe_b64decode(sig_b64)
+    except Exception:
         return False
+    kid = data.get("key_id") if isinstance(data, dict) else None
+    if kid and kid in KEY_REGISTRY:
+        try:
+            KEY_REGISTRY[kid]["public"].verify(sig_bytes, payload)
+            return True
+        except Exception:
+            return False
+    # Legacy fallback: try every loaded key
+    for entry in KEY_REGISTRY.values():
+        try:
+            entry["public"].verify(sig_bytes, payload)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def build_public_key_manifest(include_private_status: bool = False) -> dict:
+    """Return the manifest as served to clients via /v1/public-key.
+    Never includes private key material."""
+    keys = []
+    for kid, entry in KEY_REGISTRY.items():
+        meta = entry["meta"]
+        k = {
+            "key_id": kid,
+            "algorithm": meta.get("algorithm", "Ed25519"),
+            "valid_from": meta.get("valid_from"),
+            "valid_until": meta.get("valid_until"),
+            "status": meta.get("status", "active"),
+            "public_key_pem": entry["public_pem"],
+        }
+        if include_private_status:
+            k["private_key_available"] = entry["private"] is not None
+        keys.append(k)
+    return {
+        "algorithm": "Ed25519",
+        "keys": keys,
+        "current_signing_key": CURRENT_KEY_ID,
+        "version": VERSION,
+    }
 
 
 # ===================================================================
@@ -382,7 +578,7 @@ def sign_receipt(req: SignRequest):
     If register=true (default), the content hash and receipt ID are
     added to the public hash registry. This enables chain discovery —
     others can find out that a receipt exists for a given content hash.
-    The registry stores NO user data — only hash → receipt_id mappings
+    The registry stores NO user data — only hash -> receipt_id mappings
     (five columns: content_hash, receipt_id, parent_hash, doc_id, registered_at).
 
     If register=false, the server signs and forgets entirely.
@@ -420,6 +616,7 @@ def sign_receipt(req: SignRequest):
 
     # Build receipt: required fields first, then all populated optional fields.
     # Null/empty fields are OMITTED (keeps receipt compact and backward-compatible).
+    # key_id is embedded so the signature covers it — cannot be forged after signing.
     receipt: Dict[str, Any] = {
         "v": VERSION,
         "id": receipt_id,
@@ -427,6 +624,7 @@ def sign_receipt(req: SignRequest):
         "hash": req.output_hash,
         "uid": req.user_id,
         "src": req.source,
+        "key_id": CURRENT_KEY_ID,
     }
 
     # v0.4.0-compat optional fields
@@ -464,7 +662,7 @@ def sign_receipt(req: SignRequest):
 
     signature = sign(receipt)
 
-    # Public hash registry — stores hash→receipt_id mapping + doc_id only, no user data
+    # Public hash registry — stores hash->receipt_id mapping + doc_id only, no user data
     if req.register:
         register_hash(req.output_hash, receipt_id, req.parent_hash, req.doc_id)
 
@@ -874,8 +1072,25 @@ def lookup_by_code(code: str):
 # ===================================================================
 
 @app.get("/v1/public-key")
+def public_key(format: Optional[str] = Query(default=None, description="'legacy' returns v0.4.0 single-key shape; default is v0.5.0 manifest")):
+    """Public key distribution.
+
+    v0.5.0 default: returns the full key manifest with all known keys,
+    their validity windows, and the current signing key.
+    ?format=legacy: returns the v0.4.0 single-key JSON for
+    backward compatibility with old verifiers.
+    """
+    if format == "legacy":
+        return {"algorithm": "Ed25519", "public_key_pem": PUB_PEM, "version": VERSION}
+    return build_public_key_manifest()
+
+
 @app.get("/.well-known/aiauth-public-key")
-def public_key():
+def well_known_public_key():
+    """Legacy well-known path. Returns the CURRENT public key as a
+    single-key JSON for maximum compatibility with generic verifiers
+    that don't understand the manifest shape. Use /v1/public-key for
+    the full manifest."""
     return {"algorithm": "Ed25519", "public_key_pem": PUB_PEM, "version": VERSION}
 
 
