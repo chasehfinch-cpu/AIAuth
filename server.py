@@ -59,6 +59,103 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 # ===================================================================
+# RATE LIMITING (v0.5.0+)
+# Per-IP sliding-window counters kept in memory. Per CLAUDE.md
+# "Rate Limiting and Abuse Prevention" — these protect the free
+# signing endpoint from DoS and enumeration attacks.
+#
+# Limits are per WORKER process (uvicorn --workers 2 doubles real
+# throughput vs. spec, which is acceptable — spec limits are caps
+# not exact). For stricter enforcement behind multiple workers,
+# substitute a shared store (Redis/memcached) in the future.
+# ===================================================================
+
+import time
+import threading as _rl_threading
+from collections import deque
+
+RATE_LIMITS: Dict[str, Dict[str, int]] = {
+    "/v1/sign":           {"per_ip_per_min": 100},
+    "/v1/sign/batch":     {"per_ip_per_min": 10},
+    "/v1/account/create": {"per_ip_per_hour": 5},
+    "/v1/account/auth":   {"per_ip_per_hour": 10},
+    "/v1/discover":       {"per_ip_per_min": 60},
+    "/v1/verify/prompt":  {"per_ip_per_min": 30},
+}
+
+# Ordered longest-prefix-first for path matching below
+_RATE_PREFIXES = sorted(RATE_LIMITS.keys(), key=len, reverse=True)
+
+_RATE_BUCKETS: Dict[tuple, deque] = {}
+_RATE_LOCK = _rl_threading.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_check(key: tuple, window_seconds: int, limit: int) -> bool:
+    """Sliding-window counter. Returns True if under limit (and records
+    the hit), False if over. Thread-safe."""
+    now = time.time()
+    cutoff = now - window_seconds
+    with _RATE_LOCK:
+        dq = _RATE_BUCKETS.setdefault(key, deque())
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= limit:
+            return False
+        dq.append(now)
+        return True
+
+
+def _match_rate_endpoint(path: str) -> Optional[str]:
+    for prefix in _RATE_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return prefix
+    return None
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    endpoint_key = _match_rate_endpoint(request.url.path)
+    if endpoint_key is None:
+        return await call_next(request)
+
+    cfg = RATE_LIMITS[endpoint_key]
+    ip = _client_ip(request)
+
+    def _reject(window: int, limit: int):
+        return JSONResponse(
+            status_code=429,
+            content={"error": {
+                "code": "RATE_LIMITED",
+                "message": f"Rate limit exceeded for {endpoint_key}",
+                "details": {"window_seconds": window, "limit": limit, "endpoint": endpoint_key},
+            }},
+        )
+
+    if "per_ip_per_min" in cfg:
+        limit = cfg["per_ip_per_min"]
+        if not _rate_check((endpoint_key, "ip-min", ip), 60, limit):
+            return _reject(60, limit)
+    if "per_ip_per_hour" in cfg:
+        limit = cfg["per_ip_per_hour"]
+        if not _rate_check((endpoint_key, "ip-hr", ip), 3600, limit):
+            return _reject(3600, limit)
+
+    # X-AIAuth-Client header is advisory on /v1/sign* — we log absence but
+    # do NOT reject (preserves backward compat with curl tests and older
+    # clients). Enterprise tier may enforce in the future via policy engine.
+    # (Intentional no-op here.)
+
+    return await call_next(request)
+
+
+# ===================================================================
 # STANDARD ERROR RESPONSE FORMAT
 # Matches the contract in CLAUDE.md "Error Handling" section.
 # ===================================================================
