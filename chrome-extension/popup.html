@@ -12,6 +12,7 @@
       color: #1a1a1a;
     }
     h1 { font-size: 15px; margin: 0 0 4px; }
+    h1 .tag { font-size: 11px; color: #2563eb; background: #eff6ff; padding: 2px 6px; border-radius: 4px; font-weight: 500; margin-left: 6px; vertical-align: 1px; }
     .muted { color: #777; font-size: 11px; }
     .section { margin-top: 14px; }
     .section h2 {
@@ -45,11 +46,52 @@
     button.secondary { background: #eee; color: #111; }
     button.tiny { padding: 3px 7px; font-size: 11px; }
     button:disabled { opacity: 0.6; cursor: default; }
+    button.primary { background: #2563eb; }
     #status { font-size: 12px; margin-top: 8px; min-height: 16px; }
     .ok { color: #1a7f37; }
     .err { color: #b42318; }
     .row { display: flex; gap: 6px; }
     .row button { flex: 1; }
+
+    /* State containers — only one is visible at a time */
+    .state { display: none; }
+    .state.active { display: block; }
+
+    .panel {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 14px;
+      text-align: center;
+    }
+    .panel .head {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .panel .body {
+      font-size: 12px;
+      color: #555;
+      margin-bottom: 10px;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      padding: 2px 6px;
+      border-radius: 3px;
+      margin-left: 6px;
+      vertical-align: 1px;
+    }
+    .badge.free { background: #f3f4f6; color: #4b5563; }
+    .badge.enterprise { background: #eff6ff; color: #2563eb; }
+
+    .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 8px; }
+    .stat { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px; text-align: center; }
+    .stat .n { font-size: 18px; font-weight: 700; color: #111; }
+    .stat .lbl { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.4px; }
 
     #receipts { max-height: 180px; overflow-y: auto; border: 1px solid #eee; border-radius: 6px; }
     #receipts:empty::after {
@@ -72,6 +114,8 @@
     .rcpt-code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
     .rcpt-meta { color: #888; font-size: 11px; margin-top: 2px; }
     .rcpt-actions { display: flex; gap: 4px; }
+    .rcpt-status { font-size: 10px; color: #1a7f37; margin-left: 6px; }
+    .rcpt-status.pending { color: #b45309; }
     code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
     .drop {
       display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -82,45 +126,122 @@
     .drop-label { font-size: 13px; font-weight: 600; }
     .drop-sub { font-size: 11px; color: #888; margin-top: 4px; }
     .drop.busy { opacity: 0.7; pointer-events: none; }
+
+    details { margin-top: 12px; }
+    details summary { cursor: pointer; font-size: 12px; color: #2563eb; }
+    details[open] summary { margin-bottom: 8px; }
+    .footer {
+      margin-top: 14px;
+      padding-top: 10px;
+      border-top: 1px solid #eee;
+      font-size: 11px;
+      color: #888;
+      display: flex;
+      justify-content: space-between;
+    }
   </style>
 </head>
 <body>
-  <h1>AIAuth</h1>
-  <div class="muted">Ctrl+Shift+A on a supported AI site to attest selected text.</div>
+  <h1>AIAuth <span class="tag" id="versionTag">v0.5.0</span></h1>
 
-  <div class="section">
-    <h2>Recent receipts</h2>
-    <div id="receipts"></div>
-  </div>
-
-  <div class="section">
-    <h2>Settings</h2>
-    <label for="userId">Your email or name</label>
-    <input id="userId" type="text" placeholder="you@example.com" />
-    <label for="server">Server</label>
-    <input id="server" type="text" placeholder="https://aiauth.app" />
-    <div class="row" style="margin-top:8px;">
-      <button id="save">Save</button>
-      <button id="health" class="secondary">Check server</button>
+  <!-- STATE 1: NOT CONFIGURED -->
+  <div id="state1" class="state">
+    <div class="panel">
+      <div class="head">Chain of custody for AI work.</div>
+      <div class="body">Enter your email to get started. Free forever. No content leaves your machine.</div>
+      <label for="onboardEmail" style="text-align:left;">Your email</label>
+      <input id="onboardEmail" type="email" placeholder="you@example.com" />
+      <div class="row" style="margin-top:8px;">
+        <button id="onboardStart" class="primary">Get Started</button>
+      </div>
     </div>
   </div>
 
-  <div class="section">
-    <h2>Attest a file</h2>
-    <div id="drop" class="drop">
-      <span class="drop-label">Drop a file here, or click to choose</span>
-      <span class="drop-sub">Excel, PDF, Word, images — any file. Hashed locally, file never uploaded.</span>
+  <!-- STATE 2: AWAITING VERIFICATION -->
+  <div id="state2" class="state">
+    <div class="panel">
+      <div class="head">✉ Check your email</div>
+      <div class="body">We sent a link to <b id="pendingEmail"></b>. Click it within 15 minutes.</div>
+      <div class="body" style="font-size:11px;">Or paste the full link here:</div>
+      <input id="pasteLink" type="text" placeholder="https://aiauth.app/auth?token=..." />
+      <div class="row" style="margin-top:8px;">
+        <button id="useLink" class="primary">Verify</button>
+        <button id="resendLink" class="secondary">Resend</button>
+        <button id="changeEmail" class="secondary">Change email</button>
+      </div>
     </div>
-    <input id="filePicker" type="file" style="display:none" />
   </div>
 
-  <div class="section">
-    <h2>Attest pasted text</h2>
-    <textarea id="manual" placeholder="Paste AI output here"></textarea>
-    <button id="sign" style="margin-top:6px;">Attest text</button>
+  <!-- STATE 3 + 4: VERIFIED (State 4 adds org banner) -->
+  <div id="state3" class="state">
+    <div class="muted">
+      <b id="currentIdent">you@example.com</b>
+      <span id="tierBadge" class="badge free">Free</span>
+      <span id="orgBanner" style="display:none;"> · <b id="orgName"></b></span>
+    </div>
+    <div class="muted" style="margin-top:4px;">Ctrl+Shift+A on a supported AI site to attest selected text.</div>
+
+    <div class="stats">
+      <div class="stat"><div class="n" id="statToday">0</div><div class="lbl">Today</div></div>
+      <div class="stat"><div class="n" id="statTotal">0</div><div class="lbl">Total</div></div>
+      <div class="stat"><div class="n" id="statPending">0</div><div class="lbl">Pending</div></div>
+    </div>
+
+    <div class="section">
+      <h2>Recent receipts</h2>
+      <div id="receipts"></div>
+    </div>
+
+    <div class="section">
+      <h2>Attest a file</h2>
+      <div id="drop" class="drop">
+        <span class="drop-label">Drop a file here, or click to choose</span>
+        <span class="drop-sub">Excel, PDF, Word, images — hashed locally, file never uploaded.</span>
+      </div>
+      <input id="filePicker" type="file" style="display:none" />
+    </div>
+
+    <div class="section">
+      <h2>Attest pasted text</h2>
+      <textarea id="manual" placeholder="Paste AI output here"></textarea>
+      <button id="sign" style="margin-top:6px;">Attest text</button>
+    </div>
+
+    <details>
+      <summary>Settings</summary>
+      <label for="server">Server</label>
+      <input id="server" type="text" placeholder="https://aiauth.app" />
+      <div class="row" style="margin-top:8px;">
+        <button id="save">Save</button>
+        <button id="health" class="secondary">Check server</button>
+        <button id="logout" class="secondary">Log out</button>
+      </div>
+      <label style="margin-top:8px;">
+        <input type="checkbox" id="tierEnterprise" /> Enable enterprise-tier capture
+      </label>
+      <div class="muted" style="font-size:10px; margin-top:2px;">
+        Your organization manages this; change only if instructed.
+      </div>
+    </details>
+  </div>
+
+  <!-- STATE 5: SESSION EXPIRED -->
+  <div id="state5" class="state">
+    <div class="panel">
+      <div class="head">⚠ Session expired</div>
+      <div class="body">Log in again to manage your account. <b>Attestation still works</b> — press Ctrl+Shift+A as usual.</div>
+      <div class="row" style="margin-top:8px;">
+        <button id="reauthSend" class="primary">Send login link</button>
+      </div>
+    </div>
   </div>
 
   <div id="status"></div>
+
+  <div class="footer">
+    <span><a href="https://aiauth.app/guide" target="_blank" style="color:#2563eb;">Guide</a></span>
+    <span><a href="https://aiauth.app/check" target="_blank" style="color:#2563eb;">Verify a receipt</a></span>
+  </div>
 
   <script src="popup.js"></script>
 </body>
