@@ -3223,10 +3223,22 @@ def validate_license_endpoint(license_key: str = ""):
 
 @app.get("/", response_class=HTMLResponse)
 def homepage():
-    """Public homepage: what AIAuth is, how it works, verify link, commercial licensing."""
+    """Public homepage — wraps the index.html body fragment in the
+    shared site chrome (_site_shell) for consistency with every other
+    page. Piece B.2."""
     index_path = Path(__file__).parent / "index.html"
     if index_path.exists():
-        return HTMLResponse(index_path.read_text(encoding="utf-8"))
+        body = index_path.read_text(encoding="utf-8")
+        # Legacy index.html files (before Phase B) were self-contained
+        # HTML documents. Detect + fall back to serving raw if so.
+        if body.lstrip().startswith("<!DOCTYPE"):
+            return HTMLResponse(body)
+        return HTMLResponse(_site_shell(
+            "Chain of Custody for AI-Generated Work",
+            body,
+            active="home",
+            wide=True,
+        ))
     return HTMLResponse("<h1>AIAuth</h1><p>Homepage not yet deployed.</p>")
 
 @app.get("/logo.png")
@@ -3245,11 +3257,18 @@ def favicon():
 
 @app.get("/check", response_class=HTMLResponse)
 def verification_page():
-    """The public verification page — anyone can paste a receipt and verify it."""
+    """Public verification page — wraps the verify.html body fragment in
+    the shared site chrome (_site_shell) for consistency. Phase B.3."""
     verify_path = Path(__file__).parent / "verify.html"
     if verify_path.exists():
-        return HTMLResponse(verify_path.read_text(encoding="utf-8"))
-    return HTMLResponse("<h1>AIAuth</h1><p>Verification page not found. Place verify.html alongside server.py.</p>")
+        body = verify_path.read_text(encoding="utf-8")
+        # Legacy pre-Phase-B verify.html was self-contained; serve raw.
+        if body.lstrip().startswith("<!DOCTYPE"):
+            return HTMLResponse(body)
+        return HTMLResponse(_site_shell(
+            "Verify a Receipt", body, active="check",
+        ))
+    return HTMLResponse("<h1>AIAuth</h1><p>Verification page not found.</p>", status_code=404)
 
 
 @app.get("/demo", response_class=HTMLResponse)
@@ -3292,9 +3311,19 @@ def admin_dashboard_html():
         return HTMLResponse(tpl.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>Dashboard</h1><p>Template not deployed.</p>", status_code=404)
 
-def _page_shell(title: str, body_html: str, active: str = "") -> str:
-    """Shared page chrome matching index.html."""
+def _site_shell(title: str, body_html: str, active: str = "", wide: bool = False) -> str:
+    """Shared site chrome — single source of nav + footer for every
+    public page. Title Case throughout. Piece B.1.
+
+    Args:
+      title: inner <title> (gets " — AIAuth" suffix)
+      body_html: page content (already-formed HTML)
+      active: which nav item to highlight ("home" | "how" | "business" |
+              "guide" | "check" | "enterprise" | "")
+      wide: use wider content container (for dashboards, tables)
+    """
     def active_cls(key): return ' style="color:var(--text)"' if active == key else ""
+    inner_class = "container-wide" if wide else "container"
     return f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3317,6 +3346,8 @@ a:hover {{ text-decoration:underline; }}
 .nav-links a {{ color:var(--muted); }}
 .nav-cta {{ background:var(--accent); color:#fff !important; padding:8px 14px; border-radius:8px; font-weight:600; }}
 .nav-cta:hover {{ text-decoration:none; background:#1d4ed8; }}
+.nav-cta-outline {{ border:1px solid var(--border); color:var(--text) !important; padding:7px 12px; border-radius:8px; font-weight:600; }}
+.nav-cta-outline:hover {{ text-decoration:none; border-color:var(--accent); color:var(--accent) !important; }}
 .page {{ padding:64px 0 96px; }}
 .eyebrow {{ display:inline-flex; padding:6px 12px; background:var(--accent-soft); color:var(--accent); border-radius:999px; font-size:12px; font-weight:600; letter-spacing:0.02em; text-transform:uppercase; }}
 h1.page-title {{ font-size:clamp(30px,4vw,46px); line-height:1.1; font-weight:800; letter-spacing:-0.02em; margin-top:18px; }}
@@ -3343,26 +3374,37 @@ h1.page-title {{ font-size:clamp(30px,4vw,46px); line-height:1.1; font-weight:80
 footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px solid var(--border); }}
 .foot-inner {{ display:flex; justify-content:space-between; flex-wrap:wrap; gap:16px; }}
 .foot-inner a {{ color:var(--muted); margin-right:18px; }}
-@media (max-width:760px) {{ .nav-links {{ display:none; }} }}
+@media (max-width:760px) {{ .nav-links a:not(.nav-cta):not(.brand) {{ display:none; }} }}
 </style>
 </head><body>
 <nav class="nav"><div class="container-wide nav-inner">
   <a class="brand" href="/"><img src="/logo.png" alt="AIAuth"><span>AIAuth</span></a>
   <div class="nav-links">
-    <a href="/#how"{active_cls('how')}>How it works</a>
-    <a href="/#download"{active_cls('download')}>Download</a>
-    <a href="/guide"{active_cls('guide')}>User guide</a>
-    <a class="nav-cta" href="/check">Verify a receipt</a>
+    <a href="/#how-it-works"{active_cls('how')}>How It Works</a>
+    <a href="/#business"{active_cls('business')}>For Business</a>
+    <a href="/guide"{active_cls('guide')}>User Guide</a>
+    <a class="nav-cta-outline" href="/check"{active_cls('check')}>Verify a Receipt</a>
   </div>
 </div></nav>
-<main class="page"><div class="container">
+<main class="page"><div class="{inner_class}">
 {body_html}
 </div></main>
 <footer><div class="container-wide foot-inner">
   <div>&copy; 2026 Finch Business Services LLC · AIAuth</div>
-  <div><a href="/check">Verify</a><a href="/guide">User guide</a><a href="/public-key">Public key</a></div>
+  <div>
+    <a href="/privacy">Privacy</a>
+    <a href="/public-key">Public Key</a>
+    <a href="/enterprise-guide">Enterprise Guide</a>
+    <a href="https://github.com/chasehfinch-cpu/AIAuth" target="_blank" rel="noopener">GitHub</a>
+  </div>
 </div></footer>
 </body></html>"""
+
+
+# Backward-compat alias so older route handlers continue to work while
+# Phase B rewrites happen incrementally.
+def _page_shell(title: str, body_html: str, active: str = "") -> str:
+    return _site_shell(title, body_html, active=active)
 
 
 @app.get("/guide", response_class=HTMLResponse)
@@ -3388,80 +3430,98 @@ def user_guide():
 
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy_page():
-    body = """<span class="eyebrow">Privacy policy</span>
-<h1 class="page-title">AIAuth privacy policy</h1>
-<p class="lead">Short version: your content never leaves your device. AIAuth only sees a one-way cryptographic fingerprint (SHA-256 hash) of what you attest, and that fingerprint cannot be reversed into your original content.</p>
+    body = """<span class="eyebrow">Privacy Policy</span>
+<h1 class="page-title">Privacy Policy</h1>
+<p class="lead">Your content never leaves your device. We store hashes and ciphertext, not emails or files. If our server is compromised, an attacker should get nothing useful.</p>
 
 <div class="prose">
-<p style="color:var(--muted);font-size:13px">Last updated: April 21, 2026 · Operator: Finch Business Services LLC</p>
+<p style="color:var(--muted);font-size:13px">Last updated: April 22, 2026 · Operator: Finch Business Services LLC</p>
 
-<h2>What AIAuth does</h2>
-<p>AIAuth is a cryptographic attestation service. It lets you create tamper-evident receipts for AI-generated content that you produce or review. You interact with it through the AIAuth Chrome extension, a desktop app, or direct API calls.</p>
+<h2>What AIAuth Does</h2>
+<p>AIAuth creates tamper-proof receipts for AI-generated work. You interact with it through the Chrome extension, a desktop agent, or direct API calls. The free tier is anonymous by design; the Enterprise tier is self-hosted and runs on your own infrastructure.</p>
 
-<h2>What data AIAuth processes</h2>
-<h3>1. On your device (the Chrome extension)</h3>
-<p>The extension stores, locally in Chrome's <code>chrome.storage.local</code>, only what you explicitly enter or create:</p>
+<h2>What We Store on the Free Tier</h2>
+
+<h3>1. The anonymous hash registry</h3>
+<p>Every attested content hash gets a row in a six-column registry:</p>
 <ul>
-  <li>An identifier you enter (email address or name). Used inside your receipts so you can later prove you attested something. Never sent to AIAuth servers as a standalone record.</li>
-  <li>The server URL you configure (default <code>https://aiauth.app</code>).</li>
-  <li>Your receipts — the signed JSON for each attestation you create, kept so you can share or verify them later.</li>
+  <li><code>content_hash</code> — SHA-256 of your content (one-way; cannot be reversed)</li>
+  <li><code>receipt_id</code> — a random UUID</li>
+  <li><code>parent_hash</code> — the previous version's hash, for chain discovery</li>
+  <li><code>doc_id</code> — persistent document identifier</li>
+  <li><code>content_hash_canonical</code> — SHA-256 of the canonical text (enables cross-format chain: xlsx → csv → pdf)</li>
+  <li><code>registered_at</code> — timestamp</li>
 </ul>
-<p>This local data stays on your machine. Uninstalling the extension removes it.</p>
+<p>No email. No name. No content. No IP address. Nothing here identifies a person.</p>
 
-<h3>2. What the extension sends to the AIAuth server</h3>
-<p>When you attest content, the extension computes a SHA-256 hash of that content <em>in your browser</em>, then sends the following to the server's <code>/v1/sign</code> endpoint over HTTPS:</p>
+<h3>2. Email address and account_id — ONLY if you create an account</h3>
+<p>Creating an account is optional. You can use AIAuth without one — the Chrome extension's "Start Attesting" button enables attestation immediately. An account is only needed if you want to link email addresses across devices, verify your identity for cross-person chain-of-custody use cases, or manage consent for enterprise deployments.</p>
+<p>When you create an account, we store:</p>
 <ul>
-  <li>The SHA-256 hash (a 64-character hex string).</li>
-  <li>The identifier you entered (email or name).</li>
-  <li>A source string (for example <code>chrome-extension</code> or <code>file:yourfile.xlsx</code>).</li>
-  <li>For file attestations, an optional note containing filename, size, and MIME type so you can tell receipts apart in your own list.</li>
+  <li>An HMAC hash of your email (never the plaintext)</li>
+  <li>An account identifier</li>
+  <li>Timestamps (created, updated, verified)</li>
+  <li>A separate "domain" field (e.g. <code>acme.com</code>) for enterprise-domain matching</li>
 </ul>
-<p><strong>The original content is never transmitted.</strong> A SHA-256 hash is a one-way fingerprint — it cannot be reversed to recover your content.</p>
+<p>We cannot enumerate who is registered — the hash is salted with a server secret. The only way your email is linked to your account in our database is through the one-way hash.</p>
 
-<h3>3. What the AIAuth server stores</h3>
-<p>In public mode (the default mode at <code>aiauth.app</code>), the server stores only:</p>
+<h3>3. Authentication ephemera</h3>
+<p>For magic-link logins we store single-use nonces (to prevent token replay) and revoked session IDs (for logout). Both are auto-pruned. No long-lived identifiers.</p>
+
+<h2>What We Never Store on the Free Tier</h2>
 <ul>
-  <li>A minimal <em>hash registry</em>: the content hash, the receipt ID, an optional parent hash, and a timestamp. No user identifier, no content, no IP address, no session data.</li>
+  <li><strong>Your content.</strong> Only a SHA-256 hash is sent, and hashes are one-way.</li>
+  <li><strong>Plaintext emails.</strong> We hash with HMAC-SHA256 before writing to disk. Our own database dumps show 64-character hashes, not email addresses.</li>
+  <li><strong>Receipt contents.</strong> The full signed receipt is returned to your device; we sign and forget.</li>
+  <li><strong>Behavioral metadata.</strong> Time-to-attest, destinations, classifications, concurrent AI apps — none of these are captured on the free tier. (Enterprise customers opt in to these for their own dashboards, on their own servers.)</li>
+  <li><strong>Prompt text.</strong> If you attest AI output and we detect the prompt that produced it, only its one-way hash is recorded. We never see the prompt.</li>
 </ul>
-<p>The registry exists so that anyone holding the same content or a receipt code can confirm a receipt exists. It contains nothing that can identify a person.</p>
-<p>The full signed receipt (which <em>does</em> contain your identifier) is returned to your device and never persisted on the server.</p>
 
-<h2>What AIAuth does not do</h2>
+<h2>Data Hardening</h2>
+<p>If someone breaks into our server, they should get as little as possible. Concretely:</p>
 <ul>
-  <li>AIAuth does not read, store, or transmit the text or files you attest.</li>
-  <li>AIAuth does not track you across sites, log your browsing, or profile your activity.</li>
-  <li>AIAuth does not use analytics, cookies, trackers, or third-party SDKs in the extension.</li>
-  <li>AIAuth does not sell, rent, or share your data with any third party.</li>
-  <li>AIAuth does not use your data for advertising, credit scoring, or any purpose unrelated to producing and verifying the receipts you ask for.</li>
+  <li>Email addresses are stored as HMAC hashes, salted with a server secret.</li>
+  <li>Enterprise-tier user identifiers (<code>uid</code>) are stored as AES-GCM ciphertext; only an authenticated admin of the owning organization can decrypt them, and only at response time — never written to a log.</li>
+  <li>Consent-log details (who requested what access) are stored as AES-GCM ciphertext.</li>
+  <li>Magic-link emails are delivered via a transactional email provider (Resend) and never written to our filesystem. Local file logging of magic links is off by default.</li>
+  <li>The one residual risk is our private signing keys — losing them means receipts can't be verified, so we keep them on encrypted offline backups and rotate annually. A new signing key never invalidates historical receipts; the old public key stays in our key manifest for verification.</li>
 </ul>
 
-<h2>Server logs</h2>
-<p>The AIAuth web server (nginx + uvicorn) may write standard HTTP access logs containing request timestamps, paths, status codes, and IP addresses, for operational reliability and abuse prevention. These logs are rotated and are not used for marketing, analytics, or resale. They are not tied to any stored user profile because AIAuth does not maintain user profiles.</p>
+<h2>What Changes on the Enterprise Tier</h2>
+<p>AIAuth Enterprise is <strong>self-hosted</strong>. You run the server on your own infrastructure, your IT team manages the keys, and your employees' attestation data stays on your network. We never see it. Finch Business Services LLC is a software vendor, not a data processor, for enterprise deployments. Your organization's own privacy policy governs the data your server processes.</p>
 
-<h2>Third-party services</h2>
-<p>The AIAuth website loads fonts from Google Fonts for typography. When you visit a page on aiauth.app, your browser fetches these font files from Google's CDN; this is subject to Google's own privacy terms. No AIAuth data is transmitted to Google.</p>
-<p>The AIAuth Chrome extension itself does not load any third-party resources.</p>
+<h2>GDPR and Data Subject Rights</h2>
+<p>Because the hash registry contains no personally identifiable information, registry rows are not subject to GDPR — a hash cannot be traced to you.</p>
+<p>For accounts, you have the right to export, pseudonymize, or delete your data. Contact us at <a href="mailto:privacy@aiauth.app">privacy@aiauth.app</a> and we will respond within 30 days. In most cases, deleting your local data (by uninstalling the extension) and requesting account deletion is sufficient.</p>
 
-<h2>Enterprise / self-hosted deployments</h2>
-<p>Organizations running AIAuth in <code>enterprise</code> mode on their own infrastructure may configure the server to store full attestation records, including content hashes, user identifiers, review status, and timestamps, inside their own database. In that case, the operating organization — not Finch Business Services LLC — is the data controller, and their own privacy policy governs that data.</p>
-
-<h2>Your rights</h2>
+<h2>What We Don't Do</h2>
 <ul>
-  <li>Your local data: you can delete it by clearing the extension's storage from <code>chrome://extensions</code> or by uninstalling the extension.</li>
-  <li>Registered hashes: because the hash registry contains no identifying information, there is no personal data to access, correct, or delete. A hash cannot be traced to you.</li>
-  <li>If you contact us with a specific request, we will respond within 30 days.</li>
+  <li>No tracking across sites. No analytics. No ad pixels.</li>
+  <li>No third-party SDKs in the Chrome extension.</li>
+  <li>No selling, renting, or sharing of your data.</li>
+  <li>No scraping or retention of the content you attest.</li>
 </ul>
+
+<h2>Server Logs</h2>
+<p>Our reverse proxy (nginx) logs standard HTTP access records — timestamps, paths, status codes, IP addresses — for operational reliability and abuse prevention. These are rotated weekly and not linked to any user profile (because we don't maintain user profiles in the traditional sense).</p>
+
+<h2>Third-Party Services</h2>
+<p>Our website loads typography fonts from Google Fonts. When you visit a page on aiauth.app, your browser fetches font files from Google's CDN — subject to Google's own privacy terms. The Chrome extension loads no third-party resources.</p>
+<p>Our transactional email provider is <strong>Resend</strong>. They hold email-delivery metadata (recipient address, timestamp) for up to 30 days for deliverability diagnostics. We do not transmit anything else to them.</p>
 
 <h2>Children</h2>
 <p>AIAuth is not directed to children under 13 and does not knowingly collect information from them.</p>
 
-<h2>Changes to this policy</h2>
-<p>Material changes will be announced on this page, and the "last updated" date above will change. The public-mode data practices described here (content never transmitted, no identifying data stored server-side) are core to the product and will not change without a new major version.</p>
+<h2>Honest Reality</h2>
+<p>AIAuth is built by a one-person business. We offer no SLAs, no 24/7 support line, and no formal data-protection officer. What we offer is software that tries to be small, honest, and correct. If you have questions or concerns, you'll get a direct reply from a human within a few days.</p>
+
+<h2>Changes to This Policy</h2>
+<p>Material changes are announced on this page and the "last updated" date changes. The core guarantees (content never transmitted; no plaintext emails stored; no selling data) will never change without a new major version and explicit notice to existing account holders.</p>
 
 <h2>Contact</h2>
-<p>Questions, requests, or concerns: <a href="mailto:chase@finchbusinessserv.com">chase@finchbusinessserv.com</a>.</p>
+<p>Questions: <a href="mailto:privacy@aiauth.app">privacy@aiauth.app</a>. Security advisories: <a href="mailto:security@aiauth.app">security@aiauth.app</a>.</p>
 </div>"""
-    return HTMLResponse(_page_shell("Privacy", body, active=""))
+    return HTMLResponse(_site_shell("Privacy", body, active=""))
 
 
 @app.get("/public-key", response_class=HTMLResponse)
