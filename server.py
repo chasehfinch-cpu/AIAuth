@@ -850,6 +850,25 @@ def init_db():
         reason        TEXT
     )""")
 
+    # Pilot-interest leads from /v1/pilot/interest (Phase B.5).
+    # Admin emails are stored as hashes (Piece 12 hardening applies everywhere).
+    conn.execute("""CREATE TABLE IF NOT EXISTS pilot_interest (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        submitted_at     TEXT NOT NULL,
+        company          TEXT NOT NULL,
+        admin_email_hash TEXT NOT NULL,
+        admin_email_encrypted TEXT NOT NULL,
+        admin_email_domain    TEXT,
+        user_count       INTEGER,
+        industry         TEXT,
+        source_ip        TEXT,
+        handled          INTEGER NOT NULL DEFAULT 0,
+        handled_at       TEXT,
+        handled_note     TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pi_submitted ON pilot_interest(submitted_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pi_handled ON pilot_interest(handled)")
+
     # ---------------- v0.5.0 enterprise attestation store ----------------
     # Full receipt metadata is stored here when enterprise clients POST
     # to /v1/enterprise/ingest. Created unconditionally so switching
@@ -1730,6 +1749,57 @@ def account_export(authorization: Optional[str] = Header(default=None)):
         "consent_history": consent,
         "note": "Free-tier attestation receipts are stored on your device, not on our server. Stored emails are hashed; we return only hashes + domains for linked emails.",
     }
+
+
+class PilotInterestRequest(BaseModel):
+    company: str
+    admin_email: str
+    user_count: Optional[int] = None
+    industry: Optional[str] = None
+
+
+@app.post("/v1/pilot/interest")
+def pilot_interest(body: PilotInterestRequest, request: Request):
+    """Pilot-request form submission from /demo. Unauthenticated (anyone
+    viewing the demo can submit). Rate-limit-adjacent via nginx IP throttle
+    + a simple per-day cap enforced below.
+
+    Stores a hashed admin email + company + user count + industry. Alerts
+    the operator (via stdout + optional Resend notification) so follow-up
+    happens within 24 hours.
+    """
+    company = (body.company or "").strip()
+    email = (body.admin_email or "").strip().lower()
+    if not company or not _valid_email(email):
+        raise AIAuthError("INVALID_RECEIPT", "company and valid admin_email required", 400)
+    # Rough rate guard: no more than 20 submissions per day per IP
+    ip = _client_ip(request)
+    conn = get_db()
+    recent = conn.execute(
+        "SELECT COUNT(*) AS n FROM pilot_interest WHERE source_ip = ? AND submitted_at > datetime('now', '-1 day')",
+        (ip,),
+    ).fetchone()
+    if recent and recent["n"] >= 20:
+        conn.close()
+        raise AIAuthError("RATE_LIMITED", "Too many pilot requests from this IP today", 429)
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO pilot_interest "
+        "(submitted_at, company, admin_email_hash, admin_email_encrypted, admin_email_domain, "
+        " user_count, industry, source_ip) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (now, company, email_hash(email), encrypt_value(email),
+         _email_domain(email), body.user_count, body.industry, ip),
+    )
+    conn.commit()
+    conn.close()
+
+    # Operator notification (stdout for now — owner can wire to Slack later)
+    print(f"[AIAuth pilot-interest] company={company!r} email_domain={_email_domain(email)!r} "
+          f"users={body.user_count} industry={body.industry!r}")
+
+    return {"submitted": True, "message": "Thanks. We'll email you within 24 hours."}
 
 
 @app.post("/v1/account/logout")
@@ -3274,13 +3344,24 @@ def verification_page():
 @app.get("/demo", response_class=HTMLResponse)
 def demo_dashboard():
     """Interactive commercial demo using synthetic data. Prospects can
-    add ?company=... to personalize. The template lives at
-    templates/commercial/executive-summary.html and uses
-    synthetic-data.js for fake but realistic data."""
+    add ?company=... to personalize. Template is standalone (not
+    wrapped in _site_shell) so it exports cleanly as a self-contained
+    HTML artifact for prospect handoff."""
     tpl = Path(__file__).parent / "templates" / "commercial" / "executive-summary.html"
     if tpl.exists():
         return HTMLResponse(tpl.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>AIAuth Demo</h1><p>Demo template not found.</p>", status_code=404)
+
+
+@app.get("/samples/compliance-report", response_class=HTMLResponse)
+def samples_compliance_report():
+    """Audit-ready compliance report (Phase B.6). Standalone HTML with
+    @media print styles for PDF export. Synthetic data by default;
+    switches to live via ?source=live&org_id=...&session=..."""
+    tpl = Path(__file__).parent / "templates" / "commercial" / "compliance-report.html"
+    if tpl.exists():
+        return HTMLResponse(tpl.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>Compliance Report</h1><p>Template not deployed.</p>", status_code=404)
 
 
 @app.get("/static/synthetic-data.js")

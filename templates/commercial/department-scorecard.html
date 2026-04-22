@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AIAuth — Department Scorecard</title>
+  <style>
+    body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #fafafa; color: #0f172a; margin: 0; padding: 40px 24px; }
+    .container { max-width: 1080px; margin: 0 auto; }
+    h1 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.4px; }
+    .sub { color: #64748b; font-size: 13px; margin-bottom: 24px; }
+    .dept-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; margin-top: 16px; }
+    .dept-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 20px; cursor: pointer; transition: transform .15s, box-shadow .15s; }
+    .dept-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.06); }
+    .dept-head { display: flex; justify-content: space-between; align-items: flex-start; }
+    .dept-name { font-size: 17px; font-weight: 700; }
+    .dept-users { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
+    .grade { display: inline-block; width: 30px; height: 30px; line-height: 30px; text-align: center; font-weight: 700; font-size: 14px; border-radius: 50%; }
+    .grade.A { background: #dcfce7; color: #16a34a; }
+    .grade.B { background: #ecfccb; color: #65a30d; }
+    .grade.C { background: #fef3c7; color: #d97706; }
+    .grade.D, .grade.F { background: #fee2e2; color: #dc2626; }
+    .stat-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+    .stat { background: #f7f8fa; padding: 10px; border-radius: 6px; }
+    .stat .lbl { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat .n { font-size: 18px; font-weight: 700; margin-top: 2px; }
+    .tools-row { margin-top: 12px; font-size: 12px; color: #64748b; }
+    .tools-row strong { color: #0f172a; font-weight: 600; }
+    .viol-pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; margin-right: 6px; }
+    .viol-pill.crit { background: #fee2e2; color: #dc2626; }
+    .viol-pill.high { background: #fed7aa; color: #c2410c; }
+    .viol-pill.med { background: #fef3c7; color: #a16207; }
+    .viol-pill.low { background: #f1f5f9; color: #475569; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>Department Scorecard</h1>
+  <div class="sub"><span id="orgName">Your organization</span> · <span id="period">—</span></div>
+  <div class="dept-grid" id="grid"></div>
+</div>
+<script src="synthetic-data.js"></script>
+<script>
+  async function render() {
+    const qp = new URLSearchParams(location.search);
+    const opts = qp.get("company") ? { company: qp.get("company") } : {};
+    const d = window.AIAuthSynthetic.generateDashboardData(opts);
+    document.getElementById("orgName").textContent = d.meta?.org_name || "—";
+    document.getElementById("period").textContent = `${(d.meta?.date_range?.from || "").slice(0,10)} → ${(d.meta?.date_range?.to || "").slice(0,10)}`;
+    const grid = document.getElementById("grid");
+    const fmt = n => (n || 0).toLocaleString();
+    const pct = n => (Math.round((n || 0) * 1000) / 10).toFixed(1) + "%";
+    for (const dp of (d.by_department || [])) {
+      const topModels = (d.by_model || []).slice(0, 3).map(m => m.model).join(", ");
+      const v = dp.violations || {};
+      const card = document.createElement("div");
+      card.className = "dept-card";
+      card.innerHTML = `
+        <div class="dept-head">
+          <div><div class="dept-name">${dp.department}</div><div class="dept-users">${fmt(dp.unique_users)} users</div></div>
+          <div class="grade ${dp.grade}">${dp.grade}</div>
+        </div>
+        <div class="stat-row">
+          <div class="stat"><div class="lbl">Attestations</div><div class="n">${fmt(dp.total)}</div></div>
+          <div class="stat"><div class="lbl">Review Rate</div><div class="n">${pct(dp.review_rate)}</div></div>
+          <div class="stat"><div class="lbl">Rubber-stamp</div><div class="n">${pct(dp.rubber_stamp_rate)}</div></div>
+          <div class="stat"><div class="lbl">Avg TTA</div><div class="n">${dp.avg_tta != null ? dp.avg_tta + "s" : "—"}</div></div>
+        </div>
+        <div class="tools-row"><strong>Top tools:</strong> ${topModels}</div>
+        <div class="tools-row">
+          ${v.critical ? `<span class="viol-pill crit">${v.critical} critical</span>` : ""}
+          ${v.high ? `<span class="viol-pill high">${v.high} high</span>` : ""}
+          ${v.medium ? `<span class="viol-pill med">${v.medium} medium</span>` : ""}
+          ${v.low ? `<span class="viol-pill low">${v.low} low</span>` : ""}
+        </div>`;
+      grid.appendChild(card);
+    }
+  }
+  render();
+</script>
+</body>
+</html>

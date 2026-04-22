@@ -1,0 +1,93 @@
+<!doctype html>
+<!--
+  AIAuth Pilot Report — Placeholder Template
+  Used by scripts/render_pilot_report.py to produce a standalone
+  prospect-specific HTML file after a 30-day pilot. Placeholders use
+  Mustache-style braces {{...}} and are substituted at render time.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>AIAuth — {{ORG_NAME}} Pilot Report</title>
+  <style>
+    body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #fff; color: #0f172a; margin: 0; padding: 40px 24px; }
+    .container { max-width: 880px; margin: 0 auto; }
+    .eyebrow { font-size: 11px; color: #2563eb; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; }
+    h1 { font-size: 30px; margin: 4px 0 8px; letter-spacing: -0.4px; }
+    .sub { color: #64748b; font-size: 13px; margin-bottom: 28px; border-bottom: 1px solid #e5e7eb; padding-bottom: 16px; }
+    h2 { font-size: 18px; margin: 26px 0 10px; border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+    .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 12px 0; }
+    .kpi { background: #f7f8fa; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; text-align: center; }
+    .kpi .n { font-size: 24px; font-weight: 700; color: #0f172a; }
+    .kpi .l { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 3px; }
+    .callout { background: #eff6ff; border-left: 3px solid #2563eb; padding: 12px 16px; margin: 14px 0; font-size: 14px; color: #1e3a8a; border-radius: 0 6px 6px 0; }
+    .highlight { background: #dcfce7; border-left: 3px solid #16a34a; padding: 12px 16px; margin: 14px 0; font-size: 14px; color: #166534; border-radius: 0 6px 6px 0; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+    th { text-align: left; color: #64748b; font-weight: 600; font-size: 11px; text-transform: uppercase; padding: 8px 10px; border-bottom: 1px solid #e5e7eb; }
+    td { padding: 8px 10px; border-bottom: 1px solid #f1f5f9; }
+    .sig { margin-top: 32px; padding: 20px; background: #f7f8fa; border-radius: 8px; font-size: 12px; color: #64748b; }
+    @media print { body { padding: 24px 40px; } h2 { page-break-after: avoid; } .kpi-row, table { page-break-inside: avoid; } }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="eyebrow">30-Day Pilot Report</div>
+  <h1>{{ORG_NAME}}</h1>
+  <div class="sub">Pilot window: {{PILOT_START}} → {{PILOT_END}} · {{PILOT_DEPARTMENT}} department · Generated {{GENERATED_AT}}</div>
+
+  <div class="highlight">
+    <strong>Top line:</strong> {{HIGHLIGHT_TEXT}}
+  </div>
+
+  <h2>Attestation Volume</h2>
+  <div class="kpi-row">
+    <div class="kpi"><div class="n">{{TOTAL_ATTESTATIONS}}</div><div class="l">Attestations</div></div>
+    <div class="kpi"><div class="n">{{UNIQUE_USERS}}</div><div class="l">Unique Users</div></div>
+    <div class="kpi"><div class="n">{{AI_TOOLS}}</div><div class="l">AI Tools</div></div>
+    <div class="kpi"><div class="n">{{FILE_ATTESTATIONS}}</div><div class="l">File Attests</div></div>
+  </div>
+
+  <h2>Review Quality</h2>
+  <div class="kpi-row">
+    <div class="kpi"><div class="n">{{REVIEW_RATE}}</div><div class="l">Review Rate</div></div>
+    <div class="kpi"><div class="n">{{RUBBER_STAMP_COUNT}}</div><div class="l">Rubber-Stamp Alerts</div></div>
+    <div class="kpi"><div class="n">{{AVG_TTA}}</div><div class="l">Avg Time-to-Attest</div></div>
+    <div class="kpi"><div class="n">{{MEDIAN_TTA}}</div><div class="l">Median TTA</div></div>
+  </div>
+
+  <h2>Shadow AI & Governance</h2>
+  <div class="kpi-row">
+    <div class="kpi"><div class="n">{{SHADOW_AI_ALERTS}}</div><div class="l">Shadow AI Alerts</div></div>
+    <div class="kpi"><div class="n">{{AI_AUTHORED}}</div><div class="l">AI-Authored Artifacts</div></div>
+    <div class="kpi"><div class="n">{{EXTERNAL_EXPOSURE}}</div><div class="l">External Exposures</div></div>
+    <div class="kpi"><div class="n">{{CHAIN_INTEGRITY}}</div><div class="l">Chain Integrity</div></div>
+  </div>
+
+  <h2>Department Breakdown</h2>
+  {{DEPT_TABLE}}
+
+  <h2>Policy Violations Observed</h2>
+  {{VIOLATION_TABLE}}
+
+  <h2>Observations</h2>
+  {{OBSERVATIONS_LIST}}
+
+  <h2>Recommendations</h2>
+  {{RECOMMENDATIONS_LIST}}
+
+  <div class="callout">
+    <strong>Next steps:</strong> review the above with your IT/Compliance team. If you want to continue,
+    the same self-hosted server you've been running during the pilot continues to work with an annual
+    license. Contact sales@aiauth.app for pricing.
+  </div>
+
+  <div class="sig">
+    Prepared for {{ORG_NAME}} from metadata captured by the AIAuth Enterprise server on your infrastructure.
+    Finch Business Services LLC (software vendor) has no access to the data summarized here. All aggregations
+    are reproducible from your enterprise_attestations table using queries documented in the Admin Guide.
+    <br><br>
+    Report generated {{GENERATED_AT}} · Schema {{SCHEMA_VERSION}} · Pilot admin: {{ADMIN_EMAIL}}
+  </div>
+</div>
+</body>
+</html>
