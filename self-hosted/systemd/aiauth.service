@@ -1,0 +1,25 @@
+[Unit]
+Description=AIAuth Enterprise signing server
+After=network.target
+Documentation=https://github.com/chasehfinch-cpu/AIAuth
+
+[Service]
+Type=simple
+User=aiauth
+Group=aiauth
+WorkingDirectory=/opt/aiauth
+Environment=AIAUTH_CONFIG=/etc/aiauth/config.yaml
+ExecStartPre=/opt/aiauth/venv/bin/python /opt/aiauth/self-hosted/scripts/bootstrap.py --config /etc/aiauth/config.yaml
+ExecStart=/opt/aiauth/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8100 --workers 2
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aiauth /etc/aiauth
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

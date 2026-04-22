@@ -1,0 +1,82 @@
+# AIAuth Enterprise — Self-Hosted Configuration Template
+# Copy this to config.yaml, fill in the required fields, and run bootstrap.py.
+#
+# Every path is relative to this file unless absolute. Every secret is
+# generated at first startup if left empty. Edit, don't delete — comments
+# document the behaviour.
+
+# ---------- Required ----------
+
+# Your license key. You receive this from sales@aiauth.app after purchase.
+# Validated offline against AIAuth's public key; no phone-home.
+license_key: "PASTE-YOUR-LICENSE-KEY-HERE"
+
+# Your organization's identity.
+organization:
+  name: "Your Company Name"
+  # Email domains you own. Employees with emails at these domains who
+  # verify their address become members of your org automatically.
+  domains:
+    - "yourco.com"
+  # Primary administrator — used for license expiry warnings + security
+  # advisories. NOT stored in plaintext after initial org creation.
+  primary_admin_email: "it-admin@yourco.com"
+
+# The public URL your AIAuth server will be reachable at. Must match
+# your DNS + TLS cert. Used in magic-link email bodies.
+server_url: "https://aiauth.yourco.com"
+
+# ---------- Optional: email delivery ----------
+
+# For magic-link verification emails. If not configured, links log to
+# stdout (dev/test only). Recommended: Resend (https://resend.com).
+email:
+  provider: "resend"       # "resend" | "smtp" | "" (disabled)
+  api_key: ""              # Resend API key (starts with re_)
+  from_address: "auth@aiauth.yourco.com"
+
+# ---------- Optional: data paths ----------
+#
+# Defaults match the Docker image layout. Override for bare-metal installs.
+
+storage:
+  key_dir: "./keys"
+  app_db: "./aiauth.db"
+  registry_db: "./aiauth_registry.db"
+
+# ---------- Optional: secrets (auto-generated if empty) ----------
+#
+# SERVER_SECRET: HMAC secret for session tokens and email hashing.
+#                Rotating it requires the two-phase procedure in the
+#                Admin Guide (Section 2.5.4).
+# CLIENT_SECRET: HMAC secret for extension client_integrity validation.
+#                Must match the value embedded in the Chrome extension
+#                delivered to your users.
+#
+# Leave empty and bootstrap.py will generate random values at first run
+# and write them back to this file.
+
+secrets:
+  server_secret: ""
+  client_secret: ""
+
+# ---------- Optional: hardening + operational tuning ----------
+
+hardening:
+  # NEVER set to true in production. Dev-only opt-in for debugging
+  # magic-link delivery when email isn't wired up yet.
+  log_magic_links: false
+  # Deduplication window: same content_hash within this many seconds
+  # returns the existing receipt_id instead of creating a new one.
+  dedup_window_seconds: 300
+  # License grace period: after expiry, this many days before enterprise
+  # features gate off. Attestation signing always continues.
+  license_grace_days: 30
+
+rate_limits:
+  sign_per_ip_per_min: 100
+  sign_batch_per_ip_per_min: 10
+  account_create_per_ip_per_hour: 5
+  account_auth_per_ip_per_hour: 10
+  discover_per_ip_per_min: 60
+  verify_prompt_per_ip_per_min: 30

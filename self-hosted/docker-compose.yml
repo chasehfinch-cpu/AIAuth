@@ -1,0 +1,36 @@
+# AIAuth Enterprise — docker-compose for customer self-hosted deployment.
+#
+# Usage (from repo root):
+#   cp self-hosted/config.yaml.example config.yaml
+#   # Edit config.yaml: paste license_key, set organization + server_url
+#   docker compose -f self-hosted/docker-compose.yml up -d
+#
+# Persistent state lives in the aiauth_data named volume.
+
+services:
+  aiauth:
+    build:
+      context: ..
+      dockerfile: self-hosted/Dockerfile
+    image: aiauth-enterprise:0.5.1
+    container_name: aiauth
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    environment:
+      AIAUTH_CONFIG: /etc/aiauth/config.yaml
+    volumes:
+      # Mount config file (read-only)
+      - ../config.yaml:/etc/aiauth/config.yaml:ro
+      # Persistent storage: signing keys + databases
+      - aiauth_data:/var/lib/aiauth
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8100/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  aiauth_data:
+    driver: local
