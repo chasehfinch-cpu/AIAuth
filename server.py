@@ -3624,7 +3624,7 @@ footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px sol
     <a href="/privacy">Privacy</a>
     <a href="/public-key">Public Key</a>
     <a href="/enterprise-guide">Enterprise Guide</a>
-    <a href="https://github.com/chasehfinch-cpu/AIAuth" target="_blank" rel="noopener">GitHub</a>
+    <span style="color:#9aa0a6;cursor:not-allowed;" title="GitHub repo goes public with our first Chrome Web Store release.">GitHub (Coming Soon)</span>
   </div>
 </div></footer>
 </body></html>"""
