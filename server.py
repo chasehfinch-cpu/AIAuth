@@ -2046,11 +2046,32 @@ async def inbound_mail(request: Request):
         return {"forwarded": False, "reason": f"ignored event type: {event_type}"}
 
     data = payload.get("data") or payload
-    sender = (data.get("from") or data.get("From") or "").strip()
-    recipient = (data.get("to") or data.get("To") or "").strip()
-    subject = (data.get("subject") or data.get("Subject") or "(no subject)").strip()
+
+    def _first_addr(v) -> str:
+        """Resend sends `to` as a list of strings (and may send `from` as
+        a dict with an `email` field). Normalise any of those shapes to a
+        single address string."""
+        if not v:
+            return ""
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, list) and v:
+            return _first_addr(v[0])
+        if isinstance(v, dict):
+            return str(v.get("email") or v.get("address") or "").strip()
+        return ""
+
+    sender = _first_addr(data.get("from") or data.get("From"))
+    recipient = _first_addr(data.get("to") or data.get("To"))
+    subject_raw = data.get("subject") or data.get("Subject") or "(no subject)"
+    subject = str(subject_raw).strip() if subject_raw else "(no subject)"
     text_body = data.get("text") or data.get("Text") or ""
     html_body = data.get("html") or data.get("Html") or data.get("HTML") or ""
+    # Log event shape once per request so future shape changes are debuggable.
+    try:
+        print(f"[AIAuth inbound] event={event_type!r} top_keys={list(payload.keys())} data_keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+    except Exception:
+        pass
 
     # Loop guard: refuse to forward mail that claims to be from our own domain.
     if sender and "@aiauth.app" in sender.lower():
