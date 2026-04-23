@@ -869,6 +869,23 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pi_submitted ON pilot_interest(submitted_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pi_handled ON pilot_interest(handled)")
 
+    # Waitlist signups from the landing page (Stage 2a).
+    # Same hashing discipline as pilot_interest: email stored only as
+    # HMAC hash + Fernet ciphertext; plaintext lives only in the request
+    # handler. No IP-to-email linkage is retained beyond rate-limit windows.
+    conn.execute("""CREATE TABLE IF NOT EXISTS waitlist_signups (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        submitted_at    TEXT NOT NULL,
+        email_hash      TEXT NOT NULL UNIQUE,
+        email_encrypted TEXT NOT NULL,
+        email_domain    TEXT,
+        source_ip       TEXT,
+        notified        INTEGER NOT NULL DEFAULT 0,
+        notified_at     TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wl_submitted ON waitlist_signups(submitted_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wl_notified ON waitlist_signups(notified)")
+
     # ---------------- v0.5.0 enterprise attestation store ----------------
     # Full receipt metadata is stored here when enterprise clients POST
     # to /v1/enterprise/ingest. Created unconditionally so switching
@@ -1800,6 +1817,58 @@ def pilot_interest(body: PilotInterestRequest, request: Request):
           f"users={body.user_count} industry={body.industry!r}")
 
     return {"submitted": True, "message": "Thanks. We'll email you within 24 hours."}
+
+
+class WaitlistRequest(BaseModel):
+    email: str
+
+
+@app.post("/v1/waitlist")
+def waitlist_signup(body: WaitlistRequest, request: Request):
+    """Capture a waitlist email from the landing-page hero form.
+
+    Same data-hardening rules as pilot_interest: email is hashed (HMAC) as
+    the unique index and Fernet-encrypted for later admin decryption when we
+    send the "extension is live" broadcast. Plaintext email exists only for
+    the duration of this request handler; it is not logged, not echoed back
+    in responses, and not written to disk anywhere except the encrypted
+    column. No confirmation email is sent in the waitlist flow — we spare
+    the user the magic-link double-opt-in dance until they have a reason to
+    authenticate (i.e., the extension is live).
+    """
+    email = (body.email or "").strip().lower()
+    if not _valid_email(email):
+        raise AIAuthError("INVALID_RECEIPT", "valid email required", 400)
+
+    ip = _client_ip(request)
+    conn = get_db()
+    # Loose per-IP cap to deter mass-signup abuse.
+    recent = conn.execute(
+        "SELECT COUNT(*) AS n FROM waitlist_signups "
+        "WHERE source_ip = ? AND submitted_at > datetime('now', '-1 day')",
+        (ip,),
+    ).fetchone()
+    if recent and recent["n"] >= 10:
+        conn.close()
+        raise AIAuthError("RATE_LIMITED", "Too many waitlist signups from this IP today", 429)
+
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.execute(
+            "INSERT INTO waitlist_signups "
+            "(submitted_at, email_hash, email_encrypted, email_domain, source_ip) "
+            "VALUES (?,?,?,?,?)",
+            (now, email_hash(email), encrypt_value(email), _email_domain(email), ip),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Email already on the waitlist — idempotent success, don't leak
+        # enumeration signal to the caller.
+        pass
+    conn.close()
+
+    print(f"[AIAuth waitlist] email_domain={_email_domain(email)!r}")
+    return {"submitted": True, "message": "You're on the list. We'll email when the extension ships."}
 
 
 @app.post("/v1/account/logout")

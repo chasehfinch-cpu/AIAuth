@@ -34,3 +34,22 @@ receipts/
 build/
 dist/
 *.spec
+
+# Internal planning / scratch — never publish
+plans/
+*_plan.md
+*_audit.md
+RELEASE_NOTES_*.md
+
+# Sales-only templates — never publish
+templates/commercial/department-scorecard.html
+templates/commercial/tool-adoption.html
+templates/commercial/pilot-report-template.html
+
+# Chrome Web Store submission bundle — contains draft listing copy
+chrome-webstore-submission/
+
+# Self-hosted runtime state — only the example config is public
+self-hosted/config.yaml
+self-hosted/**/keys/
+self-hosted/**/data/

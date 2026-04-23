@@ -1,104 +1,105 @@
 # AIAuth
 
-**Notarize your AI work. Prove you reviewed it. Own your data.**
+**Chain of Custody for AI-Generated Work.**
 
-## For Everyone
+AIAuth creates a tamper-proof receipt for AI-generated content you select,
+proving what AI helped write it and that a human reviewed it. Your content
+never leaves your machine — only a SHA-256 fingerprint is sent to the signing
+server.
 
-AIAuth creates a tamper-proof receipt every time you take responsibility
-for AI-generated content. Think of it like a digital notary stamp.
-
-**Install and start in 30 seconds:**
-
-- **Chrome users** → Install from the Chrome Web Store → press Ctrl+Shift+A on any AI text
-- **Windows users** → Install from the Microsoft Store → press Ctrl+Shift+A anywhere
-
-**What it does:** You copy AI output. You press Ctrl+Shift+A. AIAuth creates
-a signed receipt and puts a code like `[AIAuth:a1b2c3d4]` in your clipboard.
-Paste that code wherever you deliver the work.
-
-**What it proves:** Anyone with that receipt can verify that you reviewed
-this specific content, on this date, and (if applicable) which AI helped
-create it.
-
-**What it doesn't do:** AIAuth never sees your actual content. Only a
-fingerprint is used. Your receipts are stored on YOUR computer, not on
-any server.
-
-**Full user guide:** Read docs/USER_GUIDE.md — written in plain English,
-no technical knowledge required.
-
-**Verify a receipt:** Go to aiauth.app/check — paste a receipt, see who
-attested what and when.
+Live at **[aiauth.app](https://www.aiauth.app)**.
 
 ---
 
-## How Chains Work
+## What It Is
 
-Content gets passed around. AIAuth tracks the full history automatically.
+- A Chrome extension + optional Windows desktop agent that attests AI output
+  with one keystroke.
+- A stateless Ed25519 signing server that returns a signed receipt.
+- A public anonymous registry that enables chain-of-custody verification
+  without storing any content, behavioral metadata, or identifiable user data.
+- A receipt format designed to be verifiable offline with the published
+  public key.
 
-```
-  Sarah creates a draft with Claude → Receipt #1
-       ↓
-  Mike edits it → Receipt #2 (links to #1)
-       ↓
-  Consultant enhances with GPT-4o → Receipt #3 (links to #2)
-       ↓
-  CFO approves final version → Receipt #4 (links to #3)
-```
+## What It Isn't
 
-Each receipt links to the previous one. The chain is tamper-evident —
-change any link and the whole chain breaks. Verify a full chain at
-aiauth.app/check by pasting all receipts as a JSON array.
+- Not an AI-content *detector* (those guess; AIAuth is a voluntary,
+  cryptographic answer).
+- Not an AI *governance* platform (governance manages the model; AIAuth
+  attests the output).
+- Not a surveillance tool. The free tier captures zero behavioral metadata.
+  Enterprise tier captures work-metadata under contract, on customer-owned
+  infrastructure.
+
+## How to Use
+
+### Verify a receipt (no install needed)
+
+Paste a receipt at **[aiauth.app/check](https://www.aiauth.app/check)**.
+Verification runs client-side against the published public key.
+
+### Attest content (closed beta)
+
+The Chrome extension is in closed beta pending Chrome Web Store review. Join
+the waitlist at [aiauth.app](https://www.aiauth.app) to be emailed when it
+ships. In the meantime, the unpacked extension can be loaded from
+`chrome-extension/` for developer testing.
+
+### Self-host the server (enterprise)
+
+See `self-hosted/README.md`. One `config.yaml`, two supported install routes
+(Docker Compose or a Python `install.sh`). Your data stays on your
+infrastructure — AIAuth the company cannot see it.
 
 ---
 
-## For Developers
-
-AIAuth is a stateless Ed25519 signing authority. Three endpoints:
+## Repository Layout
 
 ```
-POST /v1/sign          → Hash in, signed receipt out, server forgets
-POST /v1/verify        → Receipt in, valid Y/N out
-POST /v1/verify/chain  → Receipts in, chain intact Y/N out
+server.py                   Stateless signing server + enterprise endpoints
+index.html / verify.html    Site fragments wrapped by server.py (_site_shell)
+aiauth.py                   Windows desktop agent (clipboard + file attest)
+chrome-extension/           Browser extension source
+self-hosted/                Docker / Python deployment bundle for enterprises
+docs/                       User guide, enterprise guides, receipt spec
+templates/commercial/       Demo dashboard templates
+litellm-plugin/             LiteLLM callback for API-level attestation
 ```
 
-Verify receipts offline using the public key at
-`/.well-known/aiauth-public-key`. No API call needed.
+## Documentation
 
-**Quick start:**
-```bash
-pip install fastapi uvicorn cryptography
-uvicorn server:app --port 8100
-```
+- **User Guide** — [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)
+- **Receipt Format Spec** — [`docs/RECEIPT_SPEC.md`](docs/RECEIPT_SPEC.md)
+- **Enterprise Admin Guide** — [`docs/ENTERPRISE_ADMIN_GUIDE.md`](docs/ENTERPRISE_ADMIN_GUIDE.md)
+- **Enterprise User Guide** — [`docs/ENTERPRISE_USER_GUIDE.md`](docs/ENTERPRISE_USER_GUIDE.md)
+- **API Reference** — [aiauth.app/docs](https://www.aiauth.app/docs) (FastAPI auto-generated)
 
-**API docs:** aiauth.app/docs
-
----
-
-## For Companies
-
-Enterprise mode adds centralized storage, review history,
-chain queries, and compliance dashboards. Self-host or let us
-host it for you.
+## Developer Quickstart
 
 ```bash
-AIAUTH_MODE=enterprise AIAUTH_LICENSE_KEY=your-key uvicorn server:app --port 8100
+pip install -r requirements.txt
+uvicorn server:app --host 127.0.0.1 --port 8100
+curl http://127.0.0.1:8100/health
 ```
 
-Contact hello@aiauth.app for enterprise licensing.
+See the FastAPI docs at `http://127.0.0.1:8100/docs` for the full endpoint
+surface.
+
+## Security
+
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md) — please do not
+file public issues for security-relevant findings.
+
+## License
+
+Core server, Chrome extension, desktop agent, and receipt spec are licensed
+under **Apache 2.0** (see [`LICENSE`](LICENSE)).
+
+The `self-hosted/` deployment bundle is licensed under **Business Source
+License 1.1** (see [`self-hosted/LICENSE.BUSL`](self-hosted/LICENSE.BUSL)) —
+customers can run it for their own use; offering it as a managed service to
+third parties requires a commercial license until the BUSL change date.
 
 ---
 
-## Project Files
-
-```
-server.py              Server (signing authority + enterprise)
-verify.html            Public verification page (aiauth.app/check)
-desktop-agent/         Windows system tray app
-chrome-extension/      Chrome Web Store extension
-docs/USER_GUIDE.md     Plain-English user guide
-```
-
----
-
-Apache 2.0 — Finch Business Services LLC — aiauth.app
+Operated by Finch Business Services LLC. `hello@aiauth.app`
