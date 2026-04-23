@@ -2120,21 +2120,51 @@ async def inbound_mail(request: Request):
         html_body = html_body[:MAX] + "<p><em>[truncated — original exceeded 100 KB]</em></p>"
         truncated = True
 
+    # Metadata we want to surface in the forwarded notification so the
+    # operator can jump straight to the full message in the Resend
+    # dashboard if they need the body. Resend's inbound storage is
+    # dashboard-only today (GET /emails/{id} returns 403 for inbound),
+    # so these IDs are the link between the Gmail notification and the
+    # full original.
+    email_id = str(data.get("email_id") or data.get("id") or "").strip()
+    message_id = str(data.get("message_id") or "").strip()
+    resend_url = f"https://resend.com/emails/{email_id}" if email_id else ""
+    fallback_note = ""
+    if not text_body and not html_body:
+        fallback_note = (
+            "\n[Body not included in this notification — open in Resend to read the full message.]"
+        )
+        html_fallback_note = (
+            "<p style='font-size:13px;color:#64748b;margin:0 0 12px;'><em>"
+            "Body not included in this notification — "
+            f"<a href='{resend_url}'>open in Resend</a> to read the full message."
+            "</em></p>"
+        )
+    else:
+        html_fallback_note = ""
+
     prefix = (
         f"Forwarded from {recipient or 'unknown'} on aiauth.app.\n"
         f"Original From: {sender or '(unknown)'}\n"
         f"Original Subject: {subject}\n"
+        f"Resend email ID: {email_id or '(unavailable)'}\n"
+        f"Original Message-ID: {message_id or '(unavailable)'}\n"
+        f"{'Full message: ' + resend_url if resend_url else ''}\n"
         f"{'— TRUNCATED — ' if truncated else ''}"
         f"────────────────────────────────────\n\n"
+        f"{fallback_note}"
     )
     html_prefix = (
         f"<p style='font-family:system-ui,sans-serif;font-size:12px;color:#64748b;"
         f"background:#f1f5f9;padding:10px 14px;border-radius:6px;margin:0 0 16px;'>"
         f"Forwarded from <b>{recipient or 'unknown'}</b> on aiauth.app.<br>"
         f"Original From: <b>{sender or '(unknown)'}</b><br>"
-        f"Original Subject: <b>{subject}</b>"
+        f"Original Subject: <b>{subject}</b><br>"
+        f"Resend ID: <code style='font-size:11px;'>{email_id or '(unavailable)'}</code>"
+        f"{'<br><a href=\"' + resend_url + '\">View full message in Resend →</a>' if resend_url else ''}"
         f"{'<br><b>TRUNCATED</b>' if truncated else ''}"
         f"</p>"
+        f"{html_fallback_note}"
     )
 
     forward_subject = f"[fwd: {recipient or 'aiauth.app'}] {subject}"
