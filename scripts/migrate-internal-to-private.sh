@@ -53,8 +53,15 @@ echo "Staging directory: $STAGE_DIR"
 # -------------------------------------------------------------------
 echo
 echo "=== Secret scan ==="
-PATTERN='(AIAUTH_MASTER_KEY=|SERVER_SECRET=[a-f0-9]{20,}|CLIENT_SECRET=[a-f0-9]{20,}|RESEND_API_KEY=re_[A-Za-z0-9_-]{10,}|-----BEGIN (OPENSSH|RSA|EC|DSA|PRIVATE))'
-HITS=$(git log -p --all 2>/dev/null | grep -E -i "$PATTERN" | head -5 || true)
+# Each branch requires a realistic value after the variable name, so the
+# scanner cannot match its own pattern definition (the previous version
+# flagged this script itself as a false positive). Exclude this script
+# file from the scan for extra safety.
+PATTERN='(AIAUTH_MASTER_KEY=[A-Za-z0-9_+/=-]{16,}|SERVER_SECRET=[a-f0-9]{20,}|CLIENT_SECRET=[a-f0-9]{20,}|RESEND_API_KEY=re_[A-Za-z0-9_-]{10,}|-----BEGIN (OPENSSH|RSA|EC|DSA|PRIVATE))'
+HITS=$(git log -p --all 2>/dev/null \
+  | grep -E -i "$PATTERN" \
+  | grep -v 'migrate-internal-to-private' \
+  | head -5 || true)
 if [[ -n "$HITS" ]]; then
   echo "ABORT: secret material found in git history. Rotate these on production FIRST, then re-run."
   echo "$HITS"
