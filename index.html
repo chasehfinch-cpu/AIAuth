@@ -136,19 +136,32 @@
     if (!form) return;
     form.addEventListener("submit", function (e) {
       e.preventDefault();
+      var submitBtn = form.querySelector('button[type="submit"]');
+      if (submitBtn && submitBtn.disabled) return;  // debounce double-click / double-enter
+      if (submitBtn) { submitBtn.disabled = true; submitBtn.dataset.origText = submitBtn.textContent; submitBtn.textContent = "Joining…"; }
       ok.style.display = "none";
       err.style.display = "none";
       var email = document.getElementById("waitlist-email").value.trim();
-      if (!email || email.indexOf("@") < 1) { err.textContent = "Please enter a valid email address."; err.style.display = "block"; return; }
+      if (!email || email.indexOf("@") < 1) {
+        err.textContent = "Please enter a valid email address."; err.style.display = "block";
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = submitBtn.dataset.origText || "Join the Waitlist"; }
+        return;
+      }
       fetch("/v1/waitlist", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email })
       }).then(function (r) {
-        if (r.ok) { echo.textContent = email; ok.style.display = "block"; form.reset(); }
-        else { err.textContent = "Something went wrong. Please try again in a moment."; err.style.display = "block"; }
+        if (r.ok) {
+          echo.textContent = email; ok.style.display = "block"; form.reset();
+          // Leave the submit button disabled on success to prevent accidental resubmits
+        } else {
+          err.textContent = "Something went wrong. Please try again in a moment."; err.style.display = "block";
+          if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = submitBtn.dataset.origText || "Join the Waitlist"; }
+        }
       }).catch(function () {
         err.textContent = "Network error. Please try again."; err.style.display = "block";
+        if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = submitBtn.dataset.origText || "Join the Waitlist"; }
       });
     });
   })();

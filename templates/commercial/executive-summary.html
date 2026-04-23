@@ -277,6 +277,9 @@
       if (!form) return;
       form.addEventListener("submit", async (e) => {
         e.preventDefault();
+        const submitBtn = form.querySelector('button[type="submit"]');
+        if (submitBtn && submitBtn.disabled) return;  // debounce double-click / double-enter
+        if (submitBtn) { submitBtn.disabled = true; submitBtn.dataset.origText = submitBtn.textContent; submitBtn.textContent = "Submitting…"; }
         status.textContent = "Submitting…";
         status.style.color = "#64748b";
         const fd = new FormData(form);
@@ -297,13 +300,16 @@
             status.textContent = "Thanks — we'll email you within 24 hours with your license key and install package.";
             status.style.color = "#16a34a";
             form.reset();
+            // Leave the submit button disabled after a successful submission to prevent accidental resubmits
           } else {
             status.textContent = "Couldn't submit: " + (data.error?.message || res.status);
             status.style.color = "#dc2626";
+            if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = submitBtn.dataset.origText || "Submit"; }
           }
         } catch(err) {
           status.textContent = "Network error: " + err.message;
           status.style.color = "#dc2626";
+          if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = submitBtn.dataset.origText || "Submit"; }
         }
       });
     })();
