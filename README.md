@@ -2,6 +2,11 @@
 
 **Chain of Custody for AI-Generated Work.**
 
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Self-hosted: BUSL 1.1](https://img.shields.io/badge/self--hosted-BUSL--1.1-purple.svg)](self-hosted/LICENSE.BUSL)
+[![Version: v0.5.0](https://img.shields.io/badge/version-v0.5.0-green.svg)](https://github.com/chasehfinch-cpu/AIAuth/releases/tag/v0.5.0)
+[![Website: aiauth.app](https://img.shields.io/badge/website-aiauth.app-black.svg)](https://www.aiauth.app)
+
 AIAuth creates a tamper-proof receipt for AI-generated content you select,
 proving what AI helped write it and that a human reviewed it. Your content
 never leaves your machine — only a SHA-256 fingerprint is sent to the signing
