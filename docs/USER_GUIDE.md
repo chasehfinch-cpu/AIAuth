@@ -258,7 +258,7 @@ AIAuth offers an enterprise mode with:
 - Chain visualization across the organization
 - Audit export for regulators
 
-Contact chase@finchbusinessserv.com for enterprise licensing.
+Contact sales@aiauth.app for enterprise licensing.
 
 ---
 
