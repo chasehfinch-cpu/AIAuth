@@ -1109,6 +1109,38 @@ def _send_magic_link(email: str, token: str, purpose: str) -> None:
             pass
 
 
+def _notify_operator(subject: str, text: str) -> None:
+    """Send a plaintext email to the operator address (AIAUTH_OPERATOR_EMAIL).
+
+    Used for low-volume event notifications: new waitlist signups, new
+    pilot-interest submissions, and similar. No-ops silently if either
+    AIAUTH_OPERATOR_EMAIL or RESEND_API_KEY is missing — this keeps dev
+    environments quiet and makes operator email a configuration opt-in
+    rather than a hard dependency.
+
+    Failures are caught and logged to stdout; they never propagate to the
+    HTTP response of the event that triggered the notification. A signup
+    that fails to notify the operator is still a successful signup from
+    the user's perspective, and shows up in the database either way.
+    """
+    to_addr = os.getenv("AIAUTH_OPERATOR_EMAIL", "").strip()
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not to_addr or not api_key:
+        return
+    try:
+        import resend
+        resend.api_key = api_key
+        resend.Emails.send({
+            "from": os.getenv("RESEND_FROM", "AIAuth <auth@aiauth.app>"),
+            "to": to_addr,
+            "subject": subject,
+            "text": text,
+        })
+        print(f"[AIAuth operator-notify] sent subject={subject!r} to_domain={to_addr.split('@')[-1]!r}")
+    except Exception as exc:
+        print(f"[AIAuth operator-notify] delivery failed: {type(exc).__name__}")
+
+
 def _require_session(authorization: Optional[str]) -> dict:
     """Resolve a Bearer session token into its payload. Raises AIAuthError
     on missing/invalid/revoked sessions."""
@@ -1812,9 +1844,23 @@ def pilot_interest(body: PilotInterestRequest, request: Request):
     conn.commit()
     conn.close()
 
-    # Operator notification (stdout for now — owner can wire to Slack later)
+    # Operator notification (stdout + Resend email when configured)
     print(f"[AIAuth pilot-interest] company={company!r} email_domain={_email_domain(email)!r} "
           f"users={body.user_count} industry={body.industry!r}")
+    _notify_operator(
+        subject=f"[AIAuth] New pilot request: {company}",
+        text=(
+            f"A new enterprise pilot request was submitted.\n\n"
+            f"Company:    {company}\n"
+            f"Admin:      {email}\n"
+            f"Domain:     {_email_domain(email)}\n"
+            f"User count: {body.user_count}\n"
+            f"Industry:   {body.industry}\n"
+            f"Source IP:  {ip}\n"
+            f"Timestamp:  {now}\n\n"
+            f"Follow up within 24 hours per the /demo form promise.\n"
+        ),
+    )
 
     return {"submitted": True, "message": "Thanks. We'll email you within 24 hours."}
 
@@ -1868,6 +1914,19 @@ def waitlist_signup(body: WaitlistRequest, request: Request):
     conn.close()
 
     print(f"[AIAuth waitlist] email_domain={_email_domain(email)!r}")
+    _notify_operator(
+        subject=f"[AIAuth] New waitlist signup: {email}",
+        text=(
+            f"A new user joined the AIAuth waitlist.\n\n"
+            f"Email:      {email}\n"
+            f"Domain:     {_email_domain(email)}\n"
+            f"Source IP:  {ip}\n"
+            f"Timestamp:  {now}\n\n"
+            f"View full list:\n"
+            f"  ssh root@<server> \"sqlite3 /opt/aiauth/aiauth.db "
+            f"'SELECT COUNT(*) FROM waitlist_signups'\"\n"
+        ),
+    )
     return {"submitted": True, "message": "You're on the list. We'll email when the extension ships."}
 
 
