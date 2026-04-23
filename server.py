@@ -3822,6 +3822,102 @@ def privacy_page():
     return HTMLResponse(_site_shell("Privacy", body, active=""))
 
 
+@app.get("/auth", response_class=HTMLResponse)
+def auth_landing(token: Optional[str] = None, p: Optional[str] = None):
+    """Magic-link landing page.
+
+    The email sent by `_send_magic_link` routes recipients here. The token
+    itself is exchanged for a session via `POST /v1/account/verify` — this
+    page drives that exchange client-side so the token never leaves the
+    user's browser except to our own verify endpoint.
+
+    Two user paths:
+      1. Extension user: instructed to copy the current URL back into the
+         AIAuth extension popup's "Paste link" field. The extension then
+         handles the exchange and stores the session in chrome.storage.
+      2. Browser-only user: clicks "Complete Sign-In Here" to exchange the
+         token inline. The resulting session token is displayed and can be
+         copied into the extension settings, or retained in sessionStorage
+         for subsequent account-management calls from the website.
+
+    The token is single-use. If the user already completed sign-in from
+    the extension, clicking this page afterwards will show "already used."
+    """
+    purpose = (p or "").strip()
+    purpose_label = {
+        "login": "Sign in to AIAuth",
+        "verify_email": "Verify your AIAuth email",
+        "link_email": "Link this email to your AIAuth account",
+    }.get(purpose, "Complete your AIAuth sign-in")
+
+    has_token = bool(token and token.strip())
+    body = f"""<span class="eyebrow">Magic link</span>
+<h1 class="page-title">{purpose_label}</h1>
+<p class="lead">Your single-use sign-in link is ready. Finish the sign-in where you started it.</p>
+
+<div style="margin-top:28px;padding:20px;background:var(--panel);border:1px solid var(--border);border-radius:12px;">
+  <h2 style="margin:0 0 8px;font-size:16px;font-weight:700;">Using the AIAuth extension?</h2>
+  <p style="margin:0;font-size:14px;color:var(--muted);line-height:1.55;">Copy the entire URL from your browser's address bar, open the extension popup, and paste it into the <b>Paste link</b> field. Your extension will complete sign-in and you'll be ready to attest.</p>
+</div>
+
+<div style="margin-top:16px;padding:20px;background:#fff;border:1px solid var(--border);border-radius:12px;">
+  <h2 style="margin:0 0 8px;font-size:16px;font-weight:700;">Signing in from the browser only?</h2>
+  <p style="margin:0 0 14px;font-size:14px;color:var(--muted);line-height:1.55;">Click the button below to complete sign-in here. This stores a session token in this browser so you can manage your account at aiauth.app — you'll still need the extension to attest content.</p>
+  <button id="complete-btn" class="btn btn-primary" style="padding:10px 18px;font-size:14px;font-weight:600;border-radius:10px;border:none;background:var(--accent);color:#fff;cursor:pointer;"{' disabled' if not has_token else ''}>Complete Sign-In Here</button>
+  <div id="auth-result" style="margin-top:16px;font-size:14px;"></div>
+</div>
+
+<p style="margin-top:20px;font-size:13px;color:var(--muted);">Links expire 15 minutes after we send them, and each can be used only once. If your link has expired, request a fresh one from the extension popup or <a href="/">the home page</a>.</p>
+
+<script>
+  (function () {{
+    var btn = document.getElementById("complete-btn");
+    var out = document.getElementById("auth-result");
+    if (!btn) return;
+    var url = new URL(window.location.href);
+    var token = url.searchParams.get("token");
+    if (!token) {{
+      out.innerHTML = '<span style="color:#991b1b;">No token found in URL. Please use the most recent email link we sent you.</span>';
+      btn.disabled = true;
+      return;
+    }}
+    btn.addEventListener("click", function () {{
+      btn.disabled = true;
+      btn.textContent = "Completing…";
+      out.innerHTML = "";
+      fetch("/v1/account/verify", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ token: token }})
+      }}).then(function (r) {{
+        return r.json().then(function (data) {{ return {{ ok: r.ok, data: data }}; }});
+      }}).then(function (result) {{
+        if (!result.ok) {{
+          var msg = (result.data && result.data.error && result.data.error.message) ||
+                    (result.data && result.data.detail) ||
+                    "Sign-in failed. The link may be expired or already used.";
+          out.innerHTML = '<div style="padding:12px 14px;background:#fef2f2;border:1px solid #ef4444;border-radius:8px;color:#991b1b;">' + msg + '</div>';
+          btn.textContent = "Sign-In Failed";
+          return;
+        }}
+        try {{ sessionStorage.setItem("aiauth_session", JSON.stringify(result.data)); }} catch (e) {{}}
+        out.innerHTML =
+          '<div style="padding:14px 16px;background:#ecfdf5;border:1px solid #10b981;border-radius:8px;color:#065f46;">' +
+          '<b>✓ You\\'re signed in as ' + (result.data.email || "your account") + '.</b>' +
+          '<div style="margin-top:8px;font-size:13px;">You can close this tab, or open the AIAuth extension — it will pick up the sign-in automatically if this is the same browser profile.</div>' +
+          '</div>';
+        btn.style.display = "none";
+      }}).catch(function (err) {{
+        out.innerHTML = '<div style="padding:12px 14px;background:#fef2f2;border:1px solid #ef4444;border-radius:8px;color:#991b1b;">Network error. Please try again.</div>';
+        btn.disabled = false;
+        btn.textContent = "Complete Sign-In Here";
+      }});
+    }});
+  }})();
+</script>"""
+    return HTMLResponse(_site_shell("Sign In", body, active=""))
+
+
 @app.get("/public-key", response_class=HTMLResponse)
 def public_key_page():
     """Human-readable public key page — developers can still hit /v1/public-key or /.well-known/aiauth-public-key."""
