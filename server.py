@@ -1930,6 +1930,133 @@ def waitlist_signup(body: WaitlistRequest, request: Request):
     return {"submitted": True, "message": "You're on the list. We'll email when the extension ships."}
 
 
+# ===================================================================
+# INBOUND MAIL FORWARDER (Resend webhook → operator inbox)
+#
+# Resend's inbound feature accepts mail at any address on the verified
+# domain (aiauth.app) and POSTs a webhook to the URL configured in the
+# Resend dashboard. This endpoint receives that webhook, extracts the
+# minimum fields needed to preserve the message, and forwards via
+# Resend outbound to AIAUTH_OPERATOR_EMAIL.
+#
+# A shared-secret header (AIAUTH_INBOUND_SECRET) gates the endpoint so
+# that only Resend — or someone with the secret — can trigger a forward.
+# Without the gate, any attacker who discovers the URL could inject
+# arbitrary mail into the operator's inbox.
+#
+# Intentionally simple: we do not parse attachments, do not persist
+# inbound mail, and do not thread replies. The intent is to preserve
+# the "security@aiauth.app" class of addresses as functioning mail
+# drops, nothing more. If you need a real support inbox, swap this for
+# a helpdesk product.
+# ===================================================================
+
+
+@app.post("/v1/inbound")
+async def inbound_mail(request: Request):
+    """Receive a Resend inbound-mail webhook and forward to the operator.
+
+    The Resend webhook body varies by event type; we handle the
+    `email.received` event and ignore everything else. The outbound
+    forward preserves the original subject with a `[fwd]` prefix, the
+    original From/To for context, and the body (HTML or text, whichever
+    was present).
+
+    Security:
+      - X-AIAuth-Inbound-Secret header must equal env AIAUTH_INBOUND_SECRET.
+        If that env var is unset the endpoint returns 503 (disabled).
+      - We refuse to forward mail whose From address is already on
+        aiauth.app. This prevents a trivial loop where the operator
+        replies to a forwarded message and the reply comes back in.
+      - We cap the forwarded body at 100 KB. Anything larger is
+        truncated with a note.
+    """
+    expected = os.getenv("AIAUTH_INBOUND_SECRET", "").strip()
+    if not expected:
+        raise AIAuthError("DISABLED", "Inbound mail forwarding is not configured", 503)
+    presented = (request.headers.get("X-AIAuth-Inbound-Secret") or "").strip()
+    if not hmac.compare_digest(expected.encode(), presented.encode()):
+        raise AIAuthError("UNAUTHENTICATED", "Invalid inbound-mail secret", 401)
+
+    operator = os.getenv("AIAUTH_OPERATOR_EMAIL", "").strip()
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not operator or not api_key:
+        raise AIAuthError("DISABLED", "Operator email or Resend API key not configured", 503)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise AIAuthError("INVALID_RECEIPT", "Webhook body is not valid JSON", 400)
+
+    event_type = (payload.get("type") or payload.get("event") or "").lower()
+    if "email" in event_type and "received" not in event_type:
+        # Ignore delivery events, opens, clicks, bounces that Resend may
+        # emit to the same webhook. We only forward inbound-received.
+        return {"forwarded": False, "reason": f"ignored event type: {event_type}"}
+
+    data = payload.get("data") or payload
+    sender = (data.get("from") or data.get("From") or "").strip()
+    recipient = (data.get("to") or data.get("To") or "").strip()
+    subject = (data.get("subject") or data.get("Subject") or "(no subject)").strip()
+    text_body = data.get("text") or data.get("Text") or ""
+    html_body = data.get("html") or data.get("Html") or data.get("HTML") or ""
+
+    # Loop guard: refuse to forward mail that claims to be from our own domain.
+    if sender and "@aiauth.app" in sender.lower():
+        print(f"[AIAuth inbound] refused loop: from={sender!r}")
+        return {"forwarded": False, "reason": "loop prevention"}
+
+    MAX = 100_000  # 100 KB
+    truncated = False
+    if len(text_body) > MAX:
+        text_body = text_body[:MAX] + "\n\n[truncated — original exceeded 100 KB]"
+        truncated = True
+    if len(html_body) > MAX:
+        html_body = html_body[:MAX] + "<p><em>[truncated — original exceeded 100 KB]</em></p>"
+        truncated = True
+
+    prefix = (
+        f"Forwarded from {recipient or 'unknown'} on aiauth.app.\n"
+        f"Original From: {sender or '(unknown)'}\n"
+        f"Original Subject: {subject}\n"
+        f"{'— TRUNCATED — ' if truncated else ''}"
+        f"────────────────────────────────────\n\n"
+    )
+    html_prefix = (
+        f"<p style='font-family:system-ui,sans-serif;font-size:12px;color:#64748b;"
+        f"background:#f1f5f9;padding:10px 14px;border-radius:6px;margin:0 0 16px;'>"
+        f"Forwarded from <b>{recipient or 'unknown'}</b> on aiauth.app.<br>"
+        f"Original From: <b>{sender or '(unknown)'}</b><br>"
+        f"Original Subject: <b>{subject}</b>"
+        f"{'<br><b>TRUNCATED</b>' if truncated else ''}"
+        f"</p>"
+    )
+
+    forward_subject = f"[fwd: {recipient or 'aiauth.app'}] {subject}"
+    try:
+        import resend
+        resend.api_key = api_key
+        fwd_args = {
+            "from": os.getenv("RESEND_FROM", "AIAuth <auth@aiauth.app>"),
+            "to": operator,
+            "subject": forward_subject,
+            "reply_to": sender if sender else None,
+        }
+        if html_body:
+            fwd_args["html"] = html_prefix + html_body
+        else:
+            fwd_args["text"] = prefix + text_body
+        # Remove None-valued fields that the SDK rejects.
+        fwd_args = {k: v for k, v in fwd_args.items() if v is not None and v != ""}
+        resend.Emails.send(fwd_args)
+        print(f"[AIAuth inbound] forwarded to {operator.split('@')[-1]!r} from={sender!r} to={recipient!r} subject={subject!r}")
+    except Exception as exc:
+        print(f"[AIAuth inbound] forward failed: {type(exc).__name__}: {str(exc)[:200]}")
+        raise AIAuthError("FORWARD_FAILED", "Forwarding via Resend failed", 502)
+
+    return {"forwarded": True, "to_domain": operator.split("@")[-1]}
+
+
 @app.post("/v1/account/logout")
 def account_logout(authorization: Optional[str] = Header(default=None)):
     """Revoke the current session by adding its session_id to
