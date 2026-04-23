@@ -2073,6 +2073,39 @@ async def inbound_mail(request: Request):
     except Exception:
         pass
 
+    # Resend's email.received webhook delivers metadata only — the body is
+    # retrieved by calling GET /emails/{email_id} against the Resend API.
+    # Fetch it only if the webhook payload didn't already include it
+    # (future-proofing: if Resend adds body fields to the webhook, we'll
+    # just use those and skip the API round-trip).
+    if not text_body and not html_body:
+        email_id = data.get("email_id") or data.get("id") or ""
+        if email_id:
+            try:
+                import urllib.request, urllib.error
+                req = urllib.request.Request(
+                    f"https://api.resend.com/emails/{email_id}",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Accept": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body_json = json.loads(resp.read().decode("utf-8"))
+                text_body = body_json.get("text") or ""
+                html_body = body_json.get("html") or ""
+                print(f"[AIAuth inbound] fetched body via API: email_id={email_id!r} "
+                      f"text_len={len(text_body)} html_len={len(html_body)} "
+                      f"keys={list(body_json.keys())}")
+            except urllib.error.HTTPError as http_err:
+                print(f"[AIAuth inbound] body fetch HTTP {http_err.code}: {http_err.reason} "
+                      f"(email_id={email_id!r})")
+            except Exception as fetch_err:
+                print(f"[AIAuth inbound] body fetch failed: {type(fetch_err).__name__}: "
+                      f"{str(fetch_err)[:200]}")
+        else:
+            print(f"[AIAuth inbound] no email_id in payload; body fetch skipped")
+
     # Loop guard: refuse to forward mail that claims to be from our own domain.
     if sender and "@aiauth.app" in sender.lower():
         print(f"[AIAuth inbound] refused loop: from={sender!r}")
