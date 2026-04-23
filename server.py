@@ -1952,6 +1952,47 @@ def waitlist_signup(body: WaitlistRequest, request: Request):
 # ===================================================================
 
 
+def _verify_svix_signature(secret: str, body: bytes, svix_id: str, svix_ts: str, svix_sig: str) -> bool:
+    """Verify a Svix-style webhook signature (used by Resend).
+
+    secret    — "whsec_<base64-key>" from the Resend webhook settings
+    body      — raw request body bytes (signature is over raw bytes, not
+                re-serialized JSON)
+    svix_id   — value of the svix-id header
+    svix_ts   — value of the svix-timestamp header (unix epoch seconds)
+    svix_sig  — value of the svix-signature header; may contain multiple
+                space-separated signatures, each formatted as "v1,<base64>"
+
+    Returns True only if (a) the timestamp is within 5 minutes of now
+    (replay guard) and (b) at least one of the presented signatures
+    matches our recomputed HMAC-SHA256.
+    """
+    if not (secret and body and svix_id and svix_ts and svix_sig):
+        return False
+    if not secret.startswith("whsec_"):
+        return False
+    try:
+        key = base64.b64decode(secret[len("whsec_"):])
+    except Exception:
+        return False
+    try:
+        ts = int(svix_ts)
+    except ValueError:
+        return False
+    # Replay guard: reject older than 5 minutes in either direction.
+    now = int(datetime.now(timezone.utc).timestamp())
+    if abs(now - ts) > 300:
+        return False
+    to_sign = f"{svix_id}.{svix_ts}.".encode() + body
+    expected = base64.b64encode(hmac.new(key, to_sign, hashlib.sha256).digest()).decode()
+    for presented in svix_sig.split():
+        if "," in presented:
+            version, _, value = presented.partition(",")
+            if version == "v1" and hmac.compare_digest(value, expected):
+                return True
+    return False
+
+
 @app.post("/v1/inbound")
 async def inbound_mail(request: Request):
     """Receive a Resend inbound-mail webhook and forward to the operator.
@@ -1963,20 +2004,30 @@ async def inbound_mail(request: Request):
     was present).
 
     Security:
-      - X-AIAuth-Inbound-Secret header must equal env AIAUTH_INBOUND_SECRET.
-        If that env var is unset the endpoint returns 503 (disabled).
+      - Resend signs webhooks with Svix (svix-id, svix-timestamp,
+        svix-signature headers). We verify using AIAUTH_INBOUND_SECRET,
+        which should hold the "whsec_..." signing secret from the Resend
+        webhook dashboard. If that env var is unset the endpoint returns
+        503 (disabled).
+      - Signature covers the raw request body + headers, with a 5-minute
+        replay window.
       - We refuse to forward mail whose From address is already on
         aiauth.app. This prevents a trivial loop where the operator
         replies to a forwarded message and the reply comes back in.
       - We cap the forwarded body at 100 KB. Anything larger is
         truncated with a note.
     """
-    expected = os.getenv("AIAUTH_INBOUND_SECRET", "").strip()
-    if not expected:
+    secret = os.getenv("AIAUTH_INBOUND_SECRET", "").strip()
+    if not secret:
         raise AIAuthError("DISABLED", "Inbound mail forwarding is not configured", 503)
-    presented = (request.headers.get("X-AIAuth-Inbound-Secret") or "").strip()
-    if not hmac.compare_digest(expected.encode(), presented.encode()):
-        raise AIAuthError("UNAUTHENTICATED", "Invalid inbound-mail secret", 401)
+
+    body_bytes = await request.body()
+    svix_id = request.headers.get("svix-id") or request.headers.get("webhook-id") or ""
+    svix_ts = request.headers.get("svix-timestamp") or request.headers.get("webhook-timestamp") or ""
+    svix_sig = request.headers.get("svix-signature") or request.headers.get("webhook-signature") or ""
+
+    if not _verify_svix_signature(secret, body_bytes, svix_id.strip(), svix_ts.strip(), svix_sig.strip()):
+        raise AIAuthError("UNAUTHENTICATED", "Invalid or missing webhook signature", 401)
 
     operator = os.getenv("AIAUTH_OPERATOR_EMAIL", "").strip()
     api_key = os.getenv("RESEND_API_KEY", "").strip()
@@ -1984,7 +2035,7 @@ async def inbound_mail(request: Request):
         raise AIAuthError("DISABLED", "Operator email or Resend API key not configured", 503)
 
     try:
-        payload = await request.json()
+        payload = json.loads(body_bytes.decode("utf-8"))
     except Exception:
         raise AIAuthError("INVALID_RECEIPT", "Webhook body is not valid JSON", 400)
 
