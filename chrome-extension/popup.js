@@ -445,9 +445,11 @@ async function attestFile(file) {
   }
 }
 
-function bindFileDrop() {
-  const drop = $("drop");
-  const picker = $("filePicker");
+// Wire up one drop-zone + file-picker pair. Factored out so both
+// State 3 (verified) and State 3u (unverified) can share the same flow.
+function bindDropPair(dropId, pickerId) {
+  const drop = $(dropId);
+  const picker = $(pickerId);
   if (!drop || !picker) return;
   drop.addEventListener("click", () => picker.click());
   picker.addEventListener("change", () => {
@@ -463,6 +465,27 @@ function bindFileDrop() {
   drop.addEventListener("drop", (e) => {
     const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     if (f) attestFile(f);
+  });
+}
+
+function bindFileDrop() {
+  // Bind both the verified (State 3) and unverified (State 3u) drop
+  // zones. v1.4.0 fix: previously only State 3 was wired, so unverified
+  // users saw the popup bypass the extension and navigate to the file.
+  bindDropPair("drop", "filePicker");
+  bindDropPair("dropU", "filePickerU");
+
+  // Safety net: if a user drops a file anywhere else in the popup
+  // (over the stats strip, the receipt list, etc.), Chrome's default
+  // is to navigate away and open the file. Swallow those drops at the
+  // window level so the popup stays put.
+  ["dragover", "drop"].forEach(ev => {
+    window.addEventListener(ev, (e) => {
+      // Let nested handlers (on drop / dropU) run first; they stopPropagation.
+      // Anything that reaches the window gets a preventDefault so Chrome
+      // doesn't hijack the popup.
+      e.preventDefault();
+    });
   });
 }
 
