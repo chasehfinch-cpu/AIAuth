@@ -4836,7 +4836,7 @@ def api_reference_page():
 <div class="endpoint" id="health">
   <h3><span class="verb get">GET</span><span class="path">/health</span></h3>
   <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> none</div>
-  <p>Liveness check. Returns <code>{ "status": "ok", "version": "0.5.0" }</code> with 200 when the server is responsive. Used by the status page at <code>status.aiauth.app</code>.</p>
+  <p>Liveness check. Returns <code>{ "status": "ok", "version": "0.5.0" }</code> with 200 when the server is responsive.</p>
 </div>
 
 <div class="endpoint" id="waitlist">
@@ -5179,7 +5179,6 @@ footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px sol
     <a href="/compliance">Compliance</a>
     <a href="/public-key">Public Key</a>
     <a href="/enterprise-guide">Enterprise Guide</a>
-    <a href="https://status.aiauth.app" target="_blank" rel="noopener">Status</a>
     <a href="https://github.com/chasehfinch-cpu/AIAuth" target="_blank" rel="noopener">GitHub</a>
   </div>
 </div></footer>
@@ -5451,10 +5450,10 @@ def health():
 
 @app.get("/health/db")
 def health_db():
-    """Deeper readiness check for the status page. Returns DB round-trip
-    latency and the age of the currently active signing key. Intended for
-    external uptime monitors (UptimeRobot, Instatus) to surface gradual
-    degradation, not just binary up/down."""
+    """Deeper readiness check beyond /health. Returns DB round-trip
+    latency and the age of the currently active signing key so operators
+    can spot gradual degradation (slow queries, overdue key rotation)
+    rather than just binary up/down."""
     r = {"status": "ok", "service": "aiauth", "version": VERSION}
     try:
         t0 = time.time()
