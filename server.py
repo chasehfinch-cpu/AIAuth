@@ -5083,6 +5083,7 @@ footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px sol
     <a href="/compliance">Compliance</a>
     <a href="/public-key">Public Key</a>
     <a href="/enterprise-guide">Enterprise Guide</a>
+    <a href="https://status.aiauth.app" target="_blank" rel="noopener">Status</a>
     <a href="https://github.com/chasehfinch-cpu/AIAuth" target="_blank" rel="noopener">GitHub</a>
   </div>
 </div></footer>
@@ -5349,4 +5350,43 @@ def health():
         r["licensed_to"] = ENTERPRISE_LICENSE.get("company")
         r["tier"] = ENTERPRISE_LICENSE.get("tier")
         conn.close()
+    return r
+
+
+@app.get("/health/db")
+def health_db():
+    """Deeper readiness check for the status page. Returns DB round-trip
+    latency and the age of the currently active signing key. Intended for
+    external uptime monitors (UptimeRobot, Instatus) to surface gradual
+    degradation, not just binary up/down."""
+    r = {"status": "ok", "service": "aiauth", "version": VERSION}
+    try:
+        t0 = time.time()
+        conn = get_db()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        r["db_ok"] = True
+        r["db_latency_ms"] = round((time.time() - t0) * 1000, 2)
+    except Exception as exc:
+        r["status"] = "degraded"
+        r["db_ok"] = False
+        r["db_error"] = str(exc)[:200]
+
+    try:
+        manifest = build_public_key_manifest()
+        active = next((k for k in manifest.get("keys", []) if k.get("current_signing_key")), None)
+        if active and active.get("valid_from"):
+            vf = datetime.fromisoformat(active["valid_from"].replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - vf).days
+            r["active_key_id"] = active.get("key_id")
+            r["active_key_age_days"] = age_days
+            # Flag soft degradation if the active key is overdue for rotation
+            # (spec: annual). The signing path still works; operators should
+            # schedule rotation.
+            if age_days > 400:
+                r["status"] = "degraded"
+                r["rotation_overdue"] = True
+    except Exception as exc:
+        r["key_manifest_error"] = str(exc)[:200]
+
     return r
