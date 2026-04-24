@@ -104,7 +104,7 @@
     }
     .rcpt {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 6px;
       padding: 8px 10px;
       border-bottom: 1px solid #f0f0f0;
@@ -112,8 +112,17 @@
     }
     .rcpt:last-child { border-bottom: 0; }
     .rcpt-code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
-    .rcpt-meta { color: #888; font-size: 11px; margin-top: 2px; }
-    .rcpt-actions { display: flex; gap: 4px; }
+    .rcpt-meta {
+      color: #888;
+      font-size: 11px;
+      margin-top: 2px;
+      /* Truncate with ellipsis so a long meta (file type, TTA, C2PA
+         generator) never pushes the action buttons off-screen. */
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .rcpt-actions { display: flex; gap: 4px; flex-shrink: 0; }
     .rcpt-status { font-size: 10px; color: #1a7f37; margin-left: 6px; }
     .rcpt-status.pending { color: #b45309; }
     code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
