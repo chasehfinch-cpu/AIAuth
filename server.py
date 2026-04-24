@@ -4452,12 +4452,12 @@ def terms_page():
 @app.get("/security", response_class=HTMLResponse)
 def security_page():
     """Public Security & Trust page. Documents signing key custody,
-    rotation, continuity, and bus-factor risk. Content lifts from the
+    rotation, and continuity guarantees. Content lifts from the
     enterprise admin guide so free-tier users get the same transparency."""
     body = """
 <span class="eyebrow">Security &amp; Trust</span>
-<h1 class="page-title">Where the keys live and what happens if we disappear.</h1>
-<p class="lead">An attestation receipt is only as trustworthy as the key that signed it. This page documents how AIAuth's signing keys are managed, rotated, backed up, and how the system continues to function if Finch Business Services LLC ever ceases to operate.</p>
+<h1 class="page-title">Signing-key custody, rotation, and long-term verifiability.</h1>
+<p class="lead">An attestation receipt is only as trustworthy as the key that signed it. This page documents how AIAuth's signing keys are managed, rotated, and backed up, and how the verification chain is engineered to remain intact for the full life of the record.</p>
 
 <div class="prose">
   <h2>Signing key infrastructure</h2>
@@ -4496,26 +4496,26 @@ def security_page():
 }</code></pre>
   <p>When verifying a receipt, select the key whose <code>key_id</code> matches the receipt's <code>key_id</code> field. If the receipt has no <code>key_id</code> (legacy), fall back to trying each key in the manifest.</p>
 
-  <h2>Continuity and bus-factor</h2>
-  <p>AIAuth is intentionally designed so that the signing server is not a single point of failure for verification. If the signing server goes offline — permanently — receipts remain verifiable forever, provided the public key is available:</p>
+  <h2>Continuity and long-term verifiability</h2>
+  <p>The AIAuth architecture is engineered so that no single service is a point of failure for verification. A receipt issued today remains cryptographically verifiable indefinitely, independent of the operational status of the signing service:</p>
   <ul>
-    <li><b>Public key survivability.</b> The current and all retired public keys are published on GitHub alongside the source code. Any copy of the repo (including the Wayback Machine and any forks) preserves them.</li>
-    <li><b>Stateless verification.</b> Receipt verification requires only the receipt, the public key matching the receipt's <code>key_id</code>, and an Ed25519 library. It does not require the AIAuth server to be reachable.</li>
-    <li><b>Open-source client.</b> The Chrome extension and receipt format are open-source at <a href="https://github.com/chasehfinch-cpu/AIAuth">github.com/chasehfinch-cpu/AIAuth</a> under Apache 2.0. A fork can continue to build and publish the extension if we cannot.</li>
-    <li><b>Self-hosted deployments are customer-owned.</b> Enterprise customers run AIAuth on their own infrastructure with their own keys. Nothing about an enterprise deployment depends on Finch Business Services LLC continuing to exist.</li>
-    <li><b>90-day shutdown notice.</b> Per the <a href="/terms">Terms of Service</a>, any planned permanent shutdown of the free tier is announced at least 90 days in advance, and a final archive of the public key and hash registry is published before takedown.</li>
+    <li><b>Public key survivability.</b> The current and all retired public keys are published on GitHub alongside the source code. Any copy of the repository, including mirrors and archival services such as the Wayback Machine, preserves them.</li>
+    <li><b>Stateless verification.</b> Receipt verification requires only the receipt, the public key matching the receipt's <code>key_id</code>, and an Ed25519 library. It does not require any AIAuth-operated server to be reachable.</li>
+    <li><b>Open-source client.</b> The Chrome extension and receipt format are open-source at <a href="https://github.com/chasehfinch-cpu/AIAuth">github.com/chasehfinch-cpu/AIAuth</a> under Apache 2.0, independently buildable and deployable.</li>
+    <li><b>Self-hosted deployments are customer-owned.</b> Enterprise customers run AIAuth on their own infrastructure with their own keys. Enterprise operations are fully self-contained and do not depend on any Finch Business Services LLC service.</li>
+    <li><b>90-day shutdown notice.</b> Per the <a href="/terms">Terms of Service</a>, any planned permanent shutdown of the free tier is announced at least 90 days in advance, and a final archive of the public key and hash registry is published to a public location before takedown.</li>
   </ul>
 
   <h2>Reporting a vulnerability</h2>
-  <p>Responsible disclosure process, affected component categories, and contact addresses are documented in <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/SECURITY.md">SECURITY.md</a>. We do not currently offer a bug bounty; we acknowledge reporters in the security advisory when a fix ships.</p>
+  <p>The responsible-disclosure process, component scope, and contact addresses are documented in <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/SECURITY.md">SECURITY.md</a>. Reporters are acknowledged in the security advisory when a fix ships.</p>
 
-  <h2>Where we aren't yet</h2>
-  <p>Transparency about what we don't yet have:</p>
+  <h2>Current program status</h2>
+  <p>Transparency on what is and isn't in place today:</p>
   <ul>
-    <li>No formal SOC 2 audit report. A control-crosswalk document is on <a href="/compliance">/compliance</a> for reference.</li>
-    <li>No third-party penetration test (a scoped engagement is on the roadmap).</li>
-    <li>No bug bounty program (we treat vulnerability reports via the SECURITY.md channel seriously regardless).</li>
-    <li>No HSM for the free-tier signing key (self-hosted enterprise customers can and do use HSMs for their own keys).</li>
+    <li>A formal SOC 2 audit is on the FY2026 roadmap. A control crosswalk is available at <a href="/compliance">/compliance</a>.</li>
+    <li>A scoped third-party penetration test is on the FY2026 roadmap.</li>
+    <li>A bug-bounty program is planned for launch once the SOC 2 audit period concludes. Until then, vulnerability reports via the SECURITY.md channel receive prompt triage.</li>
+    <li>Free-tier signing keys do not currently run in a dedicated HSM. Self-hosted enterprise deployments can and do use HSMs for their own keys, configured per the enterprise admin guide.</li>
   </ul>
 </div>
 """
@@ -5425,23 +5425,20 @@ def privacy_page():
 </ul>
 
 <h2>Server Logs</h2>
-<p>Our reverse proxy (nginx) logs standard HTTP access records — timestamps, paths, status codes, IP addresses — for operational reliability and abuse prevention. These are rotated weekly and not linked to any user profile (because we don't maintain user profiles in the traditional sense).</p>
+<p>The reverse proxy (nginx) records standard HTTP access entries — timestamps, paths, status codes, IP addresses — for operational reliability and abuse prevention. Logs are rotated weekly and are not joined to any account profile; AIAuth does not maintain per-user behavioral profiles of any kind.</p>
 
 <h2>Third-Party Services</h2>
-<p>Our website loads typography fonts from Google Fonts. When you visit a page on aiauth.app, your browser fetches font files from Google's CDN — subject to Google's own privacy terms. The Chrome extension loads no third-party resources.</p>
-<p>Our transactional email provider is <strong>Resend</strong>. They hold email-delivery metadata (recipient address, timestamp) for up to 30 days for deliverability diagnostics. We do not transmit anything else to them.</p>
+<p>The AIAuth website loads typography fonts from Google Fonts. When you visit a page on aiauth.app, your browser fetches font files from Google's CDN, subject to Google's own privacy terms. The Chrome extension loads no third-party resources.</p>
+<p>AIAuth's transactional-email provider is <strong>Resend</strong>. Resend retains email-delivery metadata (recipient address, timestamp) for up to 30 days for deliverability diagnostics. No other data is transmitted to Resend.</p>
 
 <h2>Children</h2>
 <p>AIAuth is not directed to children under 13 and does not knowingly collect information from them.</p>
 
-<h2>Honest Reality</h2>
-<p>AIAuth is built by a one-person business. We offer no SLAs, no 24/7 support line, and no formal data-protection officer. What we offer is software that tries to be small, honest, and correct. If you have questions or concerns, you'll get a direct reply from a human within a few days.</p>
-
-<h2>Changes to This Policy</h2>
-<p>Material changes are announced on this page and the "last updated" date changes. The core guarantees (content never transmitted; no plaintext emails stored; no selling data) will never change without a new major version and explicit notice to existing account holders.</p>
+<h2>Service Commitments</h2>
+<p>AIAuth is operated by Finch Business Services LLC, a privately held company. Free-tier service is provided without formal SLAs. Enterprise customers receive support levels defined in their executed service agreement. Material operational changes — including any planned discontinuation of the free tier — are announced with at least 90 days of notice per the <a href="/terms">Terms of Service</a>. The core privacy guarantees on this page are contractual commitments; they will not be weakened without a new major version, a clear diff, and explicit notice to existing account holders.</p>
 
 <h2>Contact</h2>
-<p>Questions: <a href="mailto:privacy@aiauth.app">privacy@aiauth.app</a>. Security advisories: <a href="mailto:security@aiauth.app">security@aiauth.app</a>.</p>
+<p>Privacy inquiries: <a href="mailto:privacy@aiauth.app">privacy@aiauth.app</a>. Security disclosures: <a href="mailto:security@aiauth.app">security@aiauth.app</a>. Commercial inquiries: <a href="mailto:sales@aiauth.app">sales@aiauth.app</a>.</p>
 </div>"""
     return HTMLResponse(_site_shell("Privacy", body, active=""))
 
