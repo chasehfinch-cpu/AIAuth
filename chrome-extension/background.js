@@ -13,17 +13,25 @@
 // v1.4.0: Load the C2PA JUMBF parser + minimal CBOR decoder into the
 // service worker scope. Both modules are pure — no DOM access, no
 // network — so running them in the background is safe.
+// v1.5.0: Also load the canonical-text extractor (DOCX/XLSX/PPTX/text)
+// and the minimal PDF text extractor so file attestations can compute
+// content_hash_canonical without a desktop-agent install.
 try {
-  importScripts("c2pa_parser.js", "cbor_decoder.js");
+  importScripts(
+    "c2pa_parser.js",
+    "cbor_decoder.js",
+    "canonical_text.js",
+    "pdf_text.js",
+  );
 } catch (e) {
   // If a future CWS packaging change breaks the import, log but keep
-  // the worker alive. C2PA enrichment will be skipped on every
-  // attestation, but regular sign/verify still works.
-  console.warn("[AIAuth] C2PA modules failed to load:", e);
+  // the worker alive. Enrichment will be skipped on every attestation,
+  // but regular sign/verify still works.
+  console.warn("[AIAuth] enrichment modules failed to load:", e);
 }
 
 const DEFAULT_SERVER = "https://aiauth.app";
-const EXTENSION_VERSION = "1.4.0";
+const EXTENSION_VERSION = "1.5.0";
 
 // CLIENT_SECRET is embedded in the extension and rotated per release.
 // The server holds a matching value in its env var CLIENT_SECRET.
@@ -370,6 +378,25 @@ async function enrichWithC2PA(body, imageBytes) {
   }
 }
 
+// v1.5.0: canonical-text enrichment. If the file bytes can be
+// deterministically reduced to canonical text (xlsx/docx/pptx/pdf/plain
+// text), compute SHA-256 of the normalized text and set
+// body.content_hash_canonical. Graceful-degrades — any failure returns
+// body unchanged. The server already accepts this field (v1.3.0+).
+async function enrichWithCanonicalText(body, fileDescriptor, bytes) {
+  if (!bytes || !self.AIAuthCanonical) return body;
+  try {
+    const canonical = await self.AIAuthCanonical.computeCanonicalHash(
+      fileDescriptor, bytes);
+    if (canonical && /^[0-9a-f]{64}$/.test(canonical)) {
+      body.content_hash_canonical = canonical;
+    }
+  } catch (e) {
+    console.warn("[AIAuth] canonical-text enrichment failed:", e);
+  }
+  return body;
+}
+
 // Fetch image bytes — try the content script first (page origin, CORS
 // friendly for same-origin), fall back to the service worker's fetch.
 // Returns Uint8Array on success or null on failure.
@@ -457,8 +484,10 @@ async function signContent(text, sourceUrl, promptText, tta, tabId) {
 
 // Manual hash-based signing (for file attestation via popup — no prompt text).
 // v1.4.0: accepts an optional imageBytes payload so the popup drag-drop
-// and right-click-image paths can surface C2PA data into the receipt.
-async function signHash(output_hash, source, note, imageBytes) {
+//         and right-click-image paths can surface C2PA data into the receipt.
+// v1.5.0: accepts an optional fileDescriptor ({name, type, size}) so the
+//         canonical-text extractor can dispatch by file extension.
+async function signHash(output_hash, source, note, imageBytes, fileDescriptor) {
   const { server, userId } = await getConfig();
   if (!userId) throw new Error("Set your email/name in the AIAuth popup first.");
   if (!/^[0-9a-f]{64}$/i.test(output_hash)) throw new Error("Invalid hash.");
@@ -478,6 +507,14 @@ async function signHash(output_hash, source, note, imageBytes) {
   // probe for a JUMBF manifest and populate ai_markers.c2pa.
   if (imageBytes) {
     body = await enrichWithC2PA(body, imageBytes);
+  }
+
+  // v1.5.0: canonical-text enrichment for cross-format chain integrity.
+  // Runs when we have both a file descriptor (so we know the extension)
+  // and the file bytes. Skipped for image-only paths (right-click image
+  // attestation) since images don't have canonical text.
+  if (imageBytes && fileDescriptor) {
+    body = await enrichWithCanonicalText(body, fileDescriptor, imageBytes);
   }
 
   const timestamp = new Date().toISOString();
@@ -666,10 +703,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // v1.4.0: popup drag-drop / file-picker path passes imageBytes
         // as a plain array so enrichWithC2PA can probe for a JUMBF
         // manifest without a second read of the file.
+        // v1.5.0: also accepts fileDescriptor ({name, type, size}) so
+        // the canonical-text extractor can dispatch by file extension.
         const imageBytes = Array.isArray(msg.imageBytes)
           ? new Uint8Array(msg.imageBytes)
           : null;
-        const data = await signHash(msg.hash, msg.source || "file", msg.note || null, imageBytes);
+        const data = await signHash(
+          msg.hash,
+          msg.source || "file",
+          msg.note || null,
+          imageBytes,
+          msg.fileDescriptor || null,
+        );
         await notify("AIAuth — receipt created", data.receipt_code);
         sendResponse({ ok: true, receipt_code: data.receipt_code });
       } catch (err) {

@@ -1,6 +1,8 @@
-# Chrome Web Store Listing Copy — v1.4.0
+# Chrome Web Store Listing Copy — v1.5.0
 
 **Purpose:** Exact text to paste into the Chrome Web Store Developer Dashboard for the AIAuth extension listing.
+
+**v1.5.0 changes (cross-format chain integrity):** Receipts for file attestations now carry a canonical-text hash alongside the raw-bytes hash, so the same logical document retains chain-of-custody across format conversions (Word → PDF, Excel → CSV, PowerPoint → PDF, etc.). Supported formats: plain text, Markdown, CSV/TSV, JSON, XML, HTML, DOCX, XLSX, PPTX, and common PDFs. Canonical extraction runs entirely on-device; the content still never leaves the user's machine. No new permissions, no new host permissions. Existing receipts remain valid; this change is purely additive.
 
 **v1.4.0 changes (Data Depth Tier 2.5 — C2PA Content Credentials):** Right-click an image anywhere in the browser to create an attestation receipt, or drag-drop an image file onto the popup. When the image carries a C2PA Content Credentials manifest — as Adobe Firefly, DALL-E 3, and other compliant generators produce by default — AIAuth extracts the manifest identity, the claim generator name (e.g. `Adobe_Firefly`), and the list of content credentials assertions, and records them directly on the receipt. AIAuth is now the first voluntary human-review attestation layer that reads and preserves C2PA provenance data alongside the reviewer's signature. No new permissions, no new host permissions, no change to the short or detailed description. New second context menu entry: "Attest image with AIAuth".
 

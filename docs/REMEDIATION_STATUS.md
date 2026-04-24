@@ -16,7 +16,7 @@ Each row is tagged:
 |---|------|--------|----------|
 | 1.1 | `/security` or `/trust` page | Missing — backlog | No route in `server.py`. Continuity content partially in `docs/ENTERPRISE_ADMIN_GUIDE.md`. |
 | 1.2 | Public key manifest versioning endpoint | **Built** | `GET /v1/public-key` returns the full manifest via `build_public_key_manifest()` in `server.py`. `GET /.well-known/aiauth-public-key` exists as a discovery endpoint. |
-| 1.3 | Continuity / bus-factor documentation | Missing — backlog | Enterprise guide covers self-hosted continuity; free-tier continuity is not documented on the public site. |
+| 1.3 | Continuity documentation | **Built** | Public `/security` page covers signing-key custody, rotation, and long-term verifiability of receipts. Self-hosted enterprise operations are fully independent of Finch Business Services LLC infrastructure. |
 
 ## Section 2 — Chrome Extension Hardening
 

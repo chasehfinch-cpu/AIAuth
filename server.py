@@ -907,6 +907,32 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_submitted ON contact_inquiries(submitted_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_handled ON contact_inquiries(handled)")
 
+    # v1.5.0: user-submitted format requests. When the canonical-text
+    # extractor can't recognize a file type, users can submit the format
+    # METADATA (no file bytes ever touch the server) via /new-format.
+    # Actual sample files, if the user chooses to share one, go directly
+    # to newroutes@aiauth.app via email — that pathway is outside our
+    # infrastructure so the zero-knowledge architecture is preserved.
+    conn.execute("""CREATE TABLE IF NOT EXISTS format_requests (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        submitted_at     TEXT NOT NULL,
+        format_name      TEXT NOT NULL,
+        file_extension   TEXT,
+        file_size_bytes  INTEGER,
+        mime_type        TEXT,
+        description      TEXT,
+        use_case         TEXT,
+        admin_email_hash TEXT,
+        admin_email_encrypted TEXT,
+        admin_email_domain    TEXT,
+        source_ip        TEXT,
+        status           TEXT NOT NULL DEFAULT 'new',
+        triaged_at       TEXT,
+        triage_note      TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fr_submitted ON format_requests(submitted_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fr_status ON format_requests(status)")
+
     # ---------------- v0.5.0 enterprise attestation store ----------------
     # Full receipt metadata is stored here when enterprise clients POST
     # to /v1/enterprise/ingest. Created unconditionally so switching
@@ -1142,7 +1168,7 @@ def _send_magic_link(email: str, token: str, purpose: str) -> None:
             pass
 
 
-def _notify_operator(subject: str, text: str) -> None:
+def _notify_operator(subject: str, text: str, override_recipient: Optional[str] = None) -> None:
     """Send a plaintext email to the operator address (AIAUTH_OPERATOR_EMAIL).
 
     Used for low-volume event notifications: new waitlist signups, new
@@ -1151,12 +1177,17 @@ def _notify_operator(subject: str, text: str) -> None:
     environments quiet and makes operator email a configuration opt-in
     rather than a hard dependency.
 
+    override_recipient: optional — route this notification to a specific
+    address instead of AIAUTH_OPERATOR_EMAIL. Used by format-request and
+    other flows that want a dedicated triage inbox separate from the
+    general operator channel.
+
     Failures are caught and logged to stdout; they never propagate to the
     HTTP response of the event that triggered the notification. A signup
     that fails to notify the operator is still a successful signup from
     the user's perspective, and shows up in the database either way.
     """
-    to_addr = os.getenv("AIAUTH_OPERATOR_EMAIL", "").strip()
+    to_addr = (override_recipient or os.getenv("AIAUTH_OPERATOR_EMAIL", "")).strip()
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     if not to_addr or not api_key:
         return
@@ -2044,6 +2075,110 @@ def contact_sales(body: ContactRequest, request: Request):
         ),
     )
     return {"submitted": True, "message": "Thanks. We'll email you within one business day."}
+
+
+# ===================================================================
+# FORMAT REQUESTS — users submit metadata about file formats that
+# canonical-text extraction doesn't yet recognize. File bytes never
+# reach the server; the submission carries description metadata only,
+# and users attach sample files (if they choose) via a mailto link to
+# newroutes@aiauth.app. Preserves zero-knowledge architecture.
+# ===================================================================
+
+class FormatRequestBody(BaseModel):
+    format_name: str
+    file_extension: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    mime_type: Optional[str] = None
+    description: Optional[str] = None
+    use_case: Optional[str] = None
+    # Optional — user can request a reply. Same hashing/encryption
+    # discipline as waitlist / pilot / contact.
+    admin_email: Optional[str] = None
+
+
+@app.post("/v1/format-request")
+def format_request(body: FormatRequestBody, request: Request):
+    """Record a user-submitted format request for canonical-text
+    extraction. No file bytes are accepted — only metadata. A notification
+    routes to the address in AIAUTH_NEWROUTES_EMAIL (default
+    newroutes@aiauth.app) so the engineering triage inbox stays separate
+    from general-purpose operator mail.
+    """
+    fmt = (body.format_name or "").strip()
+    if not fmt:
+        raise AIAuthError("INVALID_RECEIPT", "format_name is required", 400)
+    ip = _client_ip(request)
+
+    conn = get_db()
+    # Loose per-IP cap to prevent abuse.
+    recent = conn.execute(
+        "SELECT COUNT(*) AS n FROM format_requests "
+        "WHERE source_ip = ? AND submitted_at > datetime('now', '-1 day')",
+        (ip,),
+    ).fetchone()
+    if recent and recent["n"] >= 15:
+        conn.close()
+        raise AIAuthError("RATE_LIMITED", "Too many format requests from this IP today", 429)
+
+    email = (body.admin_email or "").strip().lower()
+    admin_hash = None
+    admin_enc = None
+    admin_domain = None
+    if email:
+        if not _valid_email(email):
+            conn.close()
+            raise AIAuthError("INVALID_RECEIPT", "If provided, admin_email must be valid", 400)
+        admin_hash = email_hash(email)
+        admin_enc = encrypt_value(email)
+        admin_domain = _email_domain(email)
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO format_requests "
+        "(submitted_at, format_name, file_extension, file_size_bytes, mime_type, "
+        " description, use_case, admin_email_hash, admin_email_encrypted, "
+        " admin_email_domain, source_ip) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (now, fmt, body.file_extension, body.file_size_bytes, body.mime_type,
+         body.description, body.use_case, admin_hash, admin_enc, admin_domain, ip),
+    )
+    conn.commit()
+    conn.close()
+
+    # Route to the dedicated engineering-triage inbox.
+    triage_addr = os.getenv("AIAUTH_NEWROUTES_EMAIL", "newroutes@aiauth.app")
+    print(f"[AIAuth format-request] format={fmt!r} ext={body.file_extension!r} "
+          f"mime={body.mime_type!r} domain={admin_domain!r}")
+    _notify_operator(
+        subject=f"[AIAuth/new-routes] Format request: {fmt}",
+        text=(
+            f"A new canonical-format request was submitted.\n\n"
+            f"Format name:     {fmt}\n"
+            f"File extension:  {body.file_extension}\n"
+            f"MIME type:       {body.mime_type}\n"
+            f"File size bytes: {body.file_size_bytes}\n"
+            f"Description:     {body.description}\n"
+            f"Use case:        {body.use_case}\n"
+            f"Reply to:        {email or '(no reply address)'}\n"
+            f"Reply domain:    {admin_domain}\n"
+            f"Source IP:       {ip}\n"
+            f"Timestamp:       {now}\n\n"
+            f"If the submitter attached a sample file, it will arrive via a\n"
+            f"separate email to {triage_addr} — NOT through this server.\n"
+        ),
+        override_recipient=triage_addr,
+    )
+
+    return {
+        "submitted": True,
+        "message": (
+            f"Thanks. If you have a sample file you can share, email it to "
+            f"{triage_addr} with the format name in the subject line. "
+            f"We review new-format requests and prioritize high-demand formats "
+            f"for the next extension release."
+        ),
+    }
 
 
 # ===================================================================
@@ -4297,6 +4432,80 @@ def pilot_page():
     return HTMLResponse(_site_shell("Request a Pilot", body, active="pricing"))
 
 
+@app.get("/new-format", response_class=HTMLResponse)
+def new_format_page():
+    """Public page where users submit a canonical-format request when
+    the Chrome extension doesn't recognize a file type they need to
+    attest. No file bytes are accepted through this form — the form
+    collects format METADATA only. Sample files (if the submitter is
+    willing to share one) go to AIAUTH_NEWROUTES_EMAIL via a mailto
+    link, preserving the zero-knowledge architecture."""
+    body = _SUBMIT_PAGE_STYLE + """
+<div class="submit-wrap">
+  <span class="eyebrow">Canonical Format Request</span>
+  <h1 class="page-title">Request support for a new file format</h1>
+  <p class="lead">AIAuth's canonical-text extractor covers plain text, Markdown, CSV, JSON, XML, HTML, DOCX, XLSX, PPTX, and common PDFs today. If you've attested a file format we don't yet recognize — and the receipt came back without a canonical-text hash — submit the format below. Engineering reviews new-format requests and integrates high-demand formats into the next extension release.</p>
+
+  <form id="fr-form" class="submit-form" novalidate>
+    <label>
+      Format name <span style="font-weight:normal;color:var(--muted);">(e.g. "OpenDocument Spreadsheet", "LibreOffice Draw")</span>
+      <input name="format_name" type="text" required placeholder="OpenDocument Text">
+    </label>
+    <div class="row">
+      <label>
+        File extension
+        <input name="file_extension" type="text" placeholder=".odt">
+      </label>
+      <label>
+        MIME type <span style="font-weight:normal;color:var(--muted);">(optional)</span>
+        <input name="mime_type" type="text" placeholder="application/vnd.oasis.opendocument.text">
+      </label>
+    </div>
+    <label>
+      Approximate file size <span style="font-weight:normal;color:var(--muted);">(bytes, optional)</span>
+      <input name="file_size_bytes" type="number" min="0" placeholder="45000">
+    </label>
+    <label>
+      Description <span style="font-weight:normal;color:var(--muted);">(what's in this format, and why canonical extraction matters for it)</span>
+      <textarea name="description" placeholder="ODT is the default save format in LibreOffice Writer. Our legal team exports contracts as ODT before converting to PDF for signature. We need cross-format chain integrity to work across this conversion."></textarea>
+    </label>
+    <label>
+      Use case <span style="font-weight:normal;color:var(--muted);">(optional)</span>
+      <input name="use_case" type="text" placeholder="Legal contract review workflow">
+    </label>
+    <label>
+      Your email <span style="font-weight:normal;color:var(--muted);">(optional — for follow-up when format ships)</span>
+      <input name="admin_email" type="email" autocomplete="email" placeholder="you@company.com">
+    </label>
+    <button type="submit">Submit format request</button>
+  </form>
+  <div id="fr-form-ok"  class="submit-success"></div>
+  <div id="fr-form-err" class="submit-error"></div>
+
+  <div style="margin-top:28px; padding:18px 22px; background:var(--accent-soft); border:1px solid var(--border); border-radius:10px; font-size:14px; line-height:1.6; color:var(--text);">
+    <p style="margin:0 0 10px; font-weight:600;">Want to share a sample file?</p>
+    <p style="margin:0 0 10px;">File bytes <b>never touch this server</b> — that's the zero-knowledge guarantee. If you're willing to share a sample file to speed triage, email it directly to
+      <a href="mailto:newroutes@aiauth.app?subject=Canonical%20format%20sample&body=Attaching%20a%20sample%20file.%20Format:%20(fill%20in)%0A"><code>newroutes@aiauth.app</code></a>.
+      Subject line should include the format name.</p>
+    <p style="margin:0; font-size:12px; color:var(--muted);">Sample files are used only for reproducing the format in our parser; they are deleted once the format is supported in a shipped release.</p>
+  </div>
+
+  <div style="margin-top:20px; font-size:13px; color:var(--muted); line-height:1.6;">
+    <b>Our triage commitment:</b> initial review within 5 business days. If the format can be supported without a heavyweight library dependency, it ships in the next extension release (typically within 2–3 weeks). If it requires significant library additions (e.g. RTF, EPUB, proprietary binary formats), we publish an integration plan or an explicit deferral note with reasoning.
+  </div>
+</div>
+""" + _submit_page_script("fr-form", "/v1/format-request",
+                          [["format_name", "format_name", "str"],
+                           ["file_extension", "file_extension", "str"],
+                           ["mime_type", "mime_type", "str"],
+                           ["file_size_bytes", "file_size_bytes", "int"],
+                           ["description", "description", "str"],
+                           ["use_case", "use_case", "str"],
+                           ["admin_email", "admin_email", "str"]],
+                          "Thanks. We've logged your request.")
+    return HTMLResponse(_site_shell("Request a new format", body, active=""))
+
+
 @app.get("/contact", response_class=HTMLResponse)
 def contact_page(plan: Optional[str] = Query(default=None)):
     """Standalone Contact Sales page for the Team pricing tier. Posts to
@@ -4452,12 +4661,12 @@ def terms_page():
 @app.get("/security", response_class=HTMLResponse)
 def security_page():
     """Public Security & Trust page. Documents signing key custody,
-    rotation, continuity, and bus-factor risk. Content lifts from the
+    rotation, and continuity guarantees. Content lifts from the
     enterprise admin guide so free-tier users get the same transparency."""
     body = """
 <span class="eyebrow">Security &amp; Trust</span>
-<h1 class="page-title">Where the keys live and what happens if we disappear.</h1>
-<p class="lead">An attestation receipt is only as trustworthy as the key that signed it. This page documents how AIAuth's signing keys are managed, rotated, backed up, and how the system continues to function if Finch Business Services LLC ever ceases to operate.</p>
+<h1 class="page-title">Signing-key custody, rotation, and long-term verifiability.</h1>
+<p class="lead">An attestation receipt is only as trustworthy as the key that signed it. This page documents how AIAuth's signing keys are managed, rotated, and backed up, and how the verification chain is engineered to remain intact for the full life of the record.</p>
 
 <div class="prose">
   <h2>Signing key infrastructure</h2>
@@ -4496,26 +4705,26 @@ def security_page():
 }</code></pre>
   <p>When verifying a receipt, select the key whose <code>key_id</code> matches the receipt's <code>key_id</code> field. If the receipt has no <code>key_id</code> (legacy), fall back to trying each key in the manifest.</p>
 
-  <h2>Continuity and bus-factor</h2>
-  <p>AIAuth is intentionally designed so that the signing server is not a single point of failure for verification. If the signing server goes offline — permanently — receipts remain verifiable forever, provided the public key is available:</p>
+  <h2>Continuity and long-term verifiability</h2>
+  <p>The AIAuth architecture is engineered so that no single service is a point of failure for verification. A receipt issued today remains cryptographically verifiable indefinitely, independent of the operational status of the signing service:</p>
   <ul>
-    <li><b>Public key survivability.</b> The current and all retired public keys are published on GitHub alongside the source code. Any copy of the repo (including the Wayback Machine and any forks) preserves them.</li>
-    <li><b>Stateless verification.</b> Receipt verification requires only the receipt, the public key matching the receipt's <code>key_id</code>, and an Ed25519 library. It does not require the AIAuth server to be reachable.</li>
-    <li><b>Open-source client.</b> The Chrome extension and receipt format are open-source at <a href="https://github.com/chasehfinch-cpu/AIAuth">github.com/chasehfinch-cpu/AIAuth</a> under Apache 2.0. A fork can continue to build and publish the extension if we cannot.</li>
-    <li><b>Self-hosted deployments are customer-owned.</b> Enterprise customers run AIAuth on their own infrastructure with their own keys. Nothing about an enterprise deployment depends on Finch Business Services LLC continuing to exist.</li>
-    <li><b>90-day shutdown notice.</b> Per the <a href="/terms">Terms of Service</a>, any planned permanent shutdown of the free tier is announced at least 90 days in advance, and a final archive of the public key and hash registry is published before takedown.</li>
+    <li><b>Public key survivability.</b> The current and all retired public keys are published on GitHub alongside the source code. Any copy of the repository, including mirrors and archival services such as the Wayback Machine, preserves them.</li>
+    <li><b>Stateless verification.</b> Receipt verification requires only the receipt, the public key matching the receipt's <code>key_id</code>, and an Ed25519 library. It does not require any AIAuth-operated server to be reachable.</li>
+    <li><b>Open-source client.</b> The Chrome extension and receipt format are open-source at <a href="https://github.com/chasehfinch-cpu/AIAuth">github.com/chasehfinch-cpu/AIAuth</a> under Apache 2.0, independently buildable and deployable.</li>
+    <li><b>Self-hosted deployments are customer-owned.</b> Enterprise customers run AIAuth on their own infrastructure with their own keys. Enterprise operations are fully self-contained and do not depend on any Finch Business Services LLC service.</li>
+    <li><b>90-day shutdown notice.</b> Per the <a href="/terms">Terms of Service</a>, any planned permanent shutdown of the free tier is announced at least 90 days in advance, and a final archive of the public key and hash registry is published to a public location before takedown.</li>
   </ul>
 
   <h2>Reporting a vulnerability</h2>
-  <p>Responsible disclosure process, affected component categories, and contact addresses are documented in <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/SECURITY.md">SECURITY.md</a>. We do not currently offer a bug bounty; we acknowledge reporters in the security advisory when a fix ships.</p>
+  <p>The responsible-disclosure process, component scope, and contact addresses are documented in <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/SECURITY.md">SECURITY.md</a>. Reporters are acknowledged in the security advisory when a fix ships.</p>
 
-  <h2>Where we aren't yet</h2>
-  <p>Transparency about what we don't yet have:</p>
+  <h2>Current program status</h2>
+  <p>Transparency on what is and isn't in place today:</p>
   <ul>
-    <li>No formal SOC 2 audit report. A control-crosswalk document is on <a href="/compliance">/compliance</a> for reference.</li>
-    <li>No third-party penetration test (a scoped engagement is on the roadmap).</li>
-    <li>No bug bounty program (we treat vulnerability reports via the SECURITY.md channel seriously regardless).</li>
-    <li>No HSM for the free-tier signing key (self-hosted enterprise customers can and do use HSMs for their own keys).</li>
+    <li>A formal SOC 2 audit is on the FY2026 roadmap. A control crosswalk is available at <a href="/compliance">/compliance</a>.</li>
+    <li>A scoped third-party penetration test is on the FY2026 roadmap.</li>
+    <li>A bug-bounty program is planned for launch once the SOC 2 audit period concludes. Until then, vulnerability reports via the SECURITY.md channel receive prompt triage.</li>
+    <li>Free-tier signing keys do not currently run in a dedicated HSM. Self-hosted enterprise deployments can and do use HSMs for their own keys, configured per the enterprise admin guide.</li>
   </ul>
 </div>
 """
@@ -5290,13 +5499,36 @@ h1.page-title {{ font-size:clamp(30px,4vw,46px); line-height:1.1; font-weight:80
 .copy-btn:hover {{ background:#e0eaff; }}
 footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px solid var(--border); }}
 .foot-inner {{ display:flex; justify-content:space-between; flex-wrap:wrap; gap:16px; }}
-.foot-inner a {{ color:var(--muted); margin-right:18px; }}
-@media (max-width:760px) {{ .nav-links a:not(.nav-cta):not(.brand) {{ display:none; }} }}
+.foot-inner a {{ color:var(--muted); margin-right:18px; display:inline-block; line-height:1.9; }}
+
+/* Hamburger toggle — hidden on desktop, shown on narrow viewports. */
+.nav-toggle {{ display:none; align-items:center; justify-content:center; width:40px; height:36px; background:none; border:1px solid var(--border); border-radius:8px; padding:0; cursor:pointer; color:var(--text); }}
+.nav-toggle:hover {{ border-color:var(--accent); }}
+.nav-toggle .bars {{ display:inline-block; position:relative; width:18px; height:2px; background:var(--text); border-radius:1px; }}
+.nav-toggle .bars::before, .nav-toggle .bars::after {{ content:""; position:absolute; left:0; width:18px; height:2px; background:var(--text); border-radius:1px; }}
+.nav-toggle .bars::before {{ top:-6px; }}
+.nav-toggle .bars::after {{ top:6px; }}
+.nav-inner {{ position:relative; }}
+
+@media (max-width:760px) {{
+  .nav-toggle {{ display:inline-flex; }}
+  .nav-links {{ display:none; position:absolute; top:56px; right:8px; left:8px; background:#fff; border:1px solid var(--border); border-radius:12px; padding:14px; flex-direction:column; align-items:stretch; gap:6px; box-shadow:0 10px 28px rgba(0,0,0,0.08); z-index:20; }}
+  .nav-links.open {{ display:flex; }}
+  .nav-links a {{ padding:10px 12px; border-radius:8px; color:var(--text); font-weight:500; }}
+  .nav-links a:hover {{ background:var(--panel); text-decoration:none; }}
+  .nav-links .nav-cta-outline {{ text-align:center; border:1px solid var(--border); margin-top:4px; }}
+  .nav-links .nav-cta {{ text-align:center; }}
+  .foot-inner {{ flex-direction:column; gap:14px; }}
+  .foot-inner > div:last-child {{ line-height:2; }}
+}}
 </style>
 </head><body>
 <nav class="nav"><div class="container-wide nav-inner">
   <a class="brand" href="/"><img src="/logo.png" alt="AIAuth"><span>AIAuth</span></a>
-  <div class="nav-links">
+  <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false" onclick="(function(btn){{var l=document.getElementById('primaryNav');var open=l.classList.toggle('open');btn.setAttribute('aria-expanded',open?'true':'false');}})(this)">
+    <span class="bars"></span>
+  </button>
+  <div class="nav-links" id="primaryNav">
     <a href="/#how-it-works"{active_cls('how')}>How It Works</a>
     <a href="/pricing"{active_cls('pricing')}>Pricing</a>
     <a href="/standards"{active_cls('standards')}>Standards</a>
@@ -5317,6 +5549,7 @@ footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px sol
     <a href="/compliance">Compliance</a>
     <a href="/public-key">Public Key</a>
     <a href="/enterprise-guide">Enterprise Guide</a>
+    <a href="/new-format">Request a Format</a>
     <a href="https://github.com/chasehfinch-cpu/AIAuth" target="_blank" rel="noopener">GitHub</a>
   </div>
 </div></footer>
@@ -5425,23 +5658,20 @@ def privacy_page():
 </ul>
 
 <h2>Server Logs</h2>
-<p>Our reverse proxy (nginx) logs standard HTTP access records — timestamps, paths, status codes, IP addresses — for operational reliability and abuse prevention. These are rotated weekly and not linked to any user profile (because we don't maintain user profiles in the traditional sense).</p>
+<p>The reverse proxy (nginx) records standard HTTP access entries — timestamps, paths, status codes, IP addresses — for operational reliability and abuse prevention. Logs are rotated weekly and are not joined to any account profile; AIAuth does not maintain per-user behavioral profiles of any kind.</p>
 
 <h2>Third-Party Services</h2>
-<p>Our website loads typography fonts from Google Fonts. When you visit a page on aiauth.app, your browser fetches font files from Google's CDN — subject to Google's own privacy terms. The Chrome extension loads no third-party resources.</p>
-<p>Our transactional email provider is <strong>Resend</strong>. They hold email-delivery metadata (recipient address, timestamp) for up to 30 days for deliverability diagnostics. We do not transmit anything else to them.</p>
+<p>The AIAuth website loads typography fonts from Google Fonts. When you visit a page on aiauth.app, your browser fetches font files from Google's CDN, subject to Google's own privacy terms. The Chrome extension loads no third-party resources.</p>
+<p>AIAuth's transactional-email provider is <strong>Resend</strong>. Resend retains email-delivery metadata (recipient address, timestamp) for up to 30 days for deliverability diagnostics. No other data is transmitted to Resend.</p>
 
 <h2>Children</h2>
 <p>AIAuth is not directed to children under 13 and does not knowingly collect information from them.</p>
 
-<h2>Honest Reality</h2>
-<p>AIAuth is built by a one-person business. We offer no SLAs, no 24/7 support line, and no formal data-protection officer. What we offer is software that tries to be small, honest, and correct. If you have questions or concerns, you'll get a direct reply from a human within a few days.</p>
-
-<h2>Changes to This Policy</h2>
-<p>Material changes are announced on this page and the "last updated" date changes. The core guarantees (content never transmitted; no plaintext emails stored; no selling data) will never change without a new major version and explicit notice to existing account holders.</p>
+<h2>Service Commitments</h2>
+<p>AIAuth is operated by Finch Business Services LLC, a privately held company. Free-tier service is provided without formal SLAs. Enterprise customers receive support levels defined in their executed service agreement. Material operational changes — including any planned discontinuation of the free tier — are announced with at least 90 days of notice per the <a href="/terms">Terms of Service</a>. The core privacy guarantees on this page are contractual commitments; they will not be weakened without a new major version, a clear diff, and explicit notice to existing account holders.</p>
 
 <h2>Contact</h2>
-<p>Questions: <a href="mailto:privacy@aiauth.app">privacy@aiauth.app</a>. Security advisories: <a href="mailto:security@aiauth.app">security@aiauth.app</a>.</p>
+<p>Privacy inquiries: <a href="mailto:privacy@aiauth.app">privacy@aiauth.app</a>. Security disclosures: <a href="mailto:security@aiauth.app">security@aiauth.app</a>. Commercial inquiries: <a href="mailto:sales@aiauth.app">sales@aiauth.app</a>.</p>
 </div>"""
     return HTMLResponse(_site_shell("Privacy", body, active=""))
 

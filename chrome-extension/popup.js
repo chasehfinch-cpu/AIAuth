@@ -429,6 +429,8 @@ async function attestFile(file) {
       note,
       // Serialize as plain array for message passing.
       imageBytes: Array.from(new Uint8Array(buf)),
+      // v1.5.0: file descriptor for canonical-text dispatch.
+      fileDescriptor: { name: file.name, type: file.type, size: file.size },
     });
     if (resp && resp.ok) {
       setStatus(`Receipt: ${resp.receipt_code}`, "ok");

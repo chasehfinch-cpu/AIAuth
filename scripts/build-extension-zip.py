@@ -37,6 +37,11 @@ INCLUDE = [
     # Imported into the service worker via importScripts() in background.js.
     "c2pa_parser.js",
     "cbor_decoder.js",
+    # v1.5.0: cross-format chain integrity — canonical-text extractor
+    # (plain text / DOCX / XLSX / PPTX) and a minimal PDF text extractor.
+    # Same importScripts pattern.
+    "canonical_text.js",
+    "pdf_text.js",
     "icons/icon16.png",
     "icons/icon48.png",
     "icons/icon128.png",
