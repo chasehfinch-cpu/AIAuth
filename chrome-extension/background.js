@@ -11,7 +11,7 @@
 // NEVER populated here. Piece 9 will add enterprise-tier capture mode.
 
 const DEFAULT_SERVER = "https://aiauth.app";
-const EXTENSION_VERSION = "0.5.0";
+const EXTENSION_VERSION = "1.3.0";
 
 // CLIENT_SECRET is embedded in the extension and rotated per release.
 // The server holds a matching value in its env var CLIENT_SECRET.
@@ -224,12 +224,24 @@ async function buildSignBody({ text, sourceUrl, userId, promptText, tta, tabId }
     body.prompt_hash = await hashNormalized(promptText);
   }
 
-  // ai_markers: browser text attestations cannot inspect file metadata,
-  // so we leave this null. Desktop agent populates it on file attests.
+  // Data Depth v1.3.0 Tier 1: populate ai_markers with a minimal AI
+  // authorship signal when we detected a known AI domain. File-level
+  // signals (C2PA, docProps, PDF XMP) remain deferred to a future tier.
+  if (model) {
+    body.ai_markers = {
+      source: model,
+      provider: provider || null,
+      verified: true,
+    };
+  }
+
+  // v1.3.0 Tier 1: tta is a free-tier field now. Previously gated to
+  // enterprise only. The server surfaces a rubber-stamp warning on
+  // /check when tta < 10 and len > 500.
+  if (tta != null) body.tta = tta;
 
   // ---------- Enterprise-tier ONLY fields ----------
   if (tier === "enterprise") {
-    if (tta != null) body.tta = tta;
     const sid = getTabSessionId(tabId);
     if (sid) body.sid = sid;
 
@@ -308,6 +320,8 @@ async function signContent(text, sourceUrl, promptText, tta, tabId) {
     prompt_hash: body.prompt_hash || null,
     file_type: body.file_type,
     len: body.len,
+    tta: body.tta != null ? body.tta : null,
+    ai_markers: body.ai_markers || null,
     status: "signed",          // Piece 4+ will use "pending" for offline queueing
     receipt: data.receipt,
     signature: data.signature,

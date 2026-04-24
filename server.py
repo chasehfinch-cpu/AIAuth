@@ -1259,6 +1259,13 @@ class SignRequest(BaseModel):
     perceptual_hashes: Optional[Dict[str, Any]] = None  # {dhash, phash} for images
     canonical_extraction_failed: Optional[bool] = None  # set by client when format extractor was unavailable
 
+    # ----- v0.5.2: C2PA interop intake (Data Depth PR, Tier 1) -----
+    # When the attested content carries a C2PA / Content Credentials manifest,
+    # clients may surface the manifest's SHA-256 identity hash here. The hash
+    # is NOT the manifest bytes — just a digest. Canonical receipt carrier is
+    # ai_markers.c2pa.manifest_hash (see docs/RECEIPT_SPEC.md §3.2.1).
+    c2pa_manifest_hash: Optional[str] = None
+
     # Pydantic v2 config: allow "len" as alias; also tolerate extra fields for forward-compat
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
@@ -1277,6 +1284,8 @@ def _validate_sign_request(req: SignRequest) -> None:
         raise AIAuthError("INVALID_RECEIPT", "client_integrity must be one of: none, extension, os-verified", 400)
     if req.content_hash_canonical is not None and not _SHA256_RE.match(req.content_hash_canonical):
         raise AIAuthError("INVALID_HASH", "content_hash_canonical must be a 64-character SHA-256 hex string", 400)
+    if req.c2pa_manifest_hash is not None and not _SHA256_RE.match(req.c2pa_manifest_hash):
+        raise AIAuthError("INVALID_HASH", "c2pa_manifest_hash must be a 64-character SHA-256 hex string", 400)
 
 
 def _validate_client_integrity(request: Request, claimed: Optional[str], content_hash: str) -> str:
@@ -1392,6 +1401,17 @@ def sign_receipt(req: SignRequest, request: Request):
     if req.content_length is not None: receipt["len"] = req.content_length
     if req.doc_id: receipt["doc_id"] = req.doc_id
     if req.ai_markers: receipt["ai_markers"] = req.ai_markers
+    # v0.5.2: C2PA manifest hash. If the client sent c2pa_manifest_hash as
+    # a top-level field, fold it into ai_markers.c2pa.manifest_hash so
+    # verifiers have a single canonical place to look (see RECEIPT_SPEC
+    # §3.2.1). If ai_markers already has a c2pa block, the top-level field
+    # is authoritative — overwrite just the manifest_hash key.
+    if req.c2pa_manifest_hash:
+        markers = receipt.get("ai_markers") or {}
+        c2pa_block = dict(markers.get("c2pa") or {})
+        c2pa_block["manifest_hash"] = req.c2pa_manifest_hash
+        markers["c2pa"] = c2pa_block
+        receipt["ai_markers"] = markers
     # client_integrity: validate against HMAC header. Downgrades-only:
     # an invalid claim becomes "none"; never upgrades above what client requested.
     receipt["client_integrity"] = _validate_client_integrity(request, req.client_integrity, req.output_hash)
@@ -2882,7 +2902,8 @@ def dashboard_data(
         f"       SUM(CASE WHEN COALESCE(ea.tta, 999) < 10 AND COALESCE(ea.len, 0) > 500 THEN 1 ELSE 0 END) AS rubber_stamps, "
         f"       SUM(CASE WHEN ea.dest_ext = 1 THEN 1 ELSE 0 END) AS external_exposure, "
         f"       SUM(CASE WHEN ea.ai_markers IS NOT NULL THEN 1 ELSE 0 END) AS ai_authored, "
-        f"       SUM(CASE WHEN ea.prompt_hash IS NOT NULL THEN 1 ELSE 0 END) AS with_prompt_hash "
+        f"       SUM(CASE WHEN ea.prompt_hash IS NOT NULL THEN 1 ELSE 0 END) AS with_prompt_hash, "
+        f"       SUM(CASE WHEN json_extract(ea.ai_markers, '$.c2pa.manifest_hash') IS NOT NULL THEN 1 ELSE 0 END) AS with_c2pa "
         f"FROM enterprise_attestations ea {join} WHERE {where} {dept_filter}",
         params,
     ).fetchone()
@@ -3098,6 +3119,7 @@ def dashboard_data(
             "median_tta_seconds": median_tta,
             "prompt_hash_coverage": round(prompt_cov, 3),
             "ai_authored_detected": summary_row["ai_authored"] or 0,
+            "receipts_with_c2pa": summary_row["with_c2pa"] or 0,
             "shadow_ai_alerts": sum(1 for s in shadow_by_app if s["shadow_ratio"] > 0.2),
         },
         "by_department": by_department,
@@ -3401,6 +3423,72 @@ def verify_chain(req: ChainVerifyRequest):
         "final": links[-1]["user"] if links else None,
         "links": links,
     }
+
+
+class FileSignalsRequest(BaseModel):
+    """Body for POST /v1/verify/file-signals.
+
+    Verifier-side helper that cross-checks a receipt against file-signal
+    hashes the verifier computed independently. Stateless, zero-knowledge
+    (only hashes transmitted). Useful when a receipt claims a C2PA
+    manifest or a canonical-text hash and the verifier wants to confirm
+    the file they hold actually matches those claims.
+    """
+    receipt: dict
+    c2pa_manifest_hash: Optional[str] = None
+    content_hash_canonical: Optional[str] = None
+    file_hash: Optional[str] = None  # SHA-256 of raw file bytes
+
+
+@app.post("/v1/verify/file-signals")
+def verify_file_signals(req: FileSignalsRequest):
+    """Compare claimed signals on a receipt against independently computed
+    hashes of the file the verifier holds. Returns per-signal match/mismatch.
+
+    This does NOT verify the receipt's signature — chain that through
+    POST /v1/verify if you need signature validation too.
+    """
+    r = req.receipt or {}
+    result: Dict[str, Any] = {"receipt_id": r.get("id"), "checks": {}}
+
+    # content_hash (file bytes) check
+    if req.file_hash:
+        if not _SHA256_RE.match(req.file_hash):
+            raise AIAuthError("INVALID_HASH", "file_hash must be a 64-character SHA-256 hex string", 400)
+        result["checks"]["file_hash"] = {
+            "supplied": req.file_hash,
+            "receipt": r.get("hash"),
+            "match": r.get("hash") == req.file_hash,
+        }
+
+    # canonical text hash check
+    if req.content_hash_canonical:
+        if not _SHA256_RE.match(req.content_hash_canonical):
+            raise AIAuthError("INVALID_HASH", "content_hash_canonical must be a 64-character SHA-256 hex string", 400)
+        result["checks"]["content_hash_canonical"] = {
+            "supplied": req.content_hash_canonical,
+            "receipt": r.get("content_hash_canonical"),
+            "match": r.get("content_hash_canonical") == req.content_hash_canonical,
+        }
+
+    # C2PA manifest hash check
+    if req.c2pa_manifest_hash:
+        if not _SHA256_RE.match(req.c2pa_manifest_hash):
+            raise AIAuthError("INVALID_HASH", "c2pa_manifest_hash must be a 64-character SHA-256 hex string", 400)
+        receipt_c2pa = ((r.get("ai_markers") or {}).get("c2pa") or {}).get("manifest_hash")
+        result["checks"]["c2pa_manifest_hash"] = {
+            "supplied": req.c2pa_manifest_hash,
+            "receipt": receipt_c2pa,
+            "match": receipt_c2pa == req.c2pa_manifest_hash,
+        }
+
+    if not result["checks"]:
+        raise AIAuthError("INVALID_RECEIPT",
+                          "Supply at least one of: file_hash, content_hash_canonical, c2pa_manifest_hash",
+                          400)
+
+    result["all_match"] = all(c.get("match") is True for c in result["checks"].values())
+    return result
 
 
 # ===================================================================

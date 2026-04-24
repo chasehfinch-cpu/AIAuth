@@ -1,8 +1,10 @@
-# Chrome Web Store Listing Copy — v1.2.2
+# Chrome Web Store Listing Copy — v1.3.0
 
-**Purpose:** Exact text to paste into the Chrome Web Store Developer Dashboard for the AIAuth extension listing. Replaces the v1.2.2 draft that was rejected on 2026-04-24 (reference: Yellow Argon) for "excessive keywords in the item's description."
+**Purpose:** Exact text to paste into the Chrome Web Store Developer Dashboard for the AIAuth extension listing.
 
-**Rejection root cause:** The previous detailed description enumerated seven brand names in a single line (`Claude, ChatGPT, Copilot, Gemini, Cursor, Perplexity, Poe`). Chrome Web Store treats brand-list enumerations as keyword stuffing under the Spam and Placement in the Store policy. This rewrite removes the enumeration entirely and describes compatibility generically.
+**v1.3.0 changes (Data Depth Tier 1):** Richer receipts. Time-to-attest (TTA) now travels with every receipt so the public verification page can surface a rubber-stamp warning when a reviewer signed off too quickly on a long piece of content. AI-tool provenance markers (model and provider, when detected from the page URL) populate the `ai_markers` block so verifiers can see which tool produced the content. No new permissions, no new host permissions, no new listing copy required beyond the version number. The short description, detailed description, permissions justifications, and privacy-practices disclosures below are unchanged from v1.2.2.
+
+**Rejection history:** v1.2.2 was rejected on 2026-04-24 (reference: Yellow Argon) for excessive keyword enumeration in the detailed description. The copy below reflects the corrected, approved language.
 
 **Scope of this file:** The in-repo [manifest.json](manifest.json) description is already compliant and does not change. This file is the source of truth for the dashboard fields only.
 
