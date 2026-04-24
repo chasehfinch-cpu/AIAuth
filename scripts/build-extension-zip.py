@@ -36,6 +36,9 @@ INCLUDE = [
     "icons/icon16.png",
     "icons/icon48.png",
     "icons/icon128.png",
+    # Ship Apache 2.0 license alongside the code so the CWS package is
+    # self-contained for forks and security reviewers.
+    "LICENSE",
 ]
 
 
