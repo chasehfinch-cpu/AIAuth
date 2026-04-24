@@ -7,6 +7,9 @@ aiauth_public.pem
 *.db-journal
 *.db-wal
 *.db-shm
+# Key manifests are runtime state — each deployment generates its own.
+keys/
+key_manifest.json
 
 # Python
 __pycache__/
