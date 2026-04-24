@@ -80,6 +80,9 @@
   .price-card.featured .price-cta { background: var(--accent); color: #fff; border-color: var(--accent); }
   .price-cta:hover { text-decoration: none; background: var(--panel); }
   .price-card.featured .price-cta:hover { background: #1d4ed8; }
+  .price-fallback { text-align: center; font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .price-fallback a { color: var(--muted); text-decoration: underline; }
+  .price-fallback a:hover { color: var(--accent); }
 
   /* Comparison table */
   .compare-table { margin-top: 28px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: #fff; }
@@ -129,6 +132,18 @@
 
 <script>
   (function () {
+    // Smooth-scroll + focus for in-page waitlist CTAs (pricing → hero form)
+    document.querySelectorAll('a[data-scroll-to]').forEach(function (link) {
+      link.addEventListener("click", function (e) {
+        var target = document.querySelector(link.getAttribute("data-scroll-to"));
+        if (!target) return;
+        e.preventDefault();
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+        var input = target.querySelector('input[type="email"]');
+        if (input) setTimeout(function () { input.focus(); }, 400);
+      });
+    });
+
     var form = document.getElementById("waitlist-form");
     var ok = document.getElementById("waitlist-success");
     var err = document.getElementById("waitlist-error");
@@ -229,7 +244,7 @@
         <li>Prompt-chain and file attestation</li>
         <li>No account required to start</li>
       </ul>
-      <a class="price-cta" href="#waitlist-form">Join the Waitlist</a>
+      <a class="price-cta" href="#waitlist-form" data-scroll-to="#waitlist-form">Join the Waitlist</a>
     </div>
     <div class="price-card featured">
       <div class="price-tier">Team</div>
@@ -243,7 +258,8 @@
         <li>Chain integrity monitoring</li>
         <li>Email support</li>
       </ul>
-      <a class="price-cta" href="mailto:sales@aiauth.app?subject=AIAuth%20Team%20Plan">Contact Sales</a>
+      <a class="price-cta" href="/demo?plan=team">Contact Sales</a>
+      <div class="price-fallback">or email <a href="mailto:sales@aiauth.app?subject=AIAuth%20Team%20Plan">sales@aiauth.app</a></div>
     </div>
     <div class="price-card">
       <div class="price-tier">Enterprise</div>
@@ -257,7 +273,8 @@
         <li>Managed-config for Workspace / Intune</li>
         <li>Pilot report generator</li>
       </ul>
-      <a class="price-cta" href="mailto:sales@aiauth.app?subject=AIAuth%20Enterprise%20Pilot">Request a Pilot</a>
+      <a class="price-cta" href="/demo?plan=enterprise">Request a Pilot</a>
+      <div class="price-fallback">or email <a href="mailto:sales@aiauth.app?subject=AIAuth%20Enterprise%20Pilot">sales@aiauth.app</a></div>
     </div>
   </div>
 </section>
