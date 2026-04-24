@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AIAuth — Chain of Custody for AI Work",
   "short_name": "AIAuth",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Tamper-proof chain-of-custody receipts for AI-generated work. Right-click to attest. Content never leaves your device.",
   "storage": {
     "managed_schema": "managed_schema.json"

@@ -10,8 +10,20 @@
 // (tta, sid, dest, dest_ext, classification, concurrent_ai_apps) are
 // NEVER populated here. Piece 9 will add enterprise-tier capture mode.
 
+// v1.4.0: Load the C2PA JUMBF parser + minimal CBOR decoder into the
+// service worker scope. Both modules are pure — no DOM access, no
+// network — so running them in the background is safe.
+try {
+  importScripts("c2pa_parser.js", "cbor_decoder.js");
+} catch (e) {
+  // If a future CWS packaging change breaks the import, log but keep
+  // the worker alive. C2PA enrichment will be skipped on every
+  // attestation, but regular sign/verify still works.
+  console.warn("[AIAuth] C2PA modules failed to load:", e);
+}
+
 const DEFAULT_SERVER = "https://aiauth.app";
-const EXTENSION_VERSION = "1.3.0";
+const EXTENSION_VERSION = "1.4.0";
 
 // CLIENT_SECRET is embedded in the extension and rotated per release.
 // The server holds a matching value in its env var CLIENT_SECRET.
@@ -272,6 +284,116 @@ async function buildSignBody({ text, sourceUrl, userId, promptText, tta, tabId }
   return body;
 }
 
+// ===================================================================
+// C2PA enrichment (v1.4.0, Data Depth Tier 2.5)
+// ===================================================================
+//
+// enrichWithC2PA(body, imageBytes) — if the given bytes carry a C2PA
+// JUMBF manifest, decode the active manifest's claim and populate
+// body.ai_markers.c2pa (canonical location per RECEIPT_SPEC §3.2.1) and
+// body.c2pa_manifest_hash (first-class SignRequest field, validated
+// server-side since v1.3.0).
+//
+// Returns the (possibly mutated) body. On any parsing failure (not a
+// PNG, no caBX chunk, CBOR subset violation, etc.) returns body
+// unchanged — attestation proceeds without C2PA data. Never throws:
+// graceful degradation is the contract.
+async function enrichWithC2PA(body, imageBytes) {
+  if (!imageBytes || !self.AIAuthC2PA || !self.AIAuthCBOR) return body;
+  try {
+    const u8 = imageBytes instanceof Uint8Array
+      ? imageBytes
+      : new Uint8Array(imageBytes);
+    const jumbf = self.AIAuthC2PA.extractJumbfFromPng(u8);
+    if (!jumbf) return body;
+
+    const tree = self.AIAuthC2PA.parseJumbfBoxTree(jumbf);
+    const active = self.AIAuthC2PA.activeManifest(tree);
+    if (!active) return body;
+
+    // Locate and decode the claim CBOR.
+    const claimBox = active.children.find(c => c.label === "c2pa.claim");
+    const sigBox = active.children.find(c => c.label === "c2pa.signature");
+    if (!claimBox) return body;
+    const cborChild = claimBox.children.find(c => c.type === "cbor");
+    if (!cborChild) return body;
+    const cborBytes = self.AIAuthC2PA.getBoxContentBytes(cborChild, jumbf);
+
+    let claim;
+    try {
+      claim = self.AIAuthCBOR.decodeCbor(cborBytes);
+    } catch (e) {
+      // CBOR subset violation — skip enrichment, attest without C2PA.
+      return body;
+    }
+
+    // SHA-256 the entire JUMBF superbox as the manifest hash. This is
+    // the opaque identity used by /v1/verify/file-signals.
+    const manifestHash = await self.AIAuthC2PA.sha256Hex(jumbf);
+
+    // Pull out the assertion labels (URLs of the form
+    // "self#jumbf=c2pa.assertions/c2pa.hash.data"). Strip the prefix.
+    let assertionLabels = [];
+    if (Array.isArray(claim.assertions)) {
+      assertionLabels = claim.assertions
+        .map(a => {
+          if (a && typeof a === "object" && typeof a.url === "string") {
+            const idx = a.url.lastIndexOf("/");
+            return idx >= 0 ? a.url.slice(idx + 1) : a.url;
+          }
+          return null;
+        })
+        .filter(x => typeof x === "string" && x.length > 0);
+    }
+
+    // Build the c2pa sub-object. Skip fields the claim doesn't supply.
+    const c2pa = { manifest_hash: manifestHash };
+    if (typeof claim.claim_generator === "string") {
+      c2pa.claim_generator = claim.claim_generator;
+    }
+    if (assertionLabels.length) c2pa.assertions = assertionLabels;
+    if (typeof claim.alg === "string") c2pa.alg = claim.alg;
+    if (sigBox) c2pa.has_signature = true;
+
+    // Fold into ai_markers.c2pa, preserving any existing ai_markers fields.
+    body.ai_markers = body.ai_markers || {};
+    body.ai_markers.c2pa = c2pa;
+
+    // Also set the first-class top-level field so server validation and
+    // dashboard counters see it. This was shipped in v1.3.0.
+    body.c2pa_manifest_hash = manifestHash;
+
+    return body;
+  } catch (e) {
+    console.warn("[AIAuth] C2PA enrichment failed:", e);
+    return body;
+  }
+}
+
+// Fetch image bytes — try the content script first (page origin, CORS
+// friendly for same-origin), fall back to the service worker's fetch.
+// Returns Uint8Array on success or null on failure.
+async function fetchImageBytes(imageUrl, tabId) {
+  if (tabId) {
+    try {
+      const resp = await chrome.tabs.sendMessage(tabId, {
+        type: "AIAUTH_FETCH_IMAGE_BYTES",
+        url: imageUrl,
+      });
+      if (resp && resp.ok && Array.isArray(resp.bytes)) {
+        return new Uint8Array(resp.bytes);
+      }
+    } catch (e) { /* content script not injected — fall through */ }
+  }
+  try {
+    const r = await fetch(imageUrl);
+    if (!r.ok) return null;
+    return new Uint8Array(await r.arrayBuffer());
+  } catch (e) {
+    return null;
+  }
+}
+
 async function signContent(text, sourceUrl, promptText, tta, tabId) {
   if (!text || !text.trim()) throw new Error("No text to attest.");
   const { server, userId } = await getConfig();
@@ -333,13 +455,15 @@ async function signContent(text, sourceUrl, promptText, tta, tabId) {
   return data;
 }
 
-// Manual hash-based signing (for file attestation via popup — no prompt text)
-async function signHash(output_hash, source, note) {
+// Manual hash-based signing (for file attestation via popup — no prompt text).
+// v1.4.0: accepts an optional imageBytes payload so the popup drag-drop
+// and right-click-image paths can surface C2PA data into the receipt.
+async function signHash(output_hash, source, note, imageBytes) {
   const { server, userId } = await getConfig();
   if (!userId) throw new Error("Set your email/name in the AIAuth popup first.");
   if (!/^[0-9a-f]{64}$/i.test(output_hash)) throw new Error("Invalid hash.");
 
-  const body = {
+  let body = {
     output_hash,
     user_id: userId,
     source: source || "chrome-extension",
@@ -349,6 +473,12 @@ async function signHash(output_hash, source, note) {
     client_integrity: CLIENT_SECRET ? "extension" : "none",
   };
   if (note) body.note = note;
+
+  // v1.4.0: C2PA Tier 2.5 enrichment — if the caller passed image bytes,
+  // probe for a JUMBF manifest and populate ai_markers.c2pa.
+  if (imageBytes) {
+    body = await enrichWithC2PA(body, imageBytes);
+  }
 
   const timestamp = new Date().toISOString();
   const clientHash = await clientIntegrityHmac(output_hash, timestamp);
@@ -384,6 +514,9 @@ async function signHash(output_hash, source, note) {
     ts: data.receipt.ts,
     source: source || "chrome-extension",
     note: note || null,
+    // v1.4.0: carry ai_markers back to the popup so it can render the
+    // C2PA pill on the receipt row.
+    ai_markers: body.ai_markers || null,
     status: "signed",
     receipt: data.receipt,
     signature: data.signature,
@@ -448,30 +581,77 @@ async function handleAttest(text, sourceUrl, tabId, promptText, tta) {
   }
 }
 
-// Right-click menu on selected text
+// Right-click menus. v1.4.0 adds a second entry for images so users can
+// attest any picture (including Firefly / DALL-E / Midjourney output)
+// and pick up the C2PA manifest if one is embedded.
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
     id: "aiauth-attest-selection",
     title: "Attest selection with AIAuth",
     contexts: ["selection"],
   }, () => void chrome.runtime.lastError);
+  chrome.contextMenus.create({
+    id: "aiauth-attest-image",
+    title: "Attest image with AIAuth",
+    contexts: ["image"],
+  }, () => void chrome.runtime.lastError);
 });
 
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== "aiauth-attest-selection") return;
-  const text = info.selectionText || "";
-  // Context menu can't reach the content script synchronously, so try
-  // to fetch the last user prompt if the tab has our content script injected.
-  let promptText = null;
-  let tta = null;
-  if (tab?.id) {
+// v1.4.0: handler for right-click image attestation. Fetches bytes,
+// hashes them, runs C2PA enrichment, signs.
+async function handleAttestImage(imageUrl, tabId) {
+  try {
+    const bytes = await fetchImageBytes(imageUrl, tabId);
+    if (!bytes) {
+      await notify(
+        "AIAuth — image unreachable",
+        "Couldn't fetch the image bytes. Try saving it locally and dragging it onto the popup."
+      );
+      return { ok: false, error: "image fetch failed" };
+    }
+    // Hash the raw image bytes as output_hash.
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    const hash = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+    // signHash is the shared signing path used by popup drag-drop too.
+    // Passing imageBytes triggers C2PA enrichment inside signHash.
+    let source = "image:right-click";
     try {
-      const resp = await chrome.tabs.sendMessage(tab.id, { type: "AIAUTH_GET_SELECTION" });
-      promptText = (resp && resp.prompt_text) || null;
-      tta = (resp && typeof resp.tta === "number") ? resp.tta : null;
+      const u = new URL(imageUrl);
+      source = `image:${u.hostname}`;
     } catch {}
+    const data = await signHash(hash, source, `url=${imageUrl.slice(0, 256)}`, bytes);
+    await notify("AIAuth — image attested", data.receipt_code);
+    return { ok: true, receipt_code: data.receipt_code };
+  } catch (err) {
+    await notify("AIAuth — error", String(err.message || err));
+    return { ok: false, error: String(err.message || err) };
   }
-  await handleAttest(text, tab?.url, tab?.id, promptText, tta);
+}
+
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId === "aiauth-attest-selection") {
+    const text = info.selectionText || "";
+    let promptText = null;
+    let tta = null;
+    if (tab?.id) {
+      try {
+        const resp = await chrome.tabs.sendMessage(tab.id, { type: "AIAUTH_GET_SELECTION" });
+        promptText = (resp && resp.prompt_text) || null;
+        tta = (resp && typeof resp.tta === "number") ? resp.tta : null;
+      } catch {}
+    }
+    await handleAttest(text, tab?.url, tab?.id, promptText, tta);
+    return;
+  }
+  if (info.menuItemId === "aiauth-attest-image") {
+    const imageUrl = info.srcUrl || info.linkUrl || info.pageUrl;
+    if (!imageUrl) {
+      await notify("AIAuth — no image URL", "Could not determine the image to attest.");
+      return;
+    }
+    await handleAttestImage(imageUrl, tab?.id);
+    return;
+  }
 });
 
 // Messages from popup
@@ -483,7 +663,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "AIAUTH_SIGN_HASH") {
     (async () => {
       try {
-        const data = await signHash(msg.hash, msg.source || "file", msg.note || null);
+        // v1.4.0: popup drag-drop / file-picker path passes imageBytes
+        // as a plain array so enrichWithC2PA can probe for a JUMBF
+        // manifest without a second read of the file.
+        const imageBytes = Array.isArray(msg.imageBytes)
+          ? new Uint8Array(msg.imageBytes)
+          : null;
+        const data = await signHash(msg.hash, msg.source || "file", msg.note || null, imageBytes);
         await notify("AIAuth — receipt created", data.receipt_code);
         sendResponse({ ok: true, receipt_code: data.receipt_code });
       } catch (err) {

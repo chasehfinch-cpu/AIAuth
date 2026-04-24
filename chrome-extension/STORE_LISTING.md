@@ -1,10 +1,12 @@
-# Chrome Web Store Listing Copy — v1.3.0
+# Chrome Web Store Listing Copy — v1.4.0
 
 **Purpose:** Exact text to paste into the Chrome Web Store Developer Dashboard for the AIAuth extension listing.
 
-**v1.3.0 changes (Data Depth Tier 1):** Richer receipts. Time-to-attest (TTA) now travels with every receipt so the public verification page can surface a rubber-stamp warning when a reviewer signed off too quickly on a long piece of content. AI-tool provenance markers (model and provider, when detected from the page URL) populate the `ai_markers` block so verifiers can see which tool produced the content. No new permissions, no new host permissions, no new listing copy required beyond the version number. The short description, detailed description, permissions justifications, and privacy-practices disclosures below are unchanged from v1.2.2.
+**v1.4.0 changes (Data Depth Tier 2.5 — C2PA Content Credentials):** Right-click an image anywhere in the browser to create an attestation receipt, or drag-drop an image file onto the popup. When the image carries a C2PA Content Credentials manifest — as Adobe Firefly, DALL-E 3, and other compliant generators produce by default — AIAuth extracts the manifest identity, the claim generator name (e.g. `Adobe_Firefly`), and the list of content credentials assertions, and records them directly on the receipt. AIAuth is now the first voluntary human-review attestation layer that reads and preserves C2PA provenance data alongside the reviewer's signature. No new permissions, no new host permissions, no change to the short or detailed description. New second context menu entry: "Attest image with AIAuth".
 
-**Rejection history:** v1.2.2 was rejected on 2026-04-24 (reference: Yellow Argon) for excessive keyword enumeration in the detailed description. The copy below reflects the corrected, approved language.
+**v1.3.0 changes (Data Depth Tier 1):** Richer receipts. Time-to-attest (TTA) now travels with every receipt so the public verification page can surface a rubber-stamp warning when a reviewer signed off too quickly on a long piece of content. AI-tool provenance markers (model and provider, when detected from the page URL) populate the `ai_markers` block so verifiers can see which tool produced the content.
+
+**Rejection history:** v1.2.2 was rejected on 2026-04-24 (reference: Yellow Argon) for excessive keyword enumeration in the detailed description. The copy below reflects the corrected, approved language — unchanged from v1.3.0 / v1.4.0.
 
 **Scope of this file:** The in-repo [manifest.json](manifest.json) description is already compliant and does not change. This file is the source of truth for the dashboard fields only.
 
