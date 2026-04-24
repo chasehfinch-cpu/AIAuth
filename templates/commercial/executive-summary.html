@@ -57,6 +57,14 @@
       padding: 10px 14px; border-radius: 8px; font-size: 12px; margin-bottom: 16px;
     }
     footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+    .tier-badge {
+      display: inline-block; font-size: 10px; font-weight: 600;
+      color: var(--muted); border: 1px solid var(--border);
+      background: var(--panel); padding: 2px 8px; border-radius: 999px;
+      letter-spacing: 0.03em; margin-left: 8px; vertical-align: middle;
+      text-transform: none;
+    }
+    .kpi .tier-badge { margin-top: 6px; margin-left: 0; }
   </style>
 </head>
 <body>
@@ -90,13 +98,13 @@
     </div>
 
     <div class="grid grid-4" style="margin-top:12px;">
-      <div class="card kpi"><div class="n" id="k_ext">—</div><div class="lbl">External exposures</div></div>
-      <div class="card kpi"><div class="n" id="k_shadow">—</div><div class="lbl">Shadow AI alerts</div></div>
+      <div class="card kpi"><div class="n" id="k_ext">—</div><div class="lbl">External exposures</div><span class="tier-badge">Team / Enterprise Tier Only</span></div>
+      <div class="card kpi"><div class="n" id="k_shadow">—</div><div class="lbl">Shadow AI alerts</div><span class="tier-badge">Team / Enterprise Tier Only</span></div>
       <div class="card kpi"><div class="n" id="k_ai">—</div><div class="lbl">AI-authored artifacts</div></div>
       <div class="card kpi"><div class="n" id="k_prompt">—</div><div class="lbl">Prompt-chain coverage</div></div>
     </div>
 
-    <h2>Department scorecard</h2>
+    <h2>Department scorecard <span class="tier-badge">Team / Enterprise Tier Only</span></h2>
     <div class="card" style="padding:0;">
       <table>
         <thead>
@@ -112,7 +120,7 @@
       <div class="note">Claude and Copilot dominate usage. Shadow AI heatmap below shows which tools are open without being used for attested work.</div>
     </div>
 
-    <h2>Policy violations</h2>
+    <h2>Policy violations <span class="tier-badge">Team / Enterprise Tier Only</span></h2>
     <div class="grid grid-4">
       <div class="card kpi bad"><div class="n" id="v_crit">—</div><div class="lbl">Critical</div></div>
       <div class="card kpi bad"><div class="n" id="v_high">—</div><div class="lbl">High</div></div>
@@ -120,7 +128,7 @@
       <div class="card kpi"><div class="n" id="v_low">—</div><div class="lbl">Low</div></div>
     </div>
 
-    <h2>Shadow AI heatmap</h2>
+    <h2>Shadow AI heatmap <span class="tier-badge">Team / Enterprise Tier Only</span></h2>
     <div class="card" style="padding:0;">
       <table>
         <thead>
@@ -150,6 +158,13 @@
     <footer>
       AIAuth never sees, stores, or transmits your content. This report is derived from metadata only.
       Generated <span id="gen">—</span>. Schema <span id="sv">—</span>.
+      <div style="margin-top:8px;">
+        Metrics badged "Team / Enterprise Tier Only" are populated when the paid-tier AIAuth client is
+        deployed. Free-tier installations show a subset. Cross-format chain metrics additionally
+        require the self-hosted desktop agent, which computes the canonical-text hash; the Chrome
+        extension alone does not populate these fields. Setup for every upload-gated KPI is at
+        <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/docs/ENTERPRISE_ADMIN_GUIDE.md#kpi-data-inputs-at-a-glance">docs/ENTERPRISE_ADMIN_GUIDE.md §3.5</a>.
+      </div>
     </footer>
   </div>
 

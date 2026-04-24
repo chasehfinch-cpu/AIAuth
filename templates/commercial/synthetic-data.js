@@ -177,6 +177,16 @@
             missing_parent_hash: "e3b0c4...", chain_length_before_break: 4, chain_length_after_break: 2 },
         ],
       },
+      // Commercial-KPI-Honesty PR (2026-04-24): canonical cross-format
+      // block. Production server populates these from real queries on
+      // enterprise_attestations.content_hash_canonical + policy_violations.
+      // Synthetic demo numbers here are plausible for a mid-size pilot.
+      cross_format: {
+        canonical_groups: 340,
+        multi_format_documents: 47,
+        ai_authored_artifacts: Math.round(totalAttestations * 0.033),
+        ungoverned_ai_content: Math.round(totalAttestations * 0.002),
+      },
       recent_violations: [
         { id: 1, attestation_id: "a1b2c3", policy_id: "no-rubber-stamping",
           severity: "medium", details: { tta: 3, len: 4200, uid: "bob@" + company.toLowerCase().replace(/\s+/g, "") + ".com" },
