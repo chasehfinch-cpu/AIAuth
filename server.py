@@ -4587,6 +4587,226 @@ def one_pager_page():
     return HTMLResponse(_site_shell("Enterprise One-Pager", body, active="enterprise"))
 
 
+@app.get("/api", response_class=HTMLResponse)
+def api_reference_page():
+    """Hand-written API reference. Complements FastAPI's /docs by
+    providing curated curl examples, error-code documentation, and rate
+    limit specifics that don't make it into the auto-generated schema."""
+    body = """
+<style>
+.endpoint { margin: 28px 0 40px; padding-top: 8px; border-top: 1px solid var(--border); }
+.endpoint .verb { display: inline-block; padding: 3px 8px; border-radius: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; margin-right: 6px; vertical-align: middle; }
+.endpoint .verb.get { background: #dbeafe; color: #1e40af; }
+.endpoint .verb.post { background: #dcfce7; color: #166534; }
+.endpoint .path { font-family: 'JetBrains Mono', monospace; font-size: 17px; font-weight: 600; color: var(--text); }
+.endpoint h3 { margin: 0 0 6px !important; border: 0 !important; padding: 0 !important; }
+.endpoint .meta { font-size: 13px; color: var(--muted); margin: 4px 0 14px; }
+.endpoint .meta b { color: var(--text); }
+.endpoint pre { font-size: 12px !important; }
+.toc { columns: 2; column-gap: 28px; margin: 18px 0 28px; padding: 18px 22px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; font-size: 14px; line-height: 1.8; }
+.toc a { color: var(--text); }
+.toc a:hover { color: var(--accent); }
+</style>
+<span class="eyebrow">API Reference</span>
+<h1 class="page-title">AIAuth HTTP API — v0.5.0</h1>
+<p class="lead">Everything you need to integrate AIAuth into a CI pipeline, a document management system, or a custom workflow. FastAPI's auto-generated OpenAPI schema is at <a href="/docs"><code>/docs</code></a>; this page adds curl examples, rate limits, and error-code specifics.</p>
+
+<p><b>Base URL:</b> <code>https://aiauth.app</code> (free tier) or your self-hosted enterprise URL. <b>Auth:</b> none required for sign/verify/lookup in the free tier; enterprise ingest and admin endpoints use a license key via <code>Authorization: Bearer &lt;license&gt;</code>. <b>All responses are JSON.</b></p>
+
+<div class="toc">
+  <a href="#sign">POST /v1/sign</a><br>
+  <a href="#verify">POST /v1/verify</a><br>
+  <a href="#verify-prompt">POST /v1/verify/prompt</a><br>
+  <a href="#verify-chain">POST /v1/verify/chain</a><br>
+  <a href="#discover">POST /v1/discover/content</a><br>
+  <a href="#public-key">GET /v1/public-key</a><br>
+  <a href="#well-known">GET /.well-known/aiauth-public-key</a><br>
+  <a href="#lookup">GET /v1/lookup/{code}</a><br>
+  <a href="#stats">GET /v1/stats</a><br>
+  <a href="#health">GET /health</a><br>
+  <a href="#waitlist">POST /v1/waitlist</a><br>
+  <a href="#pilot-interest">POST /v1/pilot/interest</a><br>
+  <a href="#contact">POST /v1/contact</a><br>
+  <a href="#errors">Error format</a><br>
+  <a href="#rate-limits">Rate limits</a>
+</div>
+
+<div class="prose">
+
+<div class="endpoint" id="sign">
+  <h3><span class="verb post">POST</span><span class="path">/v1/sign</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 100 req/min per IP, 1,000 req/hour per IP</div>
+  <p>Sign an attestation receipt for a content hash. Returns a JSON receipt plus a detached Ed25519 signature.</p>
+  <p><b>Required fields:</b> <code>output_hash</code> (64-hex SHA-256 of the content), <code>user_id</code> (email or opaque uid), <code>source</code> (string, typically <code>"chrome-extension"</code>).</p>
+  <p><b>Common optional fields:</b> <code>model</code>, <code>provider</code>, <code>prompt_hash</code>, <code>source_domain</code>, <code>parent_hash</code>, <code>doc_id</code>, <code>tta</code> (seconds), <code>len</code> (character count), <code>ai_markers</code> (object). Full schema at <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/docs/RECEIPT_SPEC.md">docs/RECEIPT_SPEC.md</a>.</p>
+  <pre><code>curl -X POST https://aiauth.app/v1/sign \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "output_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "user_id": "jane@example.com",
+    "source": "chrome-extension",
+    "model": "claude-sonnet-4",
+    "tta": 45,
+    "len": 1280
+  }'</code></pre>
+  <p><b>Response:</b></p>
+  <pre><code>{
+  "receipt": {
+    "v": "0.5.0",
+    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "ts": "2026-04-24T14:22:11Z",
+    "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "uid": "jane@example.com",
+    "key_id": "key_001",
+    "model": "claude-sonnet-4",
+    "tta": 45,
+    "len": 1280
+  },
+  "signature": "&lt;base64url-ed25519-signature&gt;",
+  "receipt_code": "A1B2-C3D4"
+}</code></pre>
+  <p><b>Errors:</b> <code>400 INVALID_HASH</code>, <code>400 INVALID_RECEIPT</code>, <code>409 DUPLICATE</code> (same hash within dedup window), <code>429 RATE_LIMITED</code>.</p>
+</div>
+
+<div class="endpoint" id="verify">
+  <h3><span class="verb post">POST</span><span class="path">/v1/verify</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 300 req/min per IP</div>
+  <p>Check a receipt's Ed25519 signature against the published public key. Also queries the hash registry for related receipts (parent / child / siblings).</p>
+  <pre><code>curl -X POST https://aiauth.app/v1/verify \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "receipt": { "v":"0.5.0", "id":"...", "hash":"...", "uid":"...", "ts":"...", "key_id":"key_001" },
+    "signature": "&lt;base64url-ed25519-signature&gt;"
+  }'</code></pre>
+  <p><b>Response:</b> <code>{ "valid": true, "key_id": "key_001", "chain": { "parent": "...", "children": [...] } }</code></p>
+  <p><b>Offline:</b> This endpoint is a convenience. Verification can be performed entirely offline using the public key at <code>/.well-known/aiauth-public-key</code> and any Ed25519 library.</p>
+</div>
+
+<div class="endpoint" id="verify-prompt">
+  <h3><span class="verb post">POST</span><span class="path">/v1/verify/prompt</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 300 req/min per IP</div>
+  <p>Given a receipt and a prompt text, confirm the receipt's <code>prompt_hash</code> field matches the canonical SHA-256 of the prompt.</p>
+  <pre><code>curl -X POST https://aiauth.app/v1/verify/prompt \\
+  -H "Content-Type: application/json" \\
+  -d '{ "receipt": {...}, "prompt_text": "Draft a contract clause that..." }'</code></pre>
+</div>
+
+<div class="endpoint" id="verify-chain">
+  <h3><span class="verb post">POST</span><span class="path">/v1/verify/chain</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 120 req/min per IP</div>
+  <p>Given an ordered list of receipts forming a chain, verify every signature and that each <code>parent_hash</code> matches the prior receipt's <code>hash</code>.</p>
+  <pre><code>curl -X POST https://aiauth.app/v1/verify/chain \\
+  -H "Content-Type: application/json" \\
+  -d '{ "links": [ { "receipt": {...}, "signature": "..." }, { "receipt": {...}, "signature": "..." } ] }'</code></pre>
+</div>
+
+<div class="endpoint" id="discover">
+  <h3><span class="verb post">POST</span><span class="path">/v1/discover/content</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 120 req/min per IP</div>
+  <p>Given a content hash, return any receipt IDs registered for that hash, its parents, and its children. Enables "does a receipt exist for this text I just received?" checks without needing the receipt up front.</p>
+  <pre><code>curl -X POST https://aiauth.app/v1/discover/content \\
+  -H "Content-Type: application/json" \\
+  -d '{ "content_hash": "e3b0c44298..." }'</code></pre>
+</div>
+
+<div class="endpoint" id="public-key">
+  <h3><span class="verb get">GET</span><span class="path">/v1/public-key</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> none</div>
+  <p>Return the full key manifest: active key, retired keys, validity windows. Use this when verifying receipts offline to pick the key matching the receipt's <code>key_id</code>.</p>
+  <pre><code>curl https://aiauth.app/v1/public-key</code></pre>
+  <p>For the legacy v0.4.0 single-key shape, pass <code>?format=legacy</code>.</p>
+</div>
+
+<div class="endpoint" id="well-known">
+  <h3><span class="verb get">GET</span><span class="path">/.well-known/aiauth-public-key</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> none</div>
+  <p>Well-known discovery endpoint. Mirrors <code>/v1/public-key</code>. Use this as the canonical "where do I find the key" URL in integrations.</p>
+</div>
+
+<div class="endpoint" id="lookup">
+  <h3><span class="verb get">GET</span><span class="path">/v1/lookup/{code}</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 300 req/min per IP</div>
+  <p>Look up a receipt by its short human-readable code (the 8-character code returned from <code>/v1/sign</code>). Returns a minimal receipt stub suitable for the public <a href="/check">/check</a> verification page.</p>
+  <pre><code>curl https://aiauth.app/v1/lookup/A1B2-C3D4</code></pre>
+</div>
+
+<div class="endpoint" id="stats">
+  <h3><span class="verb get">GET</span><span class="path">/v1/stats</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 60 req/min per IP</div>
+  <p>Public aggregate statistics. Returns counts only — no user data, no domain breakdowns.</p>
+  <pre><code>curl https://aiauth.app/v1/stats</code></pre>
+</div>
+
+<div class="endpoint" id="health">
+  <h3><span class="verb get">GET</span><span class="path">/health</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> none</div>
+  <p>Liveness check. Returns <code>{ "status": "ok", "version": "0.5.0" }</code> with 200 when the server is responsive. Used by the status page at <code>status.aiauth.app</code>.</p>
+</div>
+
+<div class="endpoint" id="waitlist">
+  <h3><span class="verb post">POST</span><span class="path">/v1/waitlist</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 10 signups/day per IP</div>
+  <p>Free-tier waitlist signup. Email is hashed (HMAC) and Fernet-encrypted; plaintext is never stored.</p>
+  <pre><code>curl -X POST https://aiauth.app/v1/waitlist \\
+  -H "Content-Type: application/json" \\
+  -d '{ "email": "you@example.com" }'</code></pre>
+</div>
+
+<div class="endpoint" id="pilot-interest">
+  <h3><span class="verb post">POST</span><span class="path">/v1/pilot/interest</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 20 submissions/day per IP</div>
+  <p>Enterprise pilot request. See <a href="/pilot">/pilot</a> for the user-facing form.</p>
+  <pre><code>curl -X POST https://aiauth.app/v1/pilot/interest \\
+  -H "Content-Type: application/json" \\
+  -d '{ "company":"Acme Corp", "admin_email":"you@acme.com", "user_count":25, "industry":"Legal" }'</code></pre>
+</div>
+
+<div class="endpoint" id="contact">
+  <h3><span class="verb post">POST</span><span class="path">/v1/contact</span></h3>
+  <div class="meta"><b>Auth:</b> none · <b>Rate limit:</b> 20 submissions/day per IP</div>
+  <p>Contact sales inquiry. Inquiries route to <code>sales@aiauth.app</code>. See <a href="/contact">/contact</a> for the user-facing form.</p>
+  <pre><code>curl -X POST https://aiauth.app/v1/contact \\
+  -H "Content-Type: application/json" \\
+  -d '{ "company":"Acme Corp", "admin_email":"you@acme.com", "plan":"team", "message":"We need..." }'</code></pre>
+</div>
+
+<h2 id="errors">Error format</h2>
+<p>All errors return a consistent JSON body with HTTP status set to a meaningful code (400, 404, 409, 429, 500):</p>
+<pre><code>{
+  "error": {
+    "code": "INVALID_HASH",
+    "message": "output_hash must be a 64-character SHA-256 hex string",
+    "details": {}
+  }
+}</code></pre>
+<p><b>Codes you'll see:</b> <code>INVALID_HASH</code>, <code>INVALID_RECEIPT</code>, <code>INVALID_PROMPT_HASH</code>, <code>SIGNATURE_INVALID</code>, <code>NOT_FOUND</code>, <code>DUPLICATE</code>, <code>RATE_LIMITED</code>, <code>MISSING_LICENSE</code>, <code>UNAUTHORIZED</code>, <code>INTERNAL_ERROR</code>.</p>
+
+<h2 id="rate-limits">Rate limits</h2>
+<p>Rate limits are per-IP by default. Hitting a limit returns <code>429 RATE_LIMITED</code> with a <code>Retry-After</code> header. Enterprise self-hosted deployments can disable or raise these via environment config.</p>
+<table>
+  <thead><tr><th>Endpoint class</th><th>Limit</th></tr></thead>
+  <tbody>
+    <tr><td><code>/v1/sign</code></td><td>100/min per IP, 1,000/hour per IP</td></tr>
+    <tr><td>verify / discover / lookup</td><td>300/min per IP</td></tr>
+    <tr><td>chain verify</td><td>120/min per IP</td></tr>
+    <tr><td>waitlist / pilot / contact</td><td>10–20 submissions/day per IP</td></tr>
+    <tr><td><code>/v1/public-key</code> / <code>/health</code></td><td>no limit</td></tr>
+  </tbody>
+</table>
+
+<h2>Integration notes</h2>
+<ul>
+  <li><b>Idempotency.</b> Re-submitting the same <code>output_hash</code> within the dedup window (default 300s) returns <code>409 DUPLICATE</code> with the existing receipt id. This prevents accidental double-signing.</li>
+  <li><b>Chain linking.</b> Pass <code>parent_hash</code> (the prior version's content hash) on <code>/v1/sign</code> to form a chain. Receipts auto-link when verified.</li>
+  <li><b>Canonical text hash.</b> For cross-format chain integrity (xlsx → csv → pdf), clients should compute <code>content_hash_canonical</code> from the extracted text and send both it and <code>output_hash</code>.</li>
+  <li><b>Clock skew.</b> The <code>tta</code> and <code>ts</code> fields are client-supplied. The server records its own receipt timestamp and trusts client timestamps only for reporting purposes.</li>
+</ul>
+
+</div>
+"""
+    return HTMLResponse(_site_shell("API Reference", body, active="api"))
+
+
 @app.get("/admin/license/issue", response_class=HTMLResponse)
 def admin_license_issuer_page(master_key: Optional[str] = Query(default=None)):
     """License issuer admin page (Phase C.2).
