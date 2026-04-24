@@ -434,27 +434,6 @@ async function handleAttest(text, sourceUrl, tabId, promptText, tta) {
   }
 }
 
-// Hotkey: Ctrl+Shift+A
-chrome.commands.onCommand.addListener(async (command) => {
-  if (command !== "aiauth-attest") return;
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.id) return;
-
-  try {
-    const resp = await chrome.tabs.sendMessage(tab.id, { type: "AIAUTH_GET_SELECTION" });
-    const text = (resp && resp.text) || "";
-    const promptText = (resp && resp.prompt_text) || null;
-    const tta = (resp && typeof resp.tta === "number") ? resp.tta : null;
-    if (!text) {
-      await notify("AIAuth", "Select some AI-generated text first, then press Ctrl+Shift+A.");
-      return;
-    }
-    await handleAttest(text, tab.url, tab.id, promptText, tta);
-  } catch (e) {
-    await notify("AIAuth", "Open a supported AI site (Claude, ChatGPT, Gemini, Copilot) and select text.");
-  }
-});
-
 // Right-click menu on selected text
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({

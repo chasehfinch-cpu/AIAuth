@@ -95,7 +95,7 @@
 
     #receipts { max-height: 180px; overflow-y: auto; border: 1px solid #eee; border-radius: 6px; }
     #receipts:empty::after {
-      content: "No receipts yet. Select AI text and press Ctrl+Shift+A.";
+      content: 'No receipts yet. Select AI text and right-click, then choose "Attest selection with AIAuth".';
       display: block;
       padding: 12px;
       color: #999;
@@ -168,7 +168,7 @@
       <b id="currentIdentU">you@example.com</b>
       <span class="badge free">Free · Unverified</span>
     </div>
-    <div class="muted" style="margin-top:4px;">Ctrl+Shift+A on a supported AI site to attest selected text.</div>
+    <div class="muted" style="margin-top:4px;">the right-click menu on a supported AI site to attest selected text.</div>
 
     <div id="verifyBanner" style="margin-top:12px; padding:10px; background:#fef3c7; border:1px solid #fcd34d; border-radius:8px; font-size:12px; color:#78350f;">
       <b>Your email is unverified.</b> Attestation works, but cross-person and enterprise features
@@ -234,7 +234,7 @@
       <span id="tierBadge" class="badge free">Free</span>
       <span id="orgBanner" style="display:none;"> · <b id="orgName"></b></span>
     </div>
-    <div class="muted" style="margin-top:4px;">Ctrl+Shift+A on a supported AI site to attest selected text.</div>
+    <div class="muted" style="margin-top:4px;">the right-click menu on a supported AI site to attest selected text.</div>
 
     <div class="stats">
       <div class="stat"><div class="n" id="statToday">0</div><div class="lbl">Today</div></div>
@@ -284,7 +284,7 @@
   <div id="state5" class="state">
     <div class="panel">
       <div class="head">⚠ Session expired</div>
-      <div class="body">Log in again to manage your account. <b>Attestation still works</b> — press Ctrl+Shift+A as usual.</div>
+      <div class="body">Log in again to manage your account. <b>Attestation still works</b> — right-click and choose &quot;Attest selection with AIAuth&quot; as usual.</div>
       <div class="row" style="margin-top:8px;">
         <button id="reauthSend" class="primary">Send login link</button>
       </div>

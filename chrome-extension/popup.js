@@ -256,7 +256,7 @@ async function startAttesting() {
     emailVerified: false,
     pendingEmail: "",
   });
-  setStatus("Ready. Press Ctrl+Shift+A to attest.", "ok");
+  setStatus('Ready. Right-click and choose "Attest selection with AIAuth" to attest.', "ok");
   await render();
 }
 

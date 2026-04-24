@@ -3,7 +3,7 @@ AIAuth Desktop Agent v0.5.0 — Signed Receipt Architecture
 
 How it works:
   1. Runs in your system tray
-  2. Copy AI output → press Ctrl+Shift+A
+  2. Copy AI output → press Alt+Shift+A
   3. Agent hashes your clipboard LOCALLY (normalized)
   4. Sends ONLY the hash and free-tier metadata to AIAuth server
   5. Server signs it and FORGETS it — stores nothing about free users
@@ -61,7 +61,7 @@ LOG_FILE = CONFIG_DIR / "aiauth.log"
 DEFAULT_CONFIG = {
     "server_url": "https://aiauth.app",
     "user_id": "",
-    "hotkey": "ctrl+shift+a",
+    "hotkey": "Alt+Shift+A",
     "auto_review": True,
     "review_status": "approved",
     "session_count": 0,
@@ -843,7 +843,7 @@ def create_tray(config: dict):
 
 
 def start_hotkey(config: dict):
-    hotkey = config.get("hotkey", "ctrl+shift+a")
+    hotkey = config.get("hotkey", "Alt+Shift+A")
     try:
         keyboard.add_hotkey(hotkey, lambda: attest_clipboard(config), suppress=False)
         print(f"[Hotkey] {hotkey}")

@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "AIAuth — Chain of Custody for AI Work",
   "short_name": "AIAuth",
-  "version": "1.2.0",
-  "description": "Tamper-proof chain-of-custody receipts for AI-generated work. One key press. Content never leaves your device.",
+  "version": "1.2.2",
+  "description": "Tamper-proof chain-of-custody receipts for AI-generated work. Right-click to attest. Content never leaves your device.",
   "storage": {
     "managed_schema": "managed_schema.json"
   },
@@ -50,14 +50,5 @@
       "js": ["content.js"],
       "css": ["content.css"]
     }
-  ],
-  "commands": {
-    "aiauth-attest": {
-      "suggested_key": {
-        "default": "Ctrl+Shift+A",
-        "mac": "Command+Shift+A"
-      },
-      "description": "Attest selected text on a supported AI site"
-    }
-  }
+  ]
 }
