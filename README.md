@@ -79,6 +79,17 @@ litellm-plugin/             LiteLLM callback for API-level attestation
 - **Enterprise User Guide** — [`docs/ENTERPRISE_USER_GUIDE.md`](docs/ENTERPRISE_USER_GUIDE.md)
 - **API Reference** — [aiauth.app/docs](https://www.aiauth.app/docs) (FastAPI auto-generated)
 
+## Standards
+
+AIAuth is complementary to the [C2PA Content Credentials](https://c2pa.org/)
+standard, not a competitor to it. C2PA proves what tool created a file;
+AIAuth proves a human reviewed it. Receipts carry C2PA manifest identity
+under `ai_markers.c2pa` (see [`docs/RECEIPT_SPEC.md` §3.2.1](docs/RECEIPT_SPEC.md#321-ai_markersc2pa--c2pa--content-credentials-interop))
+so the two chains can be walked from a single receipt.
+
+Full positioning and roadmap (including a planned `aiauth.app/human-review/v1`
+C2PA assertion type) lives at [aiauth.app/standards](https://www.aiauth.app/standards).
+
 ## Developer Quickstart
 
 ```bash

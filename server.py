@@ -4109,6 +4109,64 @@ def contact_page(plan: Optional[str] = Query(default=None)):
     return HTMLResponse(_site_shell("Contact Sales", body, active="pricing"))
 
 
+@app.get("/standards", response_class=HTMLResponse)
+def standards_page():
+    """Standards-alignment page. Positions AIAuth as complementary to
+    C2PA (Content Credentials) rather than competitive, and documents
+    the receipt fields that carry C2PA interop data today."""
+    body = """
+<span class="eyebrow">Standards</span>
+<h1 class="page-title">Built alongside C2PA, not against it.</h1>
+<p class="lead">C2PA (Content Credentials) proves what tool created a piece of media. AIAuth proves that a human reviewed it. The two are complementary layers of the same provenance stack — and an AIAuth receipt can carry C2PA manifest data directly.</p>
+
+<div class="prose">
+  <h2>The provenance stack</h2>
+  <p>Every piece of AI-assisted output leaves two kinds of evidence worth preserving:</p>
+  <table>
+    <thead><tr><th>Layer</th><th>Question it answers</th><th>Standard</th></tr></thead>
+    <tbody>
+      <tr><td>Tool provenance</td><td><em>What tool created this file?</em></td><td>C2PA / Content Credentials</td></tr>
+      <tr><td>Human attestation</td><td><em>Did a person review it before I got it?</em></td><td>AIAuth</td></tr>
+    </tbody>
+  </table>
+  <p>C2PA is strong on images, video, and audio — formats where a manifest can be embedded into the file itself. It says less about text, spreadsheets, documents, and knowledge-work artifacts where the "tool that made it" is often a chain of prompts rather than a single generator. AIAuth fills that last mile.</p>
+
+  <h2>How AIAuth interoperates with C2PA today</h2>
+  <ol>
+    <li><b>Read path.</b> When a client attests a file that carries a C2PA manifest, it surfaces the manifest identity in the receipt under <code>ai_markers.c2pa</code> (<a href="/public-key">public signing keys</a> · <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/docs/RECEIPT_SPEC.md#321-ai_markersc2pa--c2pa--content-credentials-interop">receipt spec §3.2.1</a>). The attester's verifier can then walk both chains: the C2PA manifest back to the generating tool, and the AIAuth receipt forward to the human who signed off.</li>
+    <li><b>Signal consolidation.</b> AIAuth already aggregates AI-authorship signals from multiple sources in a single receipt — Office docProps, PDF XMP metadata, ChatGPT export markers, and (when present) C2PA manifests. A verifier reads one receipt instead of four out-of-band metadata stores.</li>
+    <li><b>Offline verification.</b> Receipts verify against an Ed25519 public key published at <a href="/.well-known/aiauth-public-key">/.well-known/aiauth-public-key</a>. No AIAuth server is required to check a receipt, which matches the "verify anywhere" ethos of the C2PA Trust Framework.</li>
+  </ol>
+
+  <h2>Roadmap: a C2PA assertion type for human review</h2>
+  <p>The C2PA spec permits custom assertion types under a URI namespace. We intend to publish one:</p>
+  <pre><code>Assertion label: "aiauth.app/human-review/v1"
+Fields:
+  reviewer_identity_hash  - HMAC(reviewer email)
+  tta_seconds             - seconds between content arrival and attestation
+  review_confirmed        - bool
+  receipt_id              - parent AIAuth receipt id
+  chain_parent            - prior receipt in the doc_id chain</code></pre>
+  <p>With the assertion type in place, an AIAuth receipt can be embedded directly inside a Content Credentials manifest — a single artifact that carries tool provenance and human attestation together. Target: Q4 2026, contingent on the C2PA Conformance Program timeline.</p>
+
+  <h2>More than you'd expect from a three-line JSON receipt</h2>
+  <p>A few capabilities that are live today and rarely surface in category comparisons:</p>
+  <ul>
+    <li><b>Cross-format chain integrity.</b> A canonical text hash (<code>content_hash_canonical</code>) is computed by the client from the extractable text of xlsx / pdf / docx / csv sources. When the file is exported to a different format, the canonical hash still matches — the receipt survives format conversion. Useful when a reviewer attests a draft in Word and the final deliverable ships as PDF.</li>
+    <li><b>Automatic chain formation.</b> Receipts with a matching <code>doc_id</code> or <code>parent</code> hash auto-link into a chain on verification — no separate chain store to manage.</li>
+    <li><b>Time-to-attest rubber-stamp detection.</b> Receipts carry <code>tta</code> (seconds between content arrival and attestation). A receipt with <code>tta &lt; 10</code> on &gt;500 characters is flagged on the verification page — the honest signal that "someone pressed a button" without implying "someone read it."</li>
+    <li><b>AI authorship signal consolidation.</b> Office docProps, PDF metadata, ChatGPT / Claude export markers, and C2PA manifests all land in a single <code>ai_markers</code> block the verifier can read in one pass.</li>
+    <li><b>Zero-knowledge by default.</b> Hashes and metadata travel to the signing server; the content itself never does — making AIAuth compatible with environments where the underlying file cannot be exfiltrated (healthcare, legal, classified).</li>
+    <li><b>Key-rotation survivability.</b> The full <a href="/v1/public-key">key manifest</a> publishes every current and retired signing key with validity windows, so a receipt signed under an old key still verifies years later.</li>
+  </ul>
+
+  <h2>Regulatory fit</h2>
+  <p>AIAuth aligns with the EU AI Act Article 50 deployer-disclosure provisions (enforcement begins August 2026) by providing a verifiable record that AI was involved and a human reviewed it. For media assets, we recommend pairing AIAuth with a C2PA implementation rather than substituting for one — AIAuth does not watermark images or embed metadata into media files. This mapping is informational; consult qualified counsel for compliance advice specific to your organization.</p>
+</div>
+"""
+    return HTMLResponse(_site_shell("Standards — C2PA & AIAuth", body, active="standards"))
+
+
 @app.get("/admin/license/issue", response_class=HTMLResponse)
 def admin_license_issuer_page(master_key: Optional[str] = Query(default=None)):
     """License issuer admin page (Phase C.2).
@@ -4367,6 +4425,7 @@ footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px sol
   <div class="nav-links">
     <a href="/#how-it-works"{active_cls('how')}>How It Works</a>
     <a href="/pricing"{active_cls('pricing')}>Pricing</a>
+    <a href="/standards"{active_cls('standards')}>Standards</a>
     <a href="/#business"{active_cls('business')}>For Business</a>
     <a href="/guide"{active_cls('guide')}>User Guide</a>
     <a class="nav-cta-outline" href="/check"{active_cls('check')}>Verify a Receipt</a>

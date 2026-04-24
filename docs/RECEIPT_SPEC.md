@@ -103,13 +103,54 @@ signature. The canonical serialization for signing is defined in §4.
 | `provider` | string | AI provider (e.g. `"anthropic"`). |
 | `source_domain` | string | Browser hostname where AI interaction happened. |
 | `source_app` | string | Active application name (desktop agent). |
-| `ai_markers` | object | Detected AI authorship signals: `{source: string, verified: bool}`. |
+| `ai_markers` | object | Detected AI authorship signals: `{source: string, verified: bool, c2pa?: object}`. See §3.2.1 for the C2PA sub-object. |
 | `doc_id` | string | Persistent document identifier for file chain-of-custody. |
 | `parent` | string | `hash` of the previous version in a `doc_id` chain. |
 | `file_type` | string | Content category: `"prose"` \| `"code"` \| `"spreadsheet"` \| `"image"` \| `"pdf"` \| `"other"`. |
 | `len` | integer | Content length in characters or bytes. |
 | `review` | object | Human review: `{status, by, at, note?}`. |
 | `tags` | array | User-supplied string labels. |
+
+### 3.2.1 `ai_markers.c2pa` — C2PA / Content Credentials interop
+
+When the attested content carries a C2PA manifest (Content Credentials — the
+dominant open standard for media provenance), clients SHOULD surface the
+manifest's identity to the receipt under `ai_markers.c2pa`. This lets a
+verifier correlate an AIAuth human-review attestation with the upstream
+tool-provenance chain without either system having to rewrite the other's
+data.
+
+Recommended sub-object shape:
+
+```json
+{
+  "ai_markers": {
+    "source": "dalle-3",
+    "verified": true,
+    "c2pa": {
+      "manifest_hash": "sha256:3c5f...e1a2",
+      "claim_generator": "Adobe Firefly 2026.1",
+      "assertions": ["c2pa.actions", "c2pa.ingredient"],
+      "signer_cn": "Adobe Inc.",
+      "signed_at": "2026-04-18T10:22:00Z"
+    }
+  }
+}
+```
+
+Field notes:
+
+- `manifest_hash` — SHA-256 of the serialized C2PA manifest. Canonical
+  interop primitive; required if `c2pa` is present.
+- `claim_generator` — the C2PA `claim_generator` string, verbatim.
+- `assertions` — list of assertion labels present in the manifest.
+- `signer_cn` — Common Name of the manifest's signing certificate.
+- `signed_at` — the C2PA signature time, distinct from AIAuth `ts`.
+
+Forward-compatibility: a future AIAuth minor version may define a native
+C2PA *assertion type* (`aiauth.app/human-review/v1`) that lets an AIAuth
+receipt be embedded directly inside a Content Credentials manifest. Until
+that assertion type ships, use the `ai_markers.c2pa` sub-object above.
 
 ### 3.3 Commercial-tier optional fields
 
