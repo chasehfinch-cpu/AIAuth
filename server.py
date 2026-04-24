@@ -4167,6 +4167,205 @@ Fields:
     return HTMLResponse(_site_shell("Standards — C2PA & AIAuth", body, active="standards"))
 
 
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page():
+    """Public Terms of Service page. Matches the honest-reality framing
+    of the privacy policy: no SLA on the free tier, indefinite hash-
+    registry retention, content rights stay with the user."""
+    body = """
+<span class="eyebrow">Terms of Service</span>
+<h1 class="page-title">Terms of Service</h1>
+<p class="lead">Last updated: 2026-04-24. These terms govern your use of the AIAuth free tier at aiauth.app. Enterprise self-hosted deployments are governed by the terms in their executed license agreement, which supersede these.</p>
+
+<div class="prose">
+  <h2>1. Service as-is</h2>
+  <p>The free tier of AIAuth is provided without warranty of any kind. There is no service-level agreement (SLA), no uptime guarantee, and no promise that the signing server will remain available indefinitely. If the free service becomes unavailable, receipts already issued remain cryptographically verifiable offline against the public key published at <a href="/.well-known/aiauth-public-key">/.well-known/aiauth-public-key</a>.</p>
+
+  <h2>2. Limitation of liability</h2>
+  <p>To the maximum extent permitted by law, Finch Business Services LLC is not liable for any direct, indirect, incidental, consequential, or special damages arising from use of the free tier, including but not limited to loss of data, loss of business, or loss of reputation. The free tier is not a substitute for independent legal, compliance, or evidentiary counsel.</p>
+
+  <h2>3. Data retention</h2>
+  <p>Hash registry entries (content hash, receipt id, parent hash, doc id, registration timestamp) are retained indefinitely so that chain discovery continues to work for receipts issued at any time in the past. No content, no user identifiers, and no behavioral metadata are stored alongside those entries. If the free service is ever planned to be shut down, 90 days of notice will be posted on <a href="/">aiauth.app</a> and the last known public key and hash registry will be archived to a public location (GitHub release or IPFS) before takedown.</p>
+
+  <h2>4. Intellectual property</h2>
+  <p>You retain all rights to the content you attest with AIAuth. Finch Business Services LLC claims no rights to your content, your receipts, or any metadata on your receipts. The AIAuth source code, receipt format specification, and protocol are licensed under Apache 2.0 (core) and BUSL 1.1 (self-hosted deployment bundle); see the <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/LICENSE">LICENSE</a> file.</p>
+
+  <h2>5. Acceptable use</h2>
+  <p>You agree not to:</p>
+  <ul>
+    <li>Use the signing server for mass automated attestation beyond the documented rate limits (100 requests/minute per IP, 1,000 requests/hour per IP on <code>/v1/sign</code>).</li>
+    <li>Attempt to interfere with the signing server, its rate limits, or its availability for other users.</li>
+    <li>Use AIAuth receipts to misrepresent human review — for example, attesting content without actually reviewing it, or attesting content authored by another person as your own review.</li>
+    <li>Use AIAuth in a context where a qualified attorney has advised that receipts alone would not meet your evidentiary or regulatory requirements.</li>
+  </ul>
+
+  <h2>6. No PHI / no regulated content on the free tier</h2>
+  <p>The free tier is intended for general-purpose use. Do not use the free tier to attest protected health information (PHI), classified government data, or any content subject to HIPAA, ITAR, or similar strict regulation. For regulated use, deploy the self-hosted enterprise build on infrastructure you control.</p>
+
+  <h2>7. Modification of terms</h2>
+  <p>Material changes to these terms will be announced on <a href="/">aiauth.app</a> with at least 30 days of notice. Continued use of the service after the notice period constitutes acceptance. These terms will be versioned with a dated header above — the <code>Last updated</code> line reflects the most recent effective date.</p>
+
+  <h2>8. Governing law</h2>
+  <p>These terms are governed by the laws of the Commonwealth of Virginia, United States, without regard to conflict-of-law rules. Any dispute that cannot be resolved informally will be brought in the state or federal courts of the Commonwealth of Virginia.</p>
+
+  <h2>9. Contact</h2>
+  <p>Questions about these terms: <a href="mailto:legal@aiauth.app">legal@aiauth.app</a>. Security reports: see <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/SECURITY.md">SECURITY.md</a>. General contact: <a href="mailto:sales@aiauth.app">sales@aiauth.app</a>.</p>
+</div>
+"""
+    return HTMLResponse(_site_shell("Terms of Service", body, active=""))
+
+
+@app.get("/security", response_class=HTMLResponse)
+def security_page():
+    """Public Security & Trust page. Documents signing key custody,
+    rotation, continuity, and bus-factor risk. Content lifts from the
+    enterprise admin guide so free-tier users get the same transparency."""
+    body = """
+<span class="eyebrow">Security &amp; Trust</span>
+<h1 class="page-title">Where the keys live and what happens if we disappear.</h1>
+<p class="lead">An attestation receipt is only as trustworthy as the key that signed it. This page documents how AIAuth's signing keys are managed, rotated, backed up, and how the system continues to function if Finch Business Services LLC ever ceases to operate.</p>
+
+<div class="prose">
+  <h2>Signing key infrastructure</h2>
+  <ul>
+    <li><b>Algorithm.</b> Ed25519 (RFC 8032). Chosen because the public key (32 bytes) and signature (64 bytes) are small enough to embed in a receipt without hurting portability, verification is fast enough to run in a browser, and no side-channel attacks of concern are known against constant-time implementations.</li>
+    <li><b>Generation.</b> Keys are generated on the signing server using <code>cryptography.hazmat.primitives.asymmetric.ed25519</code> — the Python <code>cryptography</code> package's bindings to <code>libsodium</code>.</li>
+    <li><b>Storage.</b> The active private key lives in an encrypted volume attached to the signing host. The volume is unlocked at boot from a passphrase stored only in operator memory. The key file itself is <code>0600</code>, owned by a non-login service user.</li>
+    <li><b>Backup.</b> The active private key is mirrored to an offline encrypted backup held by the operator. No cloud KMS or HSM is used for the free tier (enterprise self-hosted deployments can use their own HSM or cloud KMS).</li>
+    <li><b>Public-key publication.</b> The current and all retired public keys are published at <a href="/v1/public-key"><code>/v1/public-key</code></a> and at the well-known discovery location <a href="/.well-known/aiauth-public-key"><code>/.well-known/aiauth-public-key</code></a>.</li>
+  </ul>
+
+  <h2>Key rotation</h2>
+  <ul>
+    <li>Scheduled annually (every 365 days) or immediately on any suspected compromise.</li>
+    <li>The prior key is retired with <code>valid_until</code> set to the rotation timestamp; receipts signed under the retired key continue to verify indefinitely using that key's entry in the key manifest.</li>
+    <li>The rotation event is documented in the key manifest's <code>updated_at</code> field, visible at <a href="/v1/public-key"><code>/v1/public-key</code></a>.</li>
+    <li>The full rotation procedure is documented in <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/docs/ENTERPRISE_ADMIN_GUIDE.md">docs/ENTERPRISE_ADMIN_GUIDE.md</a>. It is reproducible by any self-hosted customer on their own infrastructure.</li>
+  </ul>
+
+  <h2>Key manifest versioning</h2>
+  <p>The public key endpoint returns a manifest containing every key AIAuth has ever used, each with a validity window:</p>
+  <pre><code>{
+  "keys": [
+    { "key_id": "key_001", "algorithm": "Ed25519",
+      "public_key_pem": "...", "status": "active",
+      "valid_from": "2026-04-01T00:00:00Z",
+      "valid_until": null, "current_signing_key": true },
+    { "key_id": "key_000", "algorithm": "Ed25519",
+      "public_key_pem": "...", "status": "retired",
+      "valid_from": "2025-04-01T00:00:00Z",
+      "valid_until": "2026-04-01T00:00:00Z",
+      "current_signing_key": false }
+  ],
+  "manifest_version": 1,
+  "updated_at": "2026-04-01T00:00:00Z"
+}</code></pre>
+  <p>When verifying a receipt, select the key whose <code>key_id</code> matches the receipt's <code>key_id</code> field. If the receipt has no <code>key_id</code> (legacy), fall back to trying each key in the manifest.</p>
+
+  <h2>Continuity and bus-factor</h2>
+  <p>AIAuth is intentionally designed so that the signing server is not a single point of failure for verification. If the signing server goes offline — permanently — receipts remain verifiable forever, provided the public key is available:</p>
+  <ul>
+    <li><b>Public key survivability.</b> The current and all retired public keys are published on GitHub alongside the source code. Any copy of the repo (including the Wayback Machine and any forks) preserves them.</li>
+    <li><b>Stateless verification.</b> Receipt verification requires only the receipt, the public key matching the receipt's <code>key_id</code>, and an Ed25519 library. It does not require the AIAuth server to be reachable.</li>
+    <li><b>Open-source client.</b> The Chrome extension and receipt format are open-source at <a href="https://github.com/chasehfinch-cpu/AIAuth">github.com/chasehfinch-cpu/AIAuth</a> under Apache 2.0. A fork can continue to build and publish the extension if we cannot.</li>
+    <li><b>Self-hosted deployments are customer-owned.</b> Enterprise customers run AIAuth on their own infrastructure with their own keys. Nothing about an enterprise deployment depends on Finch Business Services LLC continuing to exist.</li>
+    <li><b>90-day shutdown notice.</b> Per the <a href="/terms">Terms of Service</a>, any planned permanent shutdown of the free tier is announced at least 90 days in advance, and a final archive of the public key and hash registry is published before takedown.</li>
+  </ul>
+
+  <h2>Reporting a vulnerability</h2>
+  <p>Responsible disclosure process, affected component categories, and contact addresses are documented in <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/SECURITY.md">SECURITY.md</a>. We do not currently offer a bug bounty; we acknowledge reporters in the security advisory when a fix ships.</p>
+
+  <h2>Where we aren't yet</h2>
+  <p>Transparency about what we don't yet have:</p>
+  <ul>
+    <li>No formal SOC 2 audit report. A control-crosswalk document is on <a href="/compliance">/compliance</a> for reference.</li>
+    <li>No third-party penetration test (a scoped engagement is on the roadmap).</li>
+    <li>No bug bounty program (we treat vulnerability reports via the SECURITY.md channel seriously regardless).</li>
+    <li>No HSM for the free-tier signing key (self-hosted enterprise customers can and do use HSMs for their own keys).</li>
+  </ul>
+</div>
+"""
+    return HTMLResponse(_site_shell("Security & Trust", body, active="security"))
+
+
+@app.get("/compliance", response_class=HTMLResponse)
+def compliance_page():
+    """Public compliance / regulatory alignment page. Covers EU AI Act
+    Article 50 (enforcement 2026-08-02) and a lightweight crosswalk to
+    SOC 2, ISO 27001, and NIST AI RMF — informational, not legal advice."""
+    body = """
+<span class="eyebrow">Compliance</span>
+<h1 class="page-title">Where AIAuth fits in your compliance stack.</h1>
+<p class="lead">This page maps AIAuth's capabilities to the regulatory and control frameworks most often referenced in enterprise procurement — EU AI Act Article 50, SOC 2, ISO 27001, and the NIST AI Risk Management Framework. It is informational. Consult qualified counsel for advice specific to your organization.</p>
+
+<div class="prose">
+  <h2>EU AI Act — Article 50 (deployer disclosure)</h2>
+  <p>Enforcement begins <b>2 August 2026</b>. Article 50 requires deployers of AI systems to disclose that content was generated or materially modified by an AI system and to mark such content in a machine-readable format.</p>
+  <table>
+    <thead><tr><th>Article 50 requirement</th><th>How AIAuth addresses it</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>50(2)</b> — Deployer discloses AI involvement to recipients.</td>
+        <td>AIAuth receipts record that AI was involved (<code>model</code>, <code>provider</code>, <code>ai_markers</code>) and that a human reviewed the output. A receipt code attached to a deliverable serves as a verifiable disclosure mechanism.</td>
+      </tr>
+      <tr>
+        <td><b>50(4)</b> — Machine-readable marking of AI-generated content.</td>
+        <td>AIAuth receipts are JSON with stable field names; the <code>ai_markers</code> block identifies AI authorship signals in a parsable form. For media assets (image, video, audio) we recommend pairing AIAuth with a C2PA implementation — <a href="/standards">see the standards page</a>.</td>
+      </tr>
+      <tr>
+        <td><b>50(5)</b> — Information provided in a clear and distinguishable manner, at latest at first interaction.</td>
+        <td>Receipt codes can be attached to an email subject line, document footer, PR description, or message body. The verification page at <a href="/check">aiauth.app/check</a> is publicly accessible without an account.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>What AIAuth does NOT address in Article 50</h3>
+  <ul>
+    <li>AIAuth does not perform watermarking of media files. For synthetic image/video/audio, use a C2PA-compatible tool and preserve the Content Credentials.</li>
+    <li>AIAuth does not embed metadata inside media files — receipts live alongside the content as an external record.</li>
+    <li>AIAuth does not perform AI-content detection. It is a voluntary attestation mechanism, not a forensic classifier.</li>
+  </ul>
+
+  <h2>SOC 2 Trust Service Criteria — control crosswalk</h2>
+  <p>For enterprises evaluating AIAuth as part of a SOC 2-scoped environment, the self-hosted enterprise deployment supports the following controls:</p>
+  <ul>
+    <li><b>CC6.1 — Logical access.</b> Magic-link authentication with short-lived session tokens; admin endpoints gated behind a master key; managed-policy schema for Workspace/Intune provisioning.</li>
+    <li><b>CC7.2 — System monitoring.</b> All attestation events are logged with attestation id, timestamp, and signing key id. The admin dashboard aggregates events; operator email alerts are available.</li>
+    <li><b>CC8.1 — Change management.</b> Source is version-controlled on GitHub; releases are tagged and published; the signing key manifest versions every rotation.</li>
+    <li><b>CC9.2 — Vendor / third-party.</b> Self-hosted enterprise runs on customer infrastructure; no third-party processor handles attested content.</li>
+  </ul>
+
+  <h2>ISO/IEC 27001 Annex A — control mapping</h2>
+  <ul>
+    <li><b>A.8.1 — Asset management.</b> Attested content is hashed, never stored. The hash registry is a single-purpose data asset with documented retention.</li>
+    <li><b>A.12.4 — Logging and monitoring.</b> Per-attestation logs with cryptographic linkage via chain-of-custody parent hashes.</li>
+    <li><b>A.14.1 — Security in development.</b> Apache 2.0 source; reproducible builds for the Chrome extension.</li>
+    <li><b>A.18.1 — Compliance with legal / contractual requirements.</b> Data-handling terms codified in the <a href="/privacy">Privacy Policy</a> and <a href="/terms">Terms of Service</a>.</li>
+  </ul>
+
+  <h2>NIST AI Risk Management Framework</h2>
+  <ul>
+    <li><b>GOVERN-1.1</b> — AIAuth provides a verifiable record of human review, supporting organizational policies that require a human in the loop for AI-assisted output.</li>
+    <li><b>MAP-1.1</b> — Receipts aggregate AI-authorship signals (<code>model</code>, <code>provider</code>, <code>source_domain</code>, <code>ai_markers</code>) for context identification.</li>
+    <li><b>MEASURE-2.6</b> — Time-to-attest (<code>tta</code>) is a proxy metric for review quality; the enterprise dashboard surfaces rubber-stamp detection.</li>
+    <li><b>MANAGE-2.3</b> — Chain of custody (<code>parent</code>, <code>doc_id</code>) supports incident review and rollback.</li>
+  </ul>
+
+  <h2>Scope of applicability</h2>
+  <p>This mapping is informational and is not a substitute for a SOC 2 audit, ISO 27001 certification, or NIST AI RMF implementation. We are not yet SOC 2 audited; the crosswalk is provided so your compliance team can evaluate where AIAuth fits within your own control environment. For the self-hosted enterprise tier, we can provide architecture diagrams and control-evidence artifacts under NDA — contact <a href="mailto:sales@aiauth.app">sales@aiauth.app</a>.</p>
+
+  <h2>References</h2>
+  <ul>
+    <li><a href="https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX%3A32024R1689" target="_blank" rel="noopener">EU AI Act (Regulation 2024/1689)</a></li>
+    <li><a href="https://www.c2pa.org/specifications/specifications/2.1/index.html" target="_blank" rel="noopener">C2PA Specification 2.1</a></li>
+    <li><a href="https://www.nist.gov/itl/ai-risk-management-framework" target="_blank" rel="noopener">NIST AI RMF 1.0</a></li>
+    <li><a href="https://www.aicpa.org/resources/landing/soc-for-service-organizations" target="_blank" rel="noopener">AICPA SOC 2 Trust Services Criteria</a></li>
+  </ul>
+</div>
+"""
+    return HTMLResponse(_site_shell("Compliance", body, active="compliance"))
+
+
 @app.get("/admin/license/issue", response_class=HTMLResponse)
 def admin_license_issuer_page(master_key: Optional[str] = Query(default=None)):
     """License issuer admin page (Phase C.2).
@@ -4438,6 +4637,9 @@ footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px sol
   <div>&copy; 2026 Finch Business Services LLC · AIAuth</div>
   <div>
     <a href="/privacy">Privacy</a>
+    <a href="/terms">Terms</a>
+    <a href="/security">Security</a>
+    <a href="/compliance">Compliance</a>
     <a href="/public-key">Public Key</a>
     <a href="/enterprise-guide">Enterprise Guide</a>
     <a href="https://github.com/chasehfinch-cpu/AIAuth" target="_blank" rel="noopener">GitHub</a>
