@@ -25,9 +25,20 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        # Install only the core deps server.py imports at module load time.
+        # requirements.txt also lists the optional self-hosted-agent deps
+        # (pikepdf, pdfplumber, python-docx, imagehash, ...) which pull in
+        # system libraries like libqpdf that aren't on the CI runner. Tests
+        # don't exercise those code paths.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install \
+            "fastapi>=0.110.0" \
+            "uvicorn>=0.27.0" \
+            "pydantic>=2.0.0" \
+            "cryptography>=42.0.0" \
+            "markdown>=3.5" \
+            "resend>=0.8.0"
           pip install -r requirements-dev.txt
 
       - name: Run test suite
