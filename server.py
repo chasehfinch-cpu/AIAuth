@@ -886,6 +886,27 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_wl_submitted ON waitlist_signups(submitted_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_wl_notified ON waitlist_signups(notified)")
 
+    # Contact-sales inquiries from /contact (dedicated submission page for
+    # the Pricing-section Team CTA). Same hardening pattern as
+    # pilot_interest: email stored only as HMAC hash + Fernet ciphertext.
+    conn.execute("""CREATE TABLE IF NOT EXISTS contact_inquiries (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        submitted_at     TEXT NOT NULL,
+        company          TEXT NOT NULL,
+        admin_email_hash TEXT NOT NULL,
+        admin_email_encrypted TEXT NOT NULL,
+        admin_email_domain    TEXT,
+        plan             TEXT,
+        user_count       INTEGER,
+        message          TEXT,
+        source_ip        TEXT,
+        handled          INTEGER NOT NULL DEFAULT 0,
+        handled_at       TEXT,
+        handled_note     TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_submitted ON contact_inquiries(submitted_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ci_handled ON contact_inquiries(handled)")
+
     # ---------------- v0.5.0 enterprise attestation store ----------------
     # Full receipt metadata is stored here when enterprise clients POST
     # to /v1/enterprise/ingest. Created unconditionally so switching
@@ -1928,6 +1949,69 @@ def waitlist_signup(body: WaitlistRequest, request: Request):
         ),
     )
     return {"submitted": True, "message": "You're on the list. We'll email when the extension ships."}
+
+
+class ContactRequest(BaseModel):
+    company: str
+    admin_email: str
+    message: Optional[str] = None
+    plan: Optional[str] = None
+    user_count: Optional[int] = None
+
+
+@app.post("/v1/contact")
+def contact_sales(body: ContactRequest, request: Request):
+    """Contact-sales submission from /contact (dedicated page for the
+    Team pricing tier CTA). Mirrors the hardening discipline of
+    pilot_interest and waitlist_signup: email hashed + encrypted, simple
+    per-IP rate cap, operator notification fires on success.
+    """
+    company = (body.company or "").strip()
+    email = (body.admin_email or "").strip().lower()
+    if not company or not _valid_email(email):
+        raise AIAuthError("INVALID_RECEIPT", "company and valid admin_email required", 400)
+
+    ip = _client_ip(request)
+    conn = get_db()
+    recent = conn.execute(
+        "SELECT COUNT(*) AS n FROM contact_inquiries "
+        "WHERE source_ip = ? AND submitted_at > datetime('now', '-1 day')",
+        (ip,),
+    ).fetchone()
+    if recent and recent["n"] >= 20:
+        conn.close()
+        raise AIAuthError("RATE_LIMITED", "Too many contact requests from this IP today", 429)
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO contact_inquiries "
+        "(submitted_at, company, admin_email_hash, admin_email_encrypted, admin_email_domain, "
+        " plan, user_count, message, source_ip) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (now, company, email_hash(email), encrypt_value(email),
+         _email_domain(email), (body.plan or None), body.user_count,
+         (body.message or None), ip),
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"[AIAuth contact] company={company!r} plan={body.plan!r} "
+          f"email_domain={_email_domain(email)!r}")
+    _notify_operator(
+        subject=f"[AIAuth] Contact sales: {company}",
+        text=(
+            f"A new Contact Sales inquiry was submitted.\n\n"
+            f"Company:    {company}\n"
+            f"Admin:      {email}\n"
+            f"Domain:     {_email_domain(email)}\n"
+            f"Plan:       {body.plan}\n"
+            f"User count: {body.user_count}\n"
+            f"Message:    {body.message}\n"
+            f"Source IP:  {ip}\n"
+            f"Timestamp:  {now}\n"
+        ),
+    )
+    return {"submitted": True, "message": "Thanks. We'll email you within one business day."}
 
 
 # ===================================================================
@@ -3743,6 +3827,288 @@ def demo_dashboard():
     return HTMLResponse("<h1>AIAuth Demo</h1><p>Demo template not found.</p>", status_code=404)
 
 
+# ===================================================================
+# DEDICATED SUBMISSION PAGES
+#
+# Each Pricing-section CTA on the homepage routes to a standalone page
+# with its own form. Free → /waitlist, Team → /contact, Enterprise →
+# /pilot. /pricing is a canonical page for the pricing tiers so it can
+# be linked from primary navigation.
+# ===================================================================
+
+# Shared CSS for the four submission pages. Pulled out so the page
+# handlers stay small.
+_SUBMIT_PAGE_STYLE = """
+<style>
+.submit-wrap { max-width: 560px; }
+.submit-form { display: flex; flex-direction: column; gap: 14px; margin-top: 24px; }
+.submit-form label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; font-weight: 600; color: var(--text); }
+.submit-form input, .submit-form textarea, .submit-form select {
+  padding: 11px 14px; font-size: 15px; border: 1px solid var(--border); border-radius: 10px;
+  font-family: inherit; color: var(--text); background: #fff;
+}
+.submit-form input:focus, .submit-form textarea:focus, .submit-form select:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.submit-form textarea { min-height: 110px; resize: vertical; }
+.submit-form .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.submit-form button {
+  padding: 12px 18px; font-size: 15px; font-weight: 600;
+  background: var(--accent); color: #fff; border: 0; border-radius: 10px; cursor: pointer;
+}
+.submit-form button:hover { background: #1d4ed8; }
+.submit-form button:disabled { opacity: 0.6; cursor: not-allowed; }
+.submit-success {
+  display: none; padding: 14px 18px; background: #ecfdf5; border: 1px solid #10b981;
+  border-radius: 10px; color: #065f46; font-size: 14px; margin-top: 14px;
+}
+.submit-error {
+  display: none; padding: 14px 18px; background: #fef2f2; border: 1px solid #ef4444;
+  border-radius: 10px; color: #991b1b; font-size: 14px; margin-top: 14px;
+}
+.submit-note { font-size: 13px; color: var(--muted); margin-top: 10px; line-height: 1.5; }
+</style>
+"""
+
+
+def _submit_page_script(form_id: str, endpoint: str, fields: list, success_msg: str) -> str:
+    """Build the fetch-and-render JS for a submission form.
+
+    fields: list of (input_name, json_key, type) tuples. type is "int" for
+    numeric fields, anything else is treated as string.
+    """
+    import json as _json
+    fields_json = _json.dumps(fields)
+    return f"""
+<script>
+(function() {{
+  var form = document.getElementById({form_id!r});
+  var ok   = document.getElementById({form_id!r} + '-ok');
+  var err  = document.getElementById({form_id!r} + '-err');
+  if (!form) return;
+  form.addEventListener('submit', function(e) {{
+    e.preventDefault();
+    ok.style.display = 'none';
+    err.style.display = 'none';
+    var btn = form.querySelector('button[type="submit"]');
+    var origTxt = btn ? btn.textContent : '';
+    if (btn) {{ btn.disabled = true; btn.textContent = 'Sending...'; }}
+    var payload = {{}};
+    var fields = {fields_json};
+    for (var i = 0; i < fields.length; i++) {{
+      var f = fields[i];
+      var el = form.elements[f[0]];
+      if (!el) continue;
+      var val = el.value;
+      if (f[2] === 'int') {{
+        var n = parseInt(val, 10);
+        payload[f[1]] = isNaN(n) ? null : n;
+      }} else if (val !== undefined && val !== '') {{
+        payload[f[1]] = val;
+      }}
+    }}
+    fetch({endpoint!r}, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(payload)
+    }}).then(function(r) {{
+      return r.json().then(function(j) {{ return {{ status: r.status, body: j }}; }});
+    }}).then(function(res) {{
+      if (btn) {{ btn.disabled = false; btn.textContent = origTxt; }}
+      if (res.status >= 200 && res.status < 300 && res.body && res.body.submitted) {{
+        ok.textContent = (res.body.message || {success_msg!r});
+        ok.style.display = 'block';
+        form.reset();
+      }} else {{
+        var msg = (res.body && (res.body.detail || res.body.message)) || 'Something went wrong.';
+        if (typeof msg === 'object' && msg.message) msg = msg.message;
+        err.textContent = String(msg);
+        err.style.display = 'block';
+      }}
+    }}).catch(function() {{
+      if (btn) {{ btn.disabled = false; btn.textContent = origTxt; }}
+      err.textContent = 'Network error. Please try again.';
+      err.style.display = 'block';
+    }});
+  }});
+}})();
+</script>
+"""
+
+
+@app.get("/pricing", response_class=HTMLResponse)
+def pricing_page():
+    """Standalone pricing page. Mirrors the Pricing section of the
+    homepage but gives it a canonical URL so it can live in the primary
+    nav (rather than as an in-page anchor)."""
+    body = """
+<span class="eyebrow">Pricing</span>
+<h1 class="page-title">Simple pricing. Free for individuals.</h1>
+<p class="lead">Start free — no account, no card. Upgrade when your team needs shared verification, compliance dashboards, or self-hosted deployment.</p>
+
+<div style="display:grid; grid-template-columns:repeat(3,1fr); gap:20px; margin-top:36px;">
+  <div style="background:#fff; border:1px solid var(--border); border-radius:14px; padding:28px; display:flex; flex-direction:column;">
+    <div style="font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--muted);">Free</div>
+    <div style="font-size:36px; font-weight:800; letter-spacing:-0.02em; margin-top:8px;">$0</div>
+    <div style="font-size:13px; color:var(--muted); margin-top:4px;">Individuals &amp; open use</div>
+    <ul style="list-style:none; padding:0; margin:20px 0; flex:1; font-size:14px; line-height:1.65;">
+      <li>Unlimited attestations</li>
+      <li>Local receipt storage</li>
+      <li>Public-key verification</li>
+      <li>Right-click from any site</li>
+    </ul>
+    <a href="/waitlist" style="display:block; text-align:center; padding:11px 16px; border-radius:10px; font-size:14px; font-weight:600; border:1px solid var(--border); color:var(--text); text-decoration:none;">Join the Waitlist</a>
+  </div>
+  <div style="background:#fff; border:2px solid var(--accent); border-radius:14px; padding:28px; display:flex; flex-direction:column; position:relative;">
+    <span style="position:absolute; top:-11px; left:20px; background:var(--accent); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; padding:4px 10px; border-radius:999px;">Most Popular</span>
+    <div style="font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--muted);">Team</div>
+    <div style="font-size:36px; font-weight:800; letter-spacing:-0.02em; margin-top:8px;">Contact</div>
+    <div style="font-size:13px; color:var(--muted); margin-top:4px;">5 &ndash; 25 seats</div>
+    <ul style="list-style:none; padding:0; margin:20px 0; flex:1; font-size:14px; line-height:1.65;">
+      <li>Shared team verification</li>
+      <li>Attestation &amp; review-rate dashboard</li>
+      <li>AI-tool breakdown</li>
+      <li>Priority email support</li>
+    </ul>
+    <a href="/contact?plan=team" style="display:block; text-align:center; padding:11px 16px; border-radius:10px; font-size:14px; font-weight:600; background:var(--accent); color:#fff; border:1px solid var(--accent); text-decoration:none;">Contact Sales</a>
+  </div>
+  <div style="background:#fff; border:1px solid var(--border); border-radius:14px; padding:28px; display:flex; flex-direction:column;">
+    <div style="font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--muted);">Enterprise</div>
+    <div style="font-size:36px; font-weight:800; letter-spacing:-0.02em; margin-top:8px;">Custom</div>
+    <div style="font-size:13px; color:var(--muted); margin-top:4px;">Self-hosted · unlimited seats</div>
+    <ul style="list-style:none; padding:0; margin:20px 0; flex:1; font-size:14px; line-height:1.65;">
+      <li>Self-hosted signing server</li>
+      <li>Full compliance dashboard</li>
+      <li>Policy engine &amp; DSAR tooling</li>
+      <li>Rubber-stamp detection</li>
+      <li>SSO/LDAP roadmap</li>
+      <li>Dedicated onboarding</li>
+    </ul>
+    <a href="/pilot" style="display:block; text-align:center; padding:11px 16px; border-radius:10px; font-size:14px; font-weight:600; border:1px solid var(--border); color:var(--text); text-decoration:none;">Request a Pilot</a>
+  </div>
+</div>
+
+<p class="submit-note" style="margin-top:32px; max-width:640px;">All tiers share the same zero-knowledge architecture: content never leaves your device. Upgrades add team-level visibility and self-hosted control, not content access.</p>
+"""
+    return HTMLResponse(_site_shell("Pricing", body, active="pricing"))
+
+
+@app.get("/waitlist", response_class=HTMLResponse)
+def waitlist_page():
+    """Standalone waitlist signup page. Posts to POST /v1/waitlist."""
+    body = _SUBMIT_PAGE_STYLE + """
+<div class="submit-wrap">
+  <span class="eyebrow">Free Tier</span>
+  <h1 class="page-title">Join the Waitlist</h1>
+  <p class="lead">We'll email you the moment the free extension ships. No account, no card, no follow-up sales.</p>
+
+  <form id="wl-form" class="submit-form" novalidate>
+    <label>
+      Email
+      <input name="email" type="email" required autocomplete="email" placeholder="you@example.com">
+    </label>
+    <button type="submit">Join the Waitlist</button>
+  </form>
+  <div id="wl-form-ok"  class="submit-success"></div>
+  <div id="wl-form-err" class="submit-error"></div>
+  <p class="submit-note">We store a one-way hash of your email and an encrypted copy used only to send the launch announcement. No list sales, no tracking pixels. See <a href="/privacy">Privacy</a>.</p>
+</div>
+""" + _submit_page_script("wl-form", "/v1/waitlist",
+                          [["email", "email", "str"]],
+                          "You're on the list. We'll email when the extension ships.")
+    return HTMLResponse(_site_shell("Join the Waitlist", body, active="pricing"))
+
+
+@app.get("/pilot", response_class=HTMLResponse)
+def pilot_page():
+    """Standalone pilot-request page for the Enterprise tier. Posts to
+    POST /v1/pilot/interest (existing endpoint)."""
+    body = _SUBMIT_PAGE_STYLE + """
+<div class="submit-wrap">
+  <span class="eyebrow">Enterprise</span>
+  <h1 class="page-title">Request a 30-Day Pilot</h1>
+  <p class="lead">Deploy AIAuth to one department, measure attestation adoption and review rate, decide whether a full rollout is warranted. No cost for the pilot window.</p>
+
+  <form id="pi-form" class="submit-form" novalidate>
+    <label>
+      Company
+      <input name="company" type="text" required placeholder="Acme Corp">
+    </label>
+    <label>
+      Work email
+      <input name="admin_email" type="email" required autocomplete="email" placeholder="you@company.com">
+    </label>
+    <div class="row">
+      <label>
+        Approximate users
+        <input name="user_count" type="number" min="1" placeholder="25">
+      </label>
+      <label>
+        Industry
+        <input name="industry" type="text" placeholder="Healthcare, Legal, ...">
+      </label>
+    </div>
+    <button type="submit">Request a Pilot</button>
+  </form>
+  <div id="pi-form-ok"  class="submit-success"></div>
+  <div id="pi-form-err" class="submit-error"></div>
+  <p class="submit-note">Submissions route to sales@aiauth.app. We reply within one business day with deployment notes and a pilot checklist.</p>
+</div>
+""" + _submit_page_script("pi-form", "/v1/pilot/interest",
+                          [["company", "company", "str"],
+                           ["admin_email", "admin_email", "str"],
+                           ["user_count", "user_count", "int"],
+                           ["industry", "industry", "str"]],
+                          "Thanks. We'll email you within 24 hours.")
+    return HTMLResponse(_site_shell("Request a Pilot", body, active="pricing"))
+
+
+@app.get("/contact", response_class=HTMLResponse)
+def contact_page(plan: Optional[str] = Query(default=None)):
+    """Standalone Contact Sales page for the Team pricing tier. Posts to
+    POST /v1/contact. The ?plan=... query param pre-fills a hidden input
+    so the inbound lead is tagged with its source tier."""
+    plan_value = plan or "team"
+    body = _SUBMIT_PAGE_STYLE + f"""
+<div class="submit-wrap">
+  <span class="eyebrow">Team Plan</span>
+  <h1 class="page-title">Contact Sales</h1>
+  <p class="lead">Tell us about your team and we'll put together a quote with pricing, onboarding steps, and a pilot timeline. One business day reply.</p>
+
+  <form id="ct-form" class="submit-form" novalidate>
+    <input type="hidden" name="plan" value="{plan_value}">
+    <label>
+      Company
+      <input name="company" type="text" required placeholder="Acme Corp">
+    </label>
+    <label>
+      Work email
+      <input name="admin_email" type="email" required autocomplete="email" placeholder="you@company.com">
+    </label>
+    <label>
+      Approximate team size
+      <input name="user_count" type="number" min="1" placeholder="12">
+    </label>
+    <label>
+      What are you trying to solve?
+      <textarea name="message" placeholder="We're evaluating AI governance tools because..."></textarea>
+    </label>
+    <button type="submit">Contact Sales</button>
+  </form>
+  <div id="ct-form-ok"  class="submit-success"></div>
+  <div id="ct-form-err" class="submit-error"></div>
+  <p class="submit-note">Goes to sales@aiauth.app. We never share your email or resell contact data.</p>
+</div>
+""" + _submit_page_script("ct-form", "/v1/contact",
+                          [["company", "company", "str"],
+                           ["admin_email", "admin_email", "str"],
+                           ["plan", "plan", "str"],
+                           ["user_count", "user_count", "int"],
+                           ["message", "message", "str"]],
+                          "Thanks. We'll email you within one business day.")
+    return HTMLResponse(_site_shell("Contact Sales", body, active="pricing"))
+
+
 @app.get("/admin/license/issue", response_class=HTMLResponse)
 def admin_license_issuer_page(master_key: Optional[str] = Query(default=None)):
     """License issuer admin page (Phase C.2).
@@ -4000,6 +4366,7 @@ footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px sol
   <a class="brand" href="/"><img src="/logo.png" alt="AIAuth"><span>AIAuth</span></a>
   <div class="nav-links">
     <a href="/#how-it-works"{active_cls('how')}>How It Works</a>
+    <a href="/pricing"{active_cls('pricing')}>Pricing</a>
     <a href="/#business"{active_cls('business')}>For Business</a>
     <a href="/guide"{active_cls('guide')}>User Guide</a>
     <a class="nav-cta-outline" href="/check"{active_cls('check')}>Verify a Receipt</a>
