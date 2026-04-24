@@ -91,7 +91,7 @@
       <strong>For auditors:</strong> every receipt ID in this report can be independently verified against the organization's public key using any AIAuth-compatible verifier, including the open-source reference implementation.
     </div>
 
-    <h2>2. Attestation Volume</h2>
+    <h2>2. Attestation Volume <span class="tier-badge">Team / Enterprise Tier Only</span></h2>
     <div class="kpi-row">
       <div class="kpi"><div class="n" id="k_total">—</div><div class="l">Total Attestations</div></div>
       <div class="kpi"><div class="n" id="k_users">—</div><div class="l">Unique Attesters</div></div>
@@ -113,7 +113,7 @@
     </table>
     <p style="font-size:12px;color:var(--muted);">Grade: A (≥95% reviewed, 0 critical violations), B (≥85%), C (≥70%), D (≥50%), F (&lt;50%).</p>
 
-    <h2>5. Chain Integrity Summary</h2>
+    <h2>5. Chain Integrity Summary <span class="tier-badge">Team / Enterprise Tier Only</span></h2>
     <div class="kpi-row">
       <div class="kpi"><div class="n" id="c_total">—</div><div class="l">Total Document Chains</div></div>
       <div class="kpi"><div class="n" id="c_complete">—</div><div class="l">Complete Chains</div></div>
@@ -122,7 +122,7 @@
     </div>
     <p>A "broken chain" means a receipt references a parent hash that cannot be found in the registry. This typically indicates a document whose lineage predates AIAuth adoption or whose parent receipt was created on a different AIAuth deployment.</p>
 
-    <h2>6. Cross-Format Chain Verification</h2>
+    <h2>6. Cross-Format Chain Verification <span class="tier-badge">Team / Enterprise Tier Only</span></h2>
     <p>AIAuth's canonical-text hashing enables chain-of-custody preservation across format conversions (e.g., Excel → CSV → PDF). Receipts whose byte-level content hashes differ but share a canonical-text hash represent the same logical document in different formats.</p>
     <div class="kpi-row">
       <div class="kpi"><div class="n" id="cf_total">—</div><div class="l">Canonical Groups</div></div>
