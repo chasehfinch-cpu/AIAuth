@@ -86,9 +86,9 @@ Each row is tagged:
 
 | # | Item | Status | Evidence |
 |---|------|--------|----------|
-| 10.1 | Automated test suite | Missing — backlog | No `tests/` directory. |
+| 10.1 | Automated test suite | **Built** | `tests/` directory shipped; 60 tests across crypto, rate limits, schema, HTTP. CI at `.github/workflows/test.yml`. |
 | 10.2 | Rate limiting | **Built** | Middleware in `server.py` (~line 269). 429s enforced on `/v1/sign`, `/v1/pilot/interest`, `/v1/waitlist`. |
-| 10.3 | Status page | Missing — backlog | `/health` exists; no public status page. |
+| 10.3 | Status page | Won't fix | `/health` and `/health/db` provide readiness signals. External public status page explicitly declined — operator preferred not to take on a third-party dependency. |
 
 ## Section 11 — Intellectual Property
 
