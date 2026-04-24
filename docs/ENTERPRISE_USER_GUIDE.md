@@ -6,7 +6,7 @@ This guide is for employees whose company has deployed AIAuth Enterprise. Short 
 
 ## 1. What's Changing for You
 
-Your company now uses AIAuth to create a chain of custody for AI-assisted work. When you use ChatGPT, Claude, Copilot, or any other AI tool to help produce work output, you press **Ctrl+Shift+A** to create a tamper-proof receipt proving:
+Your company now uses AIAuth to create a chain of custody for AI-assisted work. When you use ChatGPT, Claude, Copilot, or any other AI tool to help produce work output, you press **the right-click menu** to create a tamper-proof receipt proving:
 
 - What AI was used
 - When it was used
@@ -41,7 +41,7 @@ Look for the AIAuth icon in your browser toolbar (a small blue "A"). Click it:
 2. Enter your **corporate** email address (e.g., `you@yourco.com`).
 3. Click **Verify My Email (Recommended)**.
 4. Open your corporate inbox — there's a one-time link waiting. Click it (or copy-paste it into the extension's verification box).
-5. You're ready. Press Ctrl+Shift+A on any AI site to attest.
+5. You're ready. Right-click and choose "Attest selection with AIAuth" on any AI site to attest.
 
 ### 2.2 If You Need to Install It Yourself
 
@@ -66,13 +66,13 @@ Your prior personal attestations **remain private by default**. You can optional
 After you've reviewed AI output and decided it's ready to use:
 
 1. Select the output text on the AI site.
-2. Press **Ctrl+Shift+A** (or Cmd+Shift+A on Mac).
+2. Press **the right-click menu** (or the right-click menu on Mac).
 3. A receipt is created. You'll see a toast notification with a short code like `[AIAuth:a1b2c3d4]`.
 4. That code is copied to your clipboard. Paste it wherever you want proof of provenance — alongside the content in an email, in a Slack message, in a document comment, etc.
 
 ### 3.2 Reviewing Before You Attest
 
-The extension records how long you spent looking at the AI output before pressing Ctrl+Shift+A. This is the "time-to-attest" metric. Under 10 seconds on long content triggers a "rubber-stamp" alert.
+The extension records how long you spent looking at the AI output before pressing the right-click menu. This is the "time-to-attest" metric. Under 10 seconds on long content triggers a "rubber-stamp" alert.
 
 If you're genuinely skimming something short, no alert fires. The threshold is calibrated for "long content reviewed too quickly to have actually been read."
 
@@ -82,7 +82,7 @@ Right-click any file → **AIAuth: Attest this file**. The agent hashes the file
 
 ### 3.4 When You're Offline
 
-Press Ctrl+Shift+A anyway. The receipt is created locally with a "Pending" badge. When you're back online, the extension syncs pending receipts automatically.
+Right-click and choose "Attest selection with AIAuth" anyway. The receipt is created locally with a "Pending" badge. When you're back online, the extension syncs pending receipts automatically.
 
 ---
 
@@ -121,12 +121,12 @@ Your employer cannot retroactively extract your personal attestation data. AIAut
 No. Only a one-way hash of the prompt is recorded, and only when you create an attestation. Your employer sees the hash — not the prompt text. The hash cannot be reversed into the original prompt.
 
 **Can my employer see what AI apps I have open on my computer?**
-On the enterprise version, yes — but only AI applications we recognize (ChatGPT Desktop, Claude Desktop, Cursor, Copilot, Perplexity, Poe), only at the exact moment you press Ctrl+Shift+A, and never the contents of those apps. This is called the Shadow AI Heatmap. On the free version, this is never collected.
+On the enterprise version, yes — but only AI applications we recognize (ChatGPT Desktop, Claude Desktop, Cursor, Copilot, Perplexity, Poe), only at the exact moment you Right-click and choose "Attest selection with AIAuth", and never the contents of those apps. This is called the Shadow AI Heatmap. On the free version, this is never collected.
 
 This is disclosed here because your employer is a consent-required data controller for this data, and consent requires that you know what's captured.
 
 **Do I have to use this?**
-Your company's policy determines this. AIAuth is technically optional — if you don't press Ctrl+Shift+A, no receipt is created. But if your company's policy says "all AI-assisted client deliverables must carry an AIAuth receipt," not attesting means your work isn't shippable.
+Your company's policy determines this. AIAuth is technically optional — if you don't Right-click and choose "Attest selection with AIAuth", no receipt is created. But if your company's policy says "all AI-assisted client deliverables must carry an AIAuth receipt," not attesting means your work isn't shippable.
 
 **What if I forget to attest?**
 Nothing breaks. Attestation is additive — your work still happens, just without the audit trail. Your manager might ask you to attest retroactively; you can do this by pasting the text into the extension popup's "Attest pasted text" box.

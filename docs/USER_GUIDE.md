@@ -49,7 +49,7 @@ with Copilot. Nothing changes about your workflow.
 Select the text the AI generated and copy it to your clipboard 
 (Ctrl+C or right-click → Copy).
 
-### Step 3: Press Ctrl+Shift+A
+### Step 3: Right-click and choose "Attest selection with AIAuth"
 
 That's the AIAuth shortcut. You can also right-click the AIAuth icon 
 in your system tray or browser toolbar.
@@ -109,28 +109,28 @@ tracks this automatically.
   Monday 9:00 AM
   ┌─────────────────────────────────────────────┐
   │  Sarah drafts a forecast using Claude        │
-  │  She reviews it and presses Ctrl+Shift+A     │
+  │  She reviews it and presses the right-click menu     │
   │  → Receipt #1: Sarah created this with AI    │
   └──────────────────┬──────────────────────────┘
                      │
   Monday 2:00 PM     ▼
   ┌─────────────────────────────────────────────┐
   │  Mike receives it, changes the numbers       │
-  │  He reviews his version, Ctrl+Shift+A        │
+  │  He reviews his version, the right-click menu        │
   │  → Receipt #2: Mike modified Sarah's work    │
   └──────────────────┬──────────────────────────┘
                      │
   Tuesday 10:00 AM   ▼
   ┌─────────────────────────────────────────────┐
   │  A consultant runs it through GPT-4o         │
-  │  for additional analysis, Ctrl+Shift+A       │
+  │  for additional analysis, the right-click menu       │
   │  → Receipt #3: AI-enhanced by consultant     │
   └──────────────────┬──────────────────────────┘
                      │
   Tuesday 4:00 PM    ▼
   ┌─────────────────────────────────────────────┐
   │  The CFO reviews the final version           │
-  │  She approves it, Ctrl+Shift+A               │
+  │  She approves it, the right-click menu               │
   │  → Receipt #4: CFO approved the final        │
   └─────────────────────────────────────────────┘
 ```
@@ -143,7 +143,7 @@ was involved, and who approved each version.
 
 When you attest content that was previously attested by someone else, 
 AIAuth detects that the content has changed and links the new receipt 
-to the old one. You don't do anything special — just use Ctrl+Shift+A 
+to the old one. You don't do anything special — just use the right-click menu 
 as usual. The chain builds itself.
 
 ---
@@ -222,14 +222,14 @@ important files.
 
 **Does this work with every AI tool?**
 Yes. AIAuth doesn't need to connect to the AI tool. You just copy 
-the output and press Ctrl+Shift+A. It works with any AI — ChatGPT, 
+the output and Right-click and choose "Attest selection with AIAuth". It works with any AI — ChatGPT, 
 Claude, Gemini, Copilot, Midjourney, Stable Diffusion, or anything 
 else that produces output you can copy.
 
 **What if I modify the AI output before attesting?**
 That's expected and encouraged. Edit the AI's output, make it yours, 
 then attest your final version. The receipt covers whatever was in 
-your clipboard when you pressed Ctrl+Shift+A — which is your 
+your clipboard when you pressed the right-click menu — which is your 
 reviewed, edited version.
 
 **Is this legally binding?**
@@ -302,7 +302,7 @@ The extension shows one of five views depending on your setup:
 
 ## When You're Offline
 
-Press Ctrl+Shift+A anyway. The receipt is created locally with a
+Right-click and choose "Attest selection with AIAuth" anyway. The receipt is created locally with a
 "Pending" badge. When your connection is restored, the extension
 syncs pending receipts in a single batch, and they flip to "Signed".
 Nothing is lost.

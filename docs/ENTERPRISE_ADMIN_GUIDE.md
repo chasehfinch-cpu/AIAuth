@@ -10,7 +10,7 @@ AIAuth Enterprise is **self-hosted only**. You run the server on your infrastruc
 
 ### 1.1 What AIAuth Does for Your Organization
 
-**Chain of custody, not content surveillance.** Your users press Ctrl+Shift+A to create a tamper-proof receipt of their AI-assisted work. The receipt carries metadata (who, when, which AI tool, review status) — never the content itself. Your dashboards answer "Who is using which AI tools? Are they reviewing output? Is content flowing externally?" without the privacy cost of screen recording or content capture.
+**Chain of custody, not content surveillance.** Your users Right-click and choose "Attest selection with AIAuth" to create a tamper-proof receipt of their AI-assisted work. The receipt carries metadata (who, when, which AI tool, review status) — never the content itself. Your dashboards answer "Who is using which AI tools? Are they reviewing output? Is content flowing externally?" without the privacy cost of screen recording or content capture.
 
 **What you can see:** per-user attestation rates, AI-tool adoption, review quality (time-to-attest, rubber-stamp detection), external-content-flow rates, policy violations, cross-format chain integrity.
 
