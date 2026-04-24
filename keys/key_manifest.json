@@ -1,0 +1,13 @@
+{
+  "keys": [
+    {
+      "key_id": "key_001",
+      "algorithm": "Ed25519",
+      "valid_from": "2026-04-24T22:00:55.075035+00:00",
+      "valid_until": null,
+      "status": "active",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAnC6DoejnMuVuOkSNs9px/SU97Dcu8y5JoAB2Uu8Czgc=\n-----END PUBLIC KEY-----\n"
+    }
+  ],
+  "current_signing_key": "key_001"
+}

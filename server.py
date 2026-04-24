@@ -5499,13 +5499,36 @@ h1.page-title {{ font-size:clamp(30px,4vw,46px); line-height:1.1; font-weight:80
 .copy-btn:hover {{ background:#e0eaff; }}
 footer {{ padding:40px 0; color:var(--muted); font-size:13px; border-top:1px solid var(--border); }}
 .foot-inner {{ display:flex; justify-content:space-between; flex-wrap:wrap; gap:16px; }}
-.foot-inner a {{ color:var(--muted); margin-right:18px; }}
-@media (max-width:760px) {{ .nav-links a:not(.nav-cta):not(.brand) {{ display:none; }} }}
+.foot-inner a {{ color:var(--muted); margin-right:18px; display:inline-block; line-height:1.9; }}
+
+/* Hamburger toggle — hidden on desktop, shown on narrow viewports. */
+.nav-toggle {{ display:none; align-items:center; justify-content:center; width:40px; height:36px; background:none; border:1px solid var(--border); border-radius:8px; padding:0; cursor:pointer; color:var(--text); }}
+.nav-toggle:hover {{ border-color:var(--accent); }}
+.nav-toggle .bars {{ display:inline-block; position:relative; width:18px; height:2px; background:var(--text); border-radius:1px; }}
+.nav-toggle .bars::before, .nav-toggle .bars::after {{ content:""; position:absolute; left:0; width:18px; height:2px; background:var(--text); border-radius:1px; }}
+.nav-toggle .bars::before {{ top:-6px; }}
+.nav-toggle .bars::after {{ top:6px; }}
+.nav-inner {{ position:relative; }}
+
+@media (max-width:760px) {{
+  .nav-toggle {{ display:inline-flex; }}
+  .nav-links {{ display:none; position:absolute; top:56px; right:8px; left:8px; background:#fff; border:1px solid var(--border); border-radius:12px; padding:14px; flex-direction:column; align-items:stretch; gap:6px; box-shadow:0 10px 28px rgba(0,0,0,0.08); z-index:20; }}
+  .nav-links.open {{ display:flex; }}
+  .nav-links a {{ padding:10px 12px; border-radius:8px; color:var(--text); font-weight:500; }}
+  .nav-links a:hover {{ background:var(--panel); text-decoration:none; }}
+  .nav-links .nav-cta-outline {{ text-align:center; border:1px solid var(--border); margin-top:4px; }}
+  .nav-links .nav-cta {{ text-align:center; }}
+  .foot-inner {{ flex-direction:column; gap:14px; }}
+  .foot-inner > div:last-child {{ line-height:2; }}
+}}
 </style>
 </head><body>
 <nav class="nav"><div class="container-wide nav-inner">
   <a class="brand" href="/"><img src="/logo.png" alt="AIAuth"><span>AIAuth</span></a>
-  <div class="nav-links">
+  <button class="nav-toggle" aria-label="Toggle navigation" aria-expanded="false" onclick="(function(btn){{var l=document.getElementById('primaryNav');var open=l.classList.toggle('open');btn.setAttribute('aria-expanded',open?'true':'false');}})(this)">
+    <span class="bars"></span>
+  </button>
+  <div class="nav-links" id="primaryNav">
     <a href="/#how-it-works"{active_cls('how')}>How It Works</a>
     <a href="/pricing"{active_cls('pricing')}>Pricing</a>
     <a href="/standards"{active_cls('standards')}>Standards</a>
