@@ -912,6 +912,11 @@ def init_db():
     # to /v1/enterprise/ingest. Created unconditionally so switching
     # modes doesn't require a migration. Populated only in enterprise
     # flows; free-tier /v1/sign NEVER writes here (see Dual-Path Arch).
+    #
+    # content_hash_canonical was added in the Commercial-KPI-Honesty PR
+    # (2026-04-24) so the dashboard can compute cross_format.multi_format_documents
+    # without joining to the separate hash_registry DB. Idempotent ALTER
+    # runs below to migrate existing deployments.
     conn.execute("""CREATE TABLE IF NOT EXISTS enterprise_attestations (
         id              TEXT PRIMARY KEY,
         ts              TEXT NOT NULL,
@@ -946,6 +951,13 @@ def init_db():
         client_integrity TEXT DEFAULT 'none',
         ingested_at     TEXT NOT NULL
     )""")
+    # Commercial-KPI-Honesty PR (2026-04-24): canonical-text hash column
+    # for cross-format chain analytics. Idempotent migration for existing
+    # deployments.
+    ea_cols = {r["name"] for r in conn.execute("PRAGMA table_info(enterprise_attestations)").fetchall()}
+    if "content_hash_canonical" not in ea_cols:
+        conn.execute("ALTER TABLE enterprise_attestations ADD COLUMN content_hash_canonical TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_canonical ON enterprise_attestations(content_hash_canonical)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_uid_hash ON enterprise_attestations(uid_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_ts ON enterprise_attestations(ts)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ea_org ON enterprise_attestations(org_id)")
@@ -2555,6 +2567,9 @@ def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
         org["org_id"],
         receipt.get("client_integrity", "none"),
         datetime.now(timezone.utc).isoformat(),
+        # Commercial-KPI-Honesty PR: canonical-text hash. Optional; null
+        # for clients that don't populate it (e.g. Chrome extension today).
+        receipt.get("content_hash_canonical"),
     )
     conn.execute(
         "INSERT INTO enterprise_attestations ("
@@ -2563,8 +2578,9 @@ def enterprise_ingest(body: EnterpriseIngestRequest, request: Request):
         "concurrent_ai_apps, ai_markers, doc_id, parent, "
         "file_type, len, tta, sid, dest, dest_ext, classification, "
         "review_status, review_by, review_at, review_note, tags, "
-        "schema_version, org_id, client_integrity, ingested_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "schema_version, org_id, client_integrity, ingested_at, "
+        "content_hash_canonical"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         row,
     )
 
@@ -2662,6 +2678,90 @@ def admin_org_claim(body: OrgClaimRequest, authorization: Optional[str] = Header
 
 
 # ------------- Admin: member list + DSAR + pseudonymize -------------
+
+class DepartmentUploadRequest(BaseModel):
+    """CSV upload payload for bulk department assignment.
+
+    csv: the raw CSV text. First row must be the header `email,department`.
+    Each subsequent row is `email,department`. One email per line; no
+    quoting required; UTF-8 expected. Unknown emails are silently skipped
+    so admins can safely run the upload for a roster that may include
+    former employees — the response reports unmatched_emails so the admin
+    can reconcile.
+    """
+    csv: str
+
+
+@app.post("/v1/admin/org/departments")
+def admin_org_departments(body: DepartmentUploadRequest, org_id: str = Query(...),
+                          authorization: Optional[str] = Header(default=None)):
+    """Bulk-assign department labels from a CSV to members of an org.
+    Admin-authed (reuses _require_admin_session). Idempotent — re-running
+    with the same CSV produces the same org_members state.
+
+    See docs/ENTERPRISE_ADMIN_GUIDE.md §3.4 for the CSV format and §3.5
+    for how this feeds dashboard + compliance-report aggregations.
+    """
+    _require_admin_session(authorization, org_id)
+    raw = (body.csv or "").strip()
+    if not raw:
+        raise AIAuthError("INVALID_RECEIPT", "Empty CSV payload", 400)
+
+    import csv as _csv
+    import io as _io
+    reader = _csv.reader(_io.StringIO(raw))
+    try:
+        header = [c.strip().lower() for c in next(reader)]
+    except StopIteration:
+        raise AIAuthError("INVALID_RECEIPT", "CSV has no rows", 400)
+    if header != ["email", "department"]:
+        raise AIAuthError(
+            "INVALID_RECEIPT",
+            "CSV header must be exactly: email,department",
+            400,
+        )
+
+    conn = get_db()
+    updated = 0
+    unmatched: list[str] = []
+    for row in reader:
+        if not row or len(row) < 2:
+            continue
+        email = row[0].strip().lower()
+        department = row[1].strip()
+        if not email or not _valid_email(email):
+            continue
+        eh = email_hash(email)
+        # Find the account, then update its org_members row for this org.
+        acct = conn.execute(
+            "SELECT account_id FROM accounts WHERE primary_email_hash = ?",
+            (eh,),
+        ).fetchone()
+        if not acct:
+            unmatched.append(email)
+            continue
+        result = conn.execute(
+            "UPDATE org_members SET department = ? "
+            "WHERE account_id = ? AND org_id = ?",
+            (department or None, acct["account_id"], org_id),
+        )
+        if result.rowcount > 0:
+            updated += 1
+        else:
+            unmatched.append(email)
+    conn.commit()
+    conn.close()
+
+    return {
+        "org_id": org_id,
+        "updated": updated,
+        "unmatched_count": len(unmatched),
+        # Return at most the first 50 unmatched emails so a large roster
+        # doesn't blow up the response. Admin reconciles against their
+        # own HR system.
+        "unmatched_emails": unmatched[:50],
+    }
+
 
 @app.get("/v1/admin/org/members")
 def admin_org_members(org_id: str = Query(...), authorization: Optional[str] = Header(default=None)):
@@ -3078,6 +3178,36 @@ def dashboard_data(
         params,
     ).fetchone()["n"] or 0
 
+    # Commercial KPI honesty (2026-04-24): two new queries whose labels
+    # actually match what they measure, surfaced under cross_format.*.
+    #
+    # Multi-Format Documents: count of content_hash_canonical values that
+    # appear with 2+ distinct output_hash values in the window — i.e. the
+    # same logical document attested in more than one byte-level format.
+    # Requires a client that populates content_hash_canonical (currently
+    # only the self-hosted desktop agent).
+    multi_format_docs = conn.execute(
+        f"SELECT COUNT(*) AS n FROM ( "
+        f"  SELECT ea.content_hash_canonical "
+        f"  FROM enterprise_attestations ea {join} "
+        f"  WHERE {where} {dept_filter} AND ea.content_hash_canonical IS NOT NULL "
+        f"  GROUP BY ea.content_hash_canonical "
+        f"  HAVING COUNT(DISTINCT ea.hash) > 1"
+        f")",
+        params,
+    ).fetchone()["n"] or 0
+
+    # Ungoverned AI Content: count of policy violations where policy_id is
+    # 'ungoverned-ai-content' (see DEFAULT_POLICIES). This ties the KPI
+    # directly to a real policy rule the evaluator runs on every receipt.
+    ungoverned_ai = conn.execute(
+        f"SELECT COUNT(*) AS n FROM policy_violations pv "
+        f"JOIN enterprise_attestations ea ON pv.attestation_id = ea.id "
+        f"{join} WHERE {where} {dept_filter} "
+        f"AND pv.policy_id = 'ungoverned-ai-content'",
+        params,
+    ).fetchone()["n"] or 0
+
     # Recent violations feed (last 20)
     recent_vios = [
         {**dict(r), "details": json.loads(r["details"] or "{}")}
@@ -3145,6 +3275,14 @@ def dashboard_data(
             "complete_chains": complete_chains,
             "broken_chains": broken_chains,
             "breaks": [],
+        },
+        # Commercial-KPI-Honesty PR: one authoritative block for
+        # cross-format analytics. Compliance report §6 reads from here.
+        "cross_format": {
+            "canonical_groups": total_chains,
+            "multi_format_documents": multi_format_docs,
+            "ai_authored_artifacts": summary_row["ai_authored"] or 0,
+            "ungoverned_ai_content": ungoverned_ai,
         },
         "recent_violations": recent_vios,
         "shadow_ai_heatmap": {

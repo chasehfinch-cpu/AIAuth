@@ -41,6 +41,20 @@
     .signature-block { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
     .signature-block .sig { border-top: 1px solid var(--ink); padding-top: 4px; font-size: 11px; color: var(--muted); margin-top: 40px; }
     .synthetic-warning { background: #fef3c7; border: 1px solid #fcd34d; color: #78350f; padding: 10px 14px; border-radius: 8px; font-size: 12px; margin-bottom: 20px; }
+    .tier-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      background: var(--panel);
+      padding: 2px 8px;
+      border-radius: 999px;
+      letter-spacing: 0.03em;
+      margin-left: 8px;
+      vertical-align: middle;
+      text-transform: none;
+    }
 
     @media print {
       body { padding: 24px 40px; background: white; }
@@ -85,14 +99,14 @@
       <div class="kpi"><div class="n" id="k_files">—</div><div class="l">File Attestations</div></div>
     </div>
 
-    <h2>3. Policy Violations — Severity Breakdown</h2>
+    <h2>3. Policy Violations — Severity Breakdown <span class="tier-badge">Team / Enterprise Tier Only</span></h2>
     <table>
       <thead><tr><th>Severity</th><th>Count</th><th>Resolved</th><th>Outstanding</th></tr></thead>
       <tbody id="violRows"></tbody>
     </table>
     <div class="callout">Policies: dual-review-financial, no-rubber-stamping, external-must-attest, unverified-financial, shadow-ai-detected, ungoverned-ai-content. Definitions in Enterprise Admin Guide Section 4.7.</div>
 
-    <h2>4. Department Compliance Scores</h2>
+    <h2>4. Department Compliance Scores <span class="tier-badge">Team / Enterprise Tier Only</span></h2>
     <table>
       <thead><tr><th>Department</th><th>Attestations</th><th>Review Rate</th><th>Rubber-Stamp Rate</th><th>Grade</th></tr></thead>
       <tbody id="deptRows"></tbody>
@@ -137,6 +151,14 @@
       AIAuth never sees, stores, or transmits your content. This report is derived from metadata only,
       produced by your organization's self-hosted AIAuth Enterprise server. Finch Business Services LLC
       (the software vendor) has no access to the data summarized here.
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:10px;">
+      Metrics badged "Team / Enterprise Tier Only" are populated when the paid-tier AIAuth client is
+      deployed (Team or Enterprise). Free-tier installations show a subset. Cross-format chain metrics
+      additionally require the self-hosted desktop agent, which computes the canonical-text hash;
+      the Chrome extension alone does not populate these fields. Setup instructions for every
+      upload-gated KPI live in
+      <a href="https://github.com/chasehfinch-cpu/AIAuth/blob/main/docs/ENTERPRISE_ADMIN_GUIDE.md#kpi-data-inputs-at-a-glance">docs/ENTERPRISE_ADMIN_GUIDE.md §3.5</a>.
     </div>
   </div>
 
@@ -218,18 +240,25 @@
       const rate = ci.total_chains ? (ci.complete_chains / ci.total_chains) : 0;
       document.getElementById("c_pct").textContent = pct(rate);
 
-      // Cross-format + AI authorship
-      document.getElementById("cf_total").textContent = fmt(ci.total_chains);
-      document.getElementById("cf_multi").textContent = fmt((d.ai_authorship?.by_source || [])
-        .reduce((n, x) => n + (x.count || 0), 0));
-      document.getElementById("cf_ai").textContent = fmt(s.ai_authored_detected);
-      document.getElementById("cf_unatt").textContent = fmt(d.ai_authorship?.unattested_with_markers?.count);
+      // Cross-format + AI authorship.
+      // Commercial-KPI-Honesty PR (2026-04-24): these four KPIs now read
+      // from the dedicated d.cross_format object. The previous wiring
+      // summed an unrelated ai_authorship.by_source count as if it were
+      // multi-format documents (mislabel) and read unattested_with_markers
+      // as "ungoverned" (also mislabel — unattested_with_markers counts
+      // AI-marked receipts without a parent, not policy-violating ones).
+      // See docs/ENTERPRISE_ADMIN_GUIDE.md §3.5 for the real definitions.
+      const cf = d.cross_format || {};
+      document.getElementById("cf_total").textContent = fmt(cf.canonical_groups ?? ci.total_chains);
+      document.getElementById("cf_multi").textContent = fmt(cf.multi_format_documents || 0);
+      document.getElementById("cf_ai").textContent    = fmt(cf.ai_authored_artifacts ?? s.ai_authored_detected);
+      document.getElementById("cf_unatt").textContent = fmt(cf.ungoverned_ai_content || 0);
 
       // Recommendations
       const recs = [];
       if ((pv.critical || 0) > 0) recs.push(`Address ${pv.critical} critical policy violation${pv.critical > 1 ? 's' : ''} within 48 hours. See Violations Feed in the dashboard.`);
       if ((s.rubber_stamp_rate || 0) > 0.03) recs.push("Rubber-stamp rate exceeds 3% — consider a review-latency policy update and reviewer training.");
-      if ((d.ai_authorship?.unattested_with_markers?.count || 0) > 0) recs.push("Un-attested AI-authored content detected in the chain. Audit documents whose AI markers were present but never passed through a reviewer.");
+      if ((cf.ungoverned_ai_content || 0) > 0) recs.push(`${cf.ungoverned_ai_content} ungoverned AI content policy violation${cf.ungoverned_ai_content > 1 ? 's' : ''} detected. Review each in the policy_violations feed and confirm the attester should have been flagged.`);
       if ((s.prompt_hash_coverage || 0) < 0.5) recs.push("Prompt-chain coverage below 50%. Consider rolling out prompt-capture on Chrome extension deployments to strengthen audit trail.");
       if (recs.length === 0) recs.push("No material concerns identified in this reporting period.");
       document.getElementById("recommendations").innerHTML = recs.map(r => `<li>${r}</li>`).join("");

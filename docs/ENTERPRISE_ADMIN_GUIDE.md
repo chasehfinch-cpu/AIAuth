@@ -129,14 +129,82 @@ This:
 
 ### 3.4 Department Mapping
 
-Upload a CSV mapping email → department:
+Several dashboard KPIs — the Department Scorecard in the executive summary, the per-department rubber-stamp and review-rate rows in the compliance report — depend on a roster that maps each verified email to a department. Without this, all attestations roll up under "Unmapped" and the scorecard is empty.
+
+**CSV format.** UTF-8, Unix or Windows line endings, no quoting required. Exactly two columns — `email` and `department` — with a mandatory header row:
+
 ```csv
 email,department
 alice@yourco.com,Finance
 bob@yourco.com,Engineering
+carol@yourco.com,Legal
 ```
 
-(Current state: department mapping via CSV import is operator-run via the admin endpoints; a UI is v0.6.0. Unmapped users appear under "Unmapped" in the dashboard.)
+Rules:
+- Emails are normalized lowercase server-side before matching.
+- An email that isn't yet an AIAuth account is silently skipped; the server returns it in `unmatched_emails` so you can reconcile against HR.
+- A blank `department` field clears any existing assignment for that member (useful when someone leaves a team).
+- Re-running with the same CSV is idempotent — safe to run nightly from a cron.
+
+**Upload endpoint.** `POST /v1/admin/org/departments?org_id=<your_org_id>`:
+
+```bash
+# From an admin session (bearer token from your /v1/admin signin):
+curl -X POST "https://aiauth.yourco.com/v1/admin/org/departments?org_id=ORG_YOURCO" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @- <<'JSON'
+{
+  "csv": "email,department\nalice@yourco.com,Finance\nbob@yourco.com,Engineering\n"
+}
+JSON
+```
+
+Response:
+
+```json
+{
+  "org_id": "ORG_YOURCO",
+  "updated": 2,
+  "unmatched_count": 0,
+  "unmatched_emails": []
+}
+```
+
+**How AIAuth references it.** At dashboard query time, the aggregator joins `enterprise_attestations.uid_hash` against `org_members.uid_hash` and groups by `org_members.department` for the Department Scorecard and per-department breakdowns. Any attestation whose attester isn't in `org_members` for the current org rolls up under "Unmapped".
+
+**What it does NOT do.** This endpoint does not create accounts. Users still self-provision via the magic-link flow (`/v1/account/create`) or via your Workspace/Intune managed policy. The CSV only assigns departments to accounts that already exist.
+
+**Offboarding.** When a user leaves, pair this with the `left_at` update described in §3.3 — setting `left_at` excludes them from forward reporting but preserves their historical attestations in the compliance trail.
+
+A built-in admin UI for department management is planned for v0.6.0. Until then, the endpoint above is the supported path.
+
+---
+
+### 3.5 KPI Data Inputs at a Glance
+
+One reference table for every KPI that needs setup beyond the default extension install. Use this when onboarding a new deployment or auditing why a metric shows zero.
+
+| KPI (report location) | What's required | Format & where | How AIAuth references it |
+|---|---|---|---|
+| **Department Scorecard** (exec summary §2, compliance §4) | Email → department roster | CSV uploaded via `POST /v1/admin/org/departments` (see §3.4) | JOIN `enterprise_attestations.uid_hash` ↔ `org_members.uid_hash`, GROUP BY department |
+| **External Exposures** (exec summary KPI strip) | Your organization's owned domain(s) | `org_domain` field in the managed Chrome extension policy — deployed via Google Workspace Admin or Microsoft Intune (see §2.1). Accepts a single domain or a comma-separated list. | The extension sets `dest_ext = true` on attest when the destination URL's hostname does NOT end with any `org_domain`. Server aggregates the boolean. |
+| **Shadow AI Heatmap** (exec summary §5, compliance narrative) | Automatic — no upload | The extension calls `enumerateConcurrentAIApps()` on every attestation when `tier === "enterprise"`. It queries open tabs matching its built-in AI_DOMAINS list. | `SELECT source, COUNT(*)` over `enterprise_attestations.concurrent_ai_apps` using `json_each()` — tools open but never attested become the shadow ratio. |
+| **Policy Violations (Critical/High/Medium/Low)** (exec summary §3, compliance §3) | Default policies ship with the server; custom rules are code changes today (YAML-driven rules are v0.6.0) | Rule set defined in `DEFAULT_POLICIES` ([server.py](../server.py) around the `_evaluate_policies` function). Custom rules require a patch + service restart. | `policy_violations` table is written to by the evaluator on every ingest; dashboard groups by `severity`. |
+| **Classification tags** (external-exposure breakdowns) | Automatic — heuristic | Extension's `suggestClassification()` tags each attestation as `financial` / `legal` / `client-facing` / `internal`. Override by customizing the function in a self-hosted build. | Stored on `enterprise_attestations.classification`. Aggregated by department and destination. |
+| **Multi-Format Documents** (compliance §6) | Canonical text hash from the desktop agent | Install the self-hosted desktop agent from [self-hosted/aiauth_canonical.py](../self-hosted/aiauth_canonical.py). The agent extracts text from xlsx/csv/pdf/docx, SHA-256s the canonical string, and includes it as `content_hash_canonical` in the sign payload. The Chrome extension does not compute this today — deferred to a later Data Depth tier. | `SELECT content_hash_canonical, COUNT(DISTINCT hash) HAVING count > 1` — the canonical hash identifies the same logical document across format conversions. |
+| **Ungoverned AI Content** (compliance §6) | Automatic — policy rule is built-in | `ungoverned-ai-content` policy defined in [server.py](../server.py) `DEFAULT_POLICIES`. Fires when a receipt has `ai_markers.verified === true` AND no `parent` receipt (root AI-authored attestation). | `SELECT COUNT(*) FROM policy_violations WHERE policy_id = 'ungoverned-ai-content'` for the reporting window. |
+| **Prompt-chain coverage** (exec summary KPI strip) | Automatic — extension populates when user prompt is visible | The content script's `getLastUserPromptText()` reads the last user turn from the AI tool's DOM and passes it to the background worker, which hashes it and sends `prompt_hash`. | `SUM(CASE WHEN prompt_hash IS NOT NULL)` / total. |
+| **Rubber-stamp alerts** (free + paid) | Automatic | Extension captures `tta` (time-to-attest) and `len` on every attestation in every tier as of v1.3.0. | `COUNT(*) WHERE tta < 10 AND len > 500`. |
+| **AI-Authored Artifacts** (free + paid) | Automatic | Extension sets `ai_markers` when a known AI tool is detected from the page URL or C2PA manifest. | `COUNT(*) WHERE ai_markers IS NOT NULL`. |
+
+**Tier summary:**
+
+- **Free tier users** get: Total attestations, Unique users, Review rate, Rubber-stamp alerts, AI-authored artifacts, Prompt-chain coverage, Model adoption, Chain integrity (from `parent_hash`), C2PA claim data (v1.4.0+).
+- **Team / Enterprise tier users** additionally get: Department Scorecard, External Exposures, Shadow AI Heatmap, Policy Violations, Classification breakdowns.
+- **Self-hosted + desktop agent** additionally gets: Multi-Format Documents, cross-format chain integrity.
+
+This hierarchy is reflected on every commercial report via the `Team / Enterprise Tier Only` badge.
 
 ---
 
