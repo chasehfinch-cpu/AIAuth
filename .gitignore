@@ -39,6 +39,8 @@ dist/
 plans/
 *_plan.md
 *_audit.md
+# Exception: the published Promise Audit is a shipped document, not scratch.
+!docs/PROMISE_AUDIT.md
 RELEASE_NOTES_*.md
 
 # Sales-only templates — never publish
