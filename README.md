@@ -6,6 +6,7 @@
 [![Self-hosted: BUSL 1.1](https://img.shields.io/badge/self--hosted-BUSL--1.1-purple.svg)](self-hosted/LICENSE.BUSL)
 [![Version: v0.5.0](https://img.shields.io/badge/version-v0.5.0-green.svg)](https://github.com/chasehfinch-cpu/AIAuth/releases/tag/v0.5.0)
 [![Website: aiauth.app](https://img.shields.io/badge/website-aiauth.app-black.svg)](https://www.aiauth.app)
+[![tests](https://github.com/chasehfinch-cpu/AIAuth/actions/workflows/test.yml/badge.svg)](https://github.com/chasehfinch-cpu/AIAuth/actions/workflows/test.yml)
 
 AIAuth creates a tamper-proof receipt for AI-generated content you select,
 proving what AI helped write it and that a human reviewed it. Your content
@@ -100,6 +101,20 @@ curl http://127.0.0.1:8100/health
 
 See the FastAPI docs at `http://127.0.0.1:8100/docs` for the full endpoint
 surface.
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+60 tests covering canonical text normalization, rate limiting, receipt
+schema validation, key manifest shape, sign/verify round-trips across
+schema versions v0.4.0 through v0.5.2, and HTTP endpoint smoke over
+every public page and sign/verify/file-signals flow. CI runs on every
+push and pull request against Python 3.11 and 3.12 via
+[`.github/workflows/test.yml`](.github/workflows/test.yml).
 
 ## Security
 

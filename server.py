@@ -2258,6 +2258,14 @@ async def inbound_mail(request: Request):
         f"────────────────────────────────────\n\n"
         f"{fallback_note}"
     )
+    # Pre-compute the conditional HTML fragment. Python 3.11 f-strings can't
+    # contain backslashes inside the {...} expression part (PEP 701 fixed
+    # this in 3.12), so the escaped-quote href attribute lives here instead.
+    resend_link_html = (
+        f'<br><a href="{resend_url}">View full message in Resend →</a>'
+        if resend_url else ""
+    )
+    truncated_html = "<br><b>TRUNCATED</b>" if truncated else ""
     html_prefix = (
         f"<p style='font-family:system-ui,sans-serif;font-size:12px;color:#64748b;"
         f"background:#f1f5f9;padding:10px 14px;border-radius:6px;margin:0 0 16px;'>"
@@ -2265,8 +2273,8 @@ async def inbound_mail(request: Request):
         f"Original From: <b>{sender or '(unknown)'}</b><br>"
         f"Original Subject: <b>{subject}</b><br>"
         f"Resend ID: <code style='font-size:11px;'>{email_id or '(unavailable)'}</code>"
-        f"{'<br><a href=\"' + resend_url + '\">View full message in Resend →</a>' if resend_url else ''}"
-        f"{'<br><b>TRUNCATED</b>' if truncated else ''}"
+        f"{resend_link_html}"
+        f"{truncated_html}"
         f"</p>"
         f"{html_fallback_note}"
     )

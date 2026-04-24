@@ -54,6 +54,12 @@ chrome-webstore-submission/
 # Extension build artifacts from scripts/build-extension-zip.py
 dist/
 
+# Pytest / coverage local state
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
 # Self-hosted runtime state — only the example config is public
 self-hosted/config.yaml
 self-hosted/**/keys/
