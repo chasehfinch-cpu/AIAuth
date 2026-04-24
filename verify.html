@@ -192,8 +192,14 @@ async function verifySingle(data) {
       <div class="r-row"><span class="r-label">Content fingerprint</span><span class="r-val">${r.hash ? r.hash.substring(0,16) + '...' : 'N/A'}</span></div>
       <div class="r-row"><span class="r-label">Receipt ID</span><span class="r-val">${r.id ? r.id.substring(0,12) : 'N/A'}</span></div>
       ${r.parent ? `<div class="r-row"><span class="r-label">Previous version</span><span class="r-val">${r.parent.substring(0,16)}...</span></div>` : ''}
+      ${typeof r.tta === 'number' ? `<div class="r-row"><span class="r-label">Time to attest</span><span class="r-val" style="color:${(r.tta < 10 && (r.len||0) > 500) ? 'var(--amber)' : 'var(--text)'}">${r.tta}s${(r.tta < 10 && (r.len||0) > 500) ? ' ⚠' : ''}</span></div>` : ''}
+      ${(r.ai_markers && r.ai_markers.c2pa && r.ai_markers.c2pa.manifest_hash) ? `<div class="r-row"><span class="r-label">C2PA manifest</span><span class="r-val">${r.ai_markers.c2pa.manifest_hash.substring(0,16)}...</span></div>` : ''}
       <div class="r-row"><span class="r-label">Signature valid</span><span class="r-val ${result.valid ? 'good' : 'bad'}">${result.valid ? 'Yes' : 'No'}</span></div>
-    </div>`;
+    </div>
+    ${(typeof r.tta === 'number' && r.tta < 10 && (r.len||0) > 500) ? `
+    <div style="margin-top:14px; padding:14px 16px; background:#fffbeb; border:1px solid #fcd34d; border-radius:10px; color:#92400e; font-size:13px; line-height:1.5;">
+      <b>⚠ Quick review flagged.</b> This receipt was signed ${r.tta} seconds after the content arrived, on ${r.len} characters of content. The reviewer may not have read the material thoroughly. Receipts still verify cryptographically — this is an advisory signal, not a validity check.
+    </div>` : ''}`;
 
   // Chain discovery — check the registry for related receipts
   const cd = result.chain_discovery;

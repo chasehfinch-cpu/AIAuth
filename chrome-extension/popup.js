@@ -110,7 +110,18 @@ async function renderReceipts() {
     const src = r.source_domain || (() => {
       try { return new URL(r.source || "").hostname; } catch { return r.source || ""; }
     })();
-    meta.textContent = `${fmtTime(r.ts)}${src ? " · " + src : ""}${r.file_type ? " · " + r.file_type : ""}`;
+    // v1.3.0 Tier 1: surface time-to-attest on the receipt row. If tta is
+    // short and content length is substantial, add a rubber-stamp warning
+    // signal (matches the server's policy rule at server.py).
+    let ttaBit = "";
+    if (typeof r.tta === "number") {
+      const rubberStamp = r.tta < 10 && (r.len || 0) > 500;
+      ttaBit = ` · ${rubberStamp ? "⚠ " : ""}attested in ${r.tta}s`;
+    }
+    meta.textContent = `${fmtTime(r.ts)}${src ? " · " + src : ""}${r.file_type ? " · " + r.file_type : ""}${ttaBit}`;
+    if (typeof r.tta === "number" && r.tta < 10 && (r.len || 0) > 500) {
+      meta.style.color = "#b45309"; // amber — matches /check rubber-stamp accent
+    }
     left.appendChild(code);
     left.appendChild(meta);
 
