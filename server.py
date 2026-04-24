@@ -4366,6 +4366,227 @@ def compliance_page():
     return HTMLResponse(_site_shell("Compliance", body, active="compliance"))
 
 
+# Shared print-friendly CSS applied to /pilot-playbook and /one-pager so
+# Ctrl+P → Save as PDF produces a clean letter-sized handout (hides nav /
+# footer, widens container, tightens margins).
+_PRINT_STYLE = """
+<style>
+@media print {
+  .nav, footer, .print-hide { display: none !important; }
+  body, main.page { background: #fff !important; padding: 0 !important; }
+  main.page { padding: 0.35in 0 !important; }
+  .container, .container-wide { max-width: 7.5in !important; padding: 0 0.5in !important; }
+  h1.page-title { font-size: 26px !important; }
+  .prose h2 { font-size: 17px !important; margin: 18px 0 8px !important; }
+  .prose h3 { font-size: 14px !important; margin: 14px 0 6px !important; }
+  .prose p, .prose li { font-size: 11pt !important; }
+  a { color: #0b1220 !important; text-decoration: none !important; }
+  a[href^="http"]::after { content: " (" attr(href) ")"; font-size: 9pt; color: #5b6573; }
+  @page { size: letter; margin: 0.5in; }
+}
+.print-banner { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: var(--accent-soft); border: 1px solid var(--border); border-radius: 10px; margin-bottom: 24px; font-size: 13px; color: var(--text); }
+.print-banner button { padding: 6px 12px; font-size: 13px; font-weight: 600; background: var(--accent); color: #fff; border: 0; border-radius: 8px; cursor: pointer; font-family: inherit; }
+.print-banner button:hover { background: #1d4ed8; }
+</style>
+<script>
+function aiauthPrint() { window.print(); }
+</script>
+"""
+
+
+@app.get("/pilot-playbook", response_class=HTMLResponse)
+def pilot_playbook_page():
+    """Pilot playbook — an internal-sell artifact a champion can forward
+    to their compliance officer and IT admin. Print-styled for
+    save-as-PDF."""
+    body = _PRINT_STYLE + """
+<div class="print-banner print-hide">
+  <span>Save as PDF: Ctrl+P (or Cmd+P) → Destination: Save as PDF.</span>
+  <button onclick="aiauthPrint()">Print / Save PDF</button>
+</div>
+
+<span class="eyebrow">Enterprise Pilot</span>
+<h1 class="page-title">AIAuth Pilot Playbook</h1>
+<p class="lead">A 30-day plan for evaluating AIAuth in your organization. Use this document to get internal buy-in from your compliance officer, IT admin, and a sponsoring department lead, then run the pilot and generate a decision-ready report.</p>
+
+<div class="prose">
+  <h2>Why pilot now</h2>
+  <ul>
+    <li><b>Regulatory clock.</b> EU AI Act Article 50 enforcement begins 2 August 2026. Organizations with EU exposure need a deployer-disclosure mechanism in place before then.</li>
+    <li><b>Internal AI governance gap.</b> Most organizations have an AI usage policy but no verifiable record of human review on AI-assisted output. AIAuth fills that gap without surveillance.</li>
+    <li><b>Competitive posture.</b> Publishing "human-reviewed" receipts on client deliverables differentiates against competitors who can only assert review verbally.</li>
+    <li><b>Low-cost evaluation.</b> The pilot is free, installs in under an hour, and produces an auditable report at the end.</li>
+  </ul>
+
+  <h2>Pilot scope</h2>
+  <table>
+    <thead><tr><th>Dimension</th><th>Recommendation</th></tr></thead>
+    <tbody>
+      <tr><td>Duration</td><td>30 days (one calendar month)</td></tr>
+      <tr><td>Users</td><td>10 – 50 users in a single department</td></tr>
+      <tr><td>Department</td><td>One with heavy AI-assisted output: legal, compliance, consulting, sales engineering, internal comms.</td></tr>
+      <tr><td>Deployment</td><td>Self-hosted on one VM customer controls; or hosted pilot instance on AIAuth infrastructure (faster to start, customer data still hash-only).</td></tr>
+      <tr><td>Cost</td><td>$0 for the pilot window. Production pricing disclosed at pilot close.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Success metrics</h2>
+  <p>Track and report on five metrics at pilot close:</p>
+  <ol>
+    <li><b>Adoption rate</b> — % of in-scope users who produced at least one attestation in the final week of the pilot.</li>
+    <li><b>Review rate</b> — attestations per user per week, a proxy for habit formation.</li>
+    <li><b>Median time-to-attest</b> — rough signal for rubber-stamp risk. Enterprises typically target >30 seconds.</li>
+    <li><b>Chain integrity</b> — fraction of document chains where every version has an attestation.</li>
+    <li><b>User satisfaction</b> — 5-question end-of-pilot survey (1-5 Likert on "easy to use", "didn't slow me down", "feel more confident in AI-assisted output", etc.).</li>
+  </ol>
+
+  <h2>Stakeholder roles</h2>
+  <table>
+    <thead><tr><th>Role</th><th>Who</th><th>What they do</th></tr></thead>
+    <tbody>
+      <tr><td>Sponsor</td><td>Compliance officer / CISO / COO</td><td>Authorizes the pilot, defines success criteria, receives the final report.</td></tr>
+      <tr><td>Deployer</td><td>IT admin / Security engineer</td><td>Installs the self-hosted server, configures managed-extension policies, answers user-facing questions.</td></tr>
+      <tr><td>Champion</td><td>Department lead or senior IC</td><td>Socializes the pilot with the team, answers "why are we doing this", escalates friction.</td></tr>
+      <tr><td>AIAuth POC</td><td>sales@aiauth.app</td><td>Provides deployment support, dashboard walkthrough, report review, and weekly check-ins.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Timeline</h2>
+  <table>
+    <thead><tr><th>Day</th><th>Milestone</th></tr></thead>
+    <tbody>
+      <tr><td>D-7</td><td>Kickoff call with AIAuth POC. Scope finalized, deployment model chosen.</td></tr>
+      <tr><td>D1–D3</td><td>IT admin installs the self-hosted server; champion announces the pilot to the department.</td></tr>
+      <tr><td>D4–D7</td><td>Onboard users: install the extension (Chrome Web Store), run through the user guide, attest one piece of content each.</td></tr>
+      <tr><td>D8–D28</td><td>Normal work with attestations on AI-assisted output. Weekly dashboard review. AIAuth POC available for friction triage.</td></tr>
+      <tr><td>D29</td><td>Generate the pilot report from the dashboard. Distribute user survey.</td></tr>
+      <tr><td>D30</td><td>Decision call: roll out, expand pilot, or stop. AIAuth sends a proposed rollout plan if proceeding.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Decision criteria — what results justify a rollout?</h2>
+  <p>Define this before the pilot starts. Typical thresholds:</p>
+  <ul>
+    <li>Adoption rate &gt; 70% of in-scope users in final week.</li>
+    <li>Median time-to-attest &gt; 15 seconds (below this suggests rubber-stamping).</li>
+    <li>User satisfaction &gt; 3.5 / 5 on "didn't slow me down".</li>
+    <li>Zero security incidents attributable to AIAuth.</li>
+    <li>Chain integrity &gt; 80% on documents edited more than once.</li>
+  </ul>
+
+  <h2>Appendix — email templates</h2>
+  <h3>A. Champion → Compliance officer</h3>
+  <pre><code>Subject: 30-day AIAuth pilot for AI-assisted output attestation
+
+[Officer's first name],
+
+I'd like to run a 30-day pilot of AIAuth inside [department] to give us
+a verifiable record of human review on AI-assisted work. It's free for
+the pilot window, self-hosted on our infrastructure, and produces a
+report at the end that maps directly to EU AI Act Article 50 disclosure
+requirements.
+
+Could I have 20 minutes this week to walk through the pilot scope? The
+playbook is at https://aiauth.app/pilot-playbook.
+
+Thanks,
+[Your name]</code></pre>
+
+  <h3>B. Champion → IT admin</h3>
+  <pre><code>Subject: AIAuth self-hosted pilot — deployment question
+
+[Admin's first name],
+
+[Officer] has approved a 30-day AIAuth pilot in [department]. AIAuth is
+a self-hosted attestation service — it signs a receipt that a human
+reviewed a piece of AI-generated content. Content never leaves the
+machine; only a SHA-256 hash is sent.
+
+Install instructions are at
+https://github.com/chasehfinch-cpu/AIAuth/blob/main/docs/ENTERPRISE_ADMIN_GUIDE.md.
+Estimated deployment time: under one hour on a single Linux VM. A
+starter managed-extension policy for our Workspace tenant is included.
+
+Can we target a D1 start date of [date]?
+
+Thanks,
+[Your name]</code></pre>
+</div>
+"""
+    return HTMLResponse(_site_shell("Pilot Playbook", body, active="enterprise"))
+
+
+@app.get("/one-pager", response_class=HTMLResponse)
+def one_pager_page():
+    """Enterprise one-pager — a single-page summary designed to save as
+    PDF and circulate in procurement approval emails."""
+    body = _PRINT_STYLE + """
+<div class="print-banner print-hide">
+  <span>Save as PDF: Ctrl+P (or Cmd+P) → Destination: Save as PDF.</span>
+  <button onclick="aiauthPrint()">Print / Save PDF</button>
+</div>
+
+<span class="eyebrow">Enterprise</span>
+<h1 class="page-title">AIAuth — Chain of Custody for AI Work</h1>
+<p class="lead">A tamper-proof record that a human reviewed AI-generated content, without ever transmitting the content itself.</p>
+
+<div class="prose">
+  <h2>What it is</h2>
+  <p>AIAuth is a Chrome extension (and optional desktop agent) that creates an Ed25519-signed receipt every time a user right-clicks AI-generated content and attests it. The receipt is issued by a signing server — self-hosted on your infrastructure in enterprise mode — and contains only a SHA-256 fingerprint of the content, a timestamp, the reviewer's identity, and cryptographic signals. The content itself is never transmitted.</p>
+
+  <h2>How it works</h2>
+  <ol>
+    <li><b>User selects AI-generated text or a file</b> in their browser or desktop.</li>
+    <li><b>Right-click → "Attest with AIAuth"</b> sends a SHA-256 hash (not the content) to the signing server.</li>
+    <li><b>Server returns a signed receipt</b> — a small JSON blob the user can paste into an email, document footer, PR description, or compliance log.</li>
+    <li><b>Anyone with the receipt</b> can verify it offline against the published public key at <code>aiauth.app/.well-known/aiauth-public-key</code>.</li>
+  </ol>
+
+  <h2>Why enterprises deploy it</h2>
+  <ul>
+    <li><b>EU AI Act Article 50 (enforcement 2026-08-02).</b> Receipts are a verifiable deployer-disclosure mechanism for AI-assisted output. See <a href="/compliance">/compliance</a>.</li>
+    <li><b>Zero-knowledge architecture.</b> Content never reaches AIAuth or any third party. Compatible with HIPAA, ITAR, classified environments (self-hosted tier only).</li>
+    <li><b>Audit-ready compliance dashboard.</b> Review-rate scorecards, rubber-stamp detection, chain-of-custody integrity, and AI-tool adoption breakdown.</li>
+    <li><b>Cross-format chain integrity.</b> A canonical text hash survives xlsx → csv → pdf conversions so the receipt still verifies after format changes.</li>
+    <li><b>Self-hosted and customer-owned.</b> Runs on one Linux VM you control. No phone-home. Signing key lives on your infrastructure.</li>
+  </ul>
+
+  <h2>What's included (enterprise)</h2>
+  <ul>
+    <li>Self-hosted signing server with compliance dashboard</li>
+    <li>Chrome extension + Windows desktop agent</li>
+    <li>Managed-extension policies for Google Workspace and Microsoft Intune</li>
+    <li>DSAR tooling and pseudonymization controls</li>
+    <li>Policy engine: rate limits, destination-external flags, classification tags</li>
+    <li>Pilot report generator with SHAP-based feature attributions</li>
+    <li>Dedicated onboarding, weekly check-ins during pilot, priority email support</li>
+  </ul>
+
+  <h2>What it is NOT</h2>
+  <ul>
+    <li>Not an AI-content detector (those guess; AIAuth is a voluntary cryptographic answer).</li>
+    <li>Not an AI governance platform (governance manages the model; AIAuth attests the output).</li>
+    <li>Not a surveillance tool. Free tier captures zero behavioral metadata; enterprise tier captures work-metadata under contract, on customer-owned infrastructure.</li>
+  </ul>
+
+  <h2>Pricing</h2>
+  <p>Enterprise pilots are free for 30 days. Production pricing starts at $5,000 / year for self-hosted with unlimited users, scaling by support level and compliance tier. Request a quote at <a href="mailto:sales@aiauth.app">sales@aiauth.app</a>.</p>
+
+  <h2>Get started</h2>
+  <ul>
+    <li><b>Request a pilot:</b> <a href="/pilot">aiauth.app/pilot</a></li>
+    <li><b>Pilot playbook:</b> <a href="/pilot-playbook">aiauth.app/pilot-playbook</a></li>
+    <li><b>Technical overview:</b> <a href="/enterprise-guide">aiauth.app/enterprise-guide</a></li>
+    <li><b>Standards alignment:</b> <a href="/standards">aiauth.app/standards</a></li>
+    <li><b>Contact:</b> <a href="mailto:sales@aiauth.app">sales@aiauth.app</a></li>
+  </ul>
+
+  <p style="margin-top:24px; font-size:12px; color:var(--muted);">© 2026 Finch Business Services LLC · AIAuth · aiauth.app</p>
+</div>
+"""
+    return HTMLResponse(_site_shell("Enterprise One-Pager", body, active="enterprise"))
+
+
 @app.get("/admin/license/issue", response_class=HTMLResponse)
 def admin_license_issuer_page(master_key: Optional[str] = Query(default=None)):
     """License issuer admin page (Phase C.2).
