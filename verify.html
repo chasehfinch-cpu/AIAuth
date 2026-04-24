@@ -194,6 +194,8 @@ async function verifySingle(data) {
       ${r.parent ? `<div class="r-row"><span class="r-label">Previous version</span><span class="r-val">${r.parent.substring(0,16)}...</span></div>` : ''}
       ${typeof r.tta === 'number' ? `<div class="r-row"><span class="r-label">Time to attest</span><span class="r-val" style="color:${(r.tta < 10 && (r.len||0) > 500) ? 'var(--amber)' : 'var(--text)'}">${r.tta}s${(r.tta < 10 && (r.len||0) > 500) ? ' ⚠' : ''}</span></div>` : ''}
       ${(r.ai_markers && r.ai_markers.c2pa && r.ai_markers.c2pa.manifest_hash) ? `<div class="r-row"><span class="r-label">C2PA manifest</span><span class="r-val">${r.ai_markers.c2pa.manifest_hash.substring(0,16)}...</span></div>` : ''}
+      ${(r.ai_markers && r.ai_markers.c2pa && r.ai_markers.c2pa.claim_generator) ? `<div class="r-row"><span class="r-label">C2PA claim generator</span><span class="r-val">${escHtml(r.ai_markers.c2pa.claim_generator)}</span></div>` : ''}
+      ${(r.ai_markers && r.ai_markers.c2pa && Array.isArray(r.ai_markers.c2pa.assertions) && r.ai_markers.c2pa.assertions.length) ? `<div class="r-row"><span class="r-label">C2PA assertions</span><span class="r-val">${r.ai_markers.c2pa.assertions.map(a => escHtml(a)).join(', ')}</span></div>` : ''}
       <div class="r-row"><span class="r-label">Signature valid</span><span class="r-val ${result.valid ? 'good' : 'bad'}">${result.valid ? 'Yes' : 'No'}</span></div>
     </div>
     ${(typeof r.tta === 'number' && r.tta < 10 && (r.len||0) > 500) ? `

@@ -33,6 +33,10 @@ INCLUDE = [
     "popup.html",
     "popup.js",
     "managed_schema.json",
+    # v1.4.0: C2PA Tier 2.5 — JUMBF parser and minimal CBOR decoder.
+    # Imported into the service worker via importScripts() in background.js.
+    "c2pa_parser.js",
+    "cbor_decoder.js",
     "icons/icon16.png",
     "icons/icon48.png",
     "icons/icon128.png",

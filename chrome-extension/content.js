@@ -115,6 +115,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return;
   }
+  if (msg?.type === "AIAUTH_FETCH_IMAGE_BYTES") {
+    // v1.4.0: C2PA Tier 2.5 — fetch an image URL in the PAGE origin so
+    // same-origin CORS rules apply. Returns the bytes as a plain array
+    // (chrome.runtime messaging doesn't transfer ArrayBuffers natively).
+    (async () => {
+      try {
+        const resp = await fetch(msg.url, { credentials: "include" });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const buf = await resp.arrayBuffer();
+        // Convert to a regular array so chrome.runtime serialization works.
+        sendResponse({ ok: true, bytes: Array.from(new Uint8Array(buf)) });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e.message || e) });
+      }
+    })();
+    return true; // async sendResponse
+  }
   if (msg?.type === "AIAUTH_RESULT") {
     if (msg.ok) {
       copyToClipboard(msg.receipt_code).then(copied => {

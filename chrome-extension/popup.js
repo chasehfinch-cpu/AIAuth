@@ -118,7 +118,15 @@ async function renderReceipts() {
       const rubberStamp = r.tta < 10 && (r.len || 0) > 500;
       ttaBit = ` · ${rubberStamp ? "⚠ " : ""}attested in ${r.tta}s`;
     }
-    meta.textContent = `${fmtTime(r.ts)}${src ? " · " + src : ""}${r.file_type ? " · " + r.file_type : ""}${ttaBit}`;
+    // v1.4.0: if the receipt carries C2PA claim data, surface the
+    // generator name as a small pill so users see at a glance which
+    // tool produced the image.
+    let c2paBit = "";
+    const gen = r.ai_markers && r.ai_markers.c2pa && r.ai_markers.c2pa.claim_generator;
+    if (typeof gen === "string" && gen.length) {
+      c2paBit = ` · C2PA: ${gen}`;
+    }
+    meta.textContent = `${fmtTime(r.ts)}${src ? " · " + src : ""}${r.file_type ? " · " + r.file_type : ""}${ttaBit}${c2paBit}`;
     if (typeof r.tta === "number" && r.tta < 10 && (r.len || 0) > 500) {
       meta.style.color = "#b45309"; // amber — matches /check rubber-stamp accent
     }
@@ -407,7 +415,11 @@ async function attestFile(file) {
   drop.classList.add("busy");
   setStatus(`Hashing ${file.name}…`);
   try {
-    const hash = await sha256File(file);
+    // v1.4.0: read the bytes once, then reuse them for both the SHA-256
+    // and for C2PA enrichment in the background. Avoids a second read.
+    const buf = await file.arrayBuffer();
+    const digest = await crypto.subtle.digest("SHA-256", buf);
+    const hash = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
     setStatus(`Signing ${file.name}…`);
     const note = `file=${file.name}; size=${file.size}; type=${file.type || "unknown"}`;
     const resp = await chrome.runtime.sendMessage({
@@ -415,6 +427,8 @@ async function attestFile(file) {
       hash,
       source: `file:${file.name}`,
       note,
+      // Serialize as plain array for message passing.
+      imageBytes: Array.from(new Uint8Array(buf)),
     });
     if (resp && resp.ok) {
       setStatus(`Receipt: ${resp.receipt_code}`, "ok");
@@ -431,9 +445,11 @@ async function attestFile(file) {
   }
 }
 
-function bindFileDrop() {
-  const drop = $("drop");
-  const picker = $("filePicker");
+// Wire up one drop-zone + file-picker pair. Factored out so both
+// State 3 (verified) and State 3u (unverified) can share the same flow.
+function bindDropPair(dropId, pickerId) {
+  const drop = $(dropId);
+  const picker = $(pickerId);
   if (!drop || !picker) return;
   drop.addEventListener("click", () => picker.click());
   picker.addEventListener("change", () => {
@@ -449,6 +465,27 @@ function bindFileDrop() {
   drop.addEventListener("drop", (e) => {
     const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     if (f) attestFile(f);
+  });
+}
+
+function bindFileDrop() {
+  // Bind both the verified (State 3) and unverified (State 3u) drop
+  // zones. v1.4.0 fix: previously only State 3 was wired, so unverified
+  // users saw the popup bypass the extension and navigate to the file.
+  bindDropPair("drop", "filePicker");
+  bindDropPair("dropU", "filePickerU");
+
+  // Safety net: if a user drops a file anywhere else in the popup
+  // (over the stats strip, the receipt list, etc.), Chrome's default
+  // is to navigate away and open the file. Swallow those drops at the
+  // window level so the popup stays put.
+  ["dragover", "drop"].forEach(ev => {
+    window.addEventListener(ev, (e) => {
+      // Let nested handlers (on drop / dropU) run first; they stopPropagation.
+      // Anything that reaches the window gets a preventDefault so Chrome
+      // doesn't hijack the popup.
+      e.preventDefault();
+    });
   });
 }
 

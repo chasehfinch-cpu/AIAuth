@@ -120,7 +120,7 @@ verifier correlate an AIAuth human-review attestation with the upstream
 tool-provenance chain without either system having to rewrite the other's
 data.
 
-Recommended sub-object shape:
+Recommended sub-object shape (full):
 
 ```json
 {
@@ -128,9 +128,11 @@ Recommended sub-object shape:
     "source": "dalle-3",
     "verified": true,
     "c2pa": {
-      "manifest_hash": "sha256:3c5f...e1a2",
-      "claim_generator": "Adobe Firefly 2026.1",
-      "assertions": ["c2pa.actions", "c2pa.ingredient"],
+      "manifest_hash": "3c5f...e1a2",
+      "claim_generator": "Adobe_Firefly",
+      "assertions": ["c2pa.ingredient.v2", "c2pa.actions.v2", "c2pa.hash.data"],
+      "alg": "sha256",
+      "has_signature": true,
       "signer_cn": "Adobe Inc.",
       "signed_at": "2026-04-18T10:22:00Z"
     }
@@ -140,12 +142,35 @@ Recommended sub-object shape:
 
 Field notes:
 
-- `manifest_hash` — SHA-256 of the serialized C2PA manifest. Canonical
-  interop primitive; required if `c2pa` is present.
-- `claim_generator` — the C2PA `claim_generator` string, verbatim.
-- `assertions` — list of assertion labels present in the manifest.
+- `manifest_hash` — SHA-256 (lowercase hex, 64 chars) of the JUMBF superbox
+  containing the manifest. Canonical interop primitive; required if `c2pa`
+  is present. Mirrored on the top-level `c2pa_manifest_hash` field so the
+  dashboard `receipts_with_c2pa` counter can find it.
+- `claim_generator` — the C2PA `claim_generator` text string from the
+  manifest's claim map, verbatim.
+- `assertions` — list of assertion labels (short name after the final `/`
+  of the assertion URL, e.g. `c2pa.hash.data`).
+- `alg` — hashing algorithm used for the manifest's assertion digests.
+- `has_signature` — boolean, `true` when the manifest carries a signature
+  box (indicates the claim is signed, independent of whether the signature
+  was verified).
 - `signer_cn` — Common Name of the manifest's signing certificate.
-- `signed_at` — the C2PA signature time, distinct from AIAuth `ts`.
+  **Tier 3 field** — not populated by AIAuth v1.4.0 Chrome extension.
+  Requires x509 ASN.1 parsing which is deferred.
+- `signed_at` — the C2PA signature time. **Tier 3 field** — requires COSE
+  header introspection, deferred.
+
+Which fields the **AIAuth v1.4.0 Chrome extension** populates:
+
+| Field | Populated? | Notes |
+|---|---|---|
+| `manifest_hash` | ✓ | SHA-256 of the JUMBF superbox |
+| `claim_generator` | ✓ | Decoded from the claim CBOR |
+| `assertions` | ✓ | Labels only, not digests |
+| `alg` | ✓ | From the claim map |
+| `has_signature` | ✓ | Set `true` whenever a `c2pa.signature` box is found |
+| `signer_cn` | ✗ | Tier 3 — ASN.1 cert parsing deferred |
+| `signed_at` | ✗ | Tier 3 — COSE header introspection deferred |
 
 Forward-compatibility: a future AIAuth minor version may define a native
 C2PA *assertion type* (`aiauth.app/human-review/v1`) that lets an AIAuth
