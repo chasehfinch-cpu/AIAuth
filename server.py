@@ -4461,40 +4461,44 @@ def pricing_page():
 <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:20px; margin-top:36px;">
   <div style="background:#fff; border:1px solid var(--border); border-radius:14px; padding:28px; display:flex; flex-direction:column;">
     <div style="font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--muted);">Free</div>
-    <div style="font-size:36px; font-weight:800; letter-spacing:-0.02em; margin-top:8px;">$0</div>
-    <div style="font-size:13px; color:var(--muted); margin-top:4px;">Individuals &amp; open use</div>
+    <div style="font-size:36px; font-weight:800; letter-spacing:-0.02em; margin-top:8px;">$0<span style="font-size:14px; font-weight:500; color:var(--muted); letter-spacing:0;"> / forever</span></div>
+    <div style="font-size:13px; color:var(--muted); margin-top:4px;">Individual use</div>
     <ul style="list-style:none; padding:0; margin:20px 0; flex:1; font-size:14px; line-height:1.65;">
       <li>Unlimited attestations</li>
-      <li>Local receipt storage</li>
-      <li>Public-key verification</li>
-      <li>Right-click from any site</li>
+      <li>Tamper-proof receipts stored on your device</li>
+      <li>Public verification page</li>
+      <li>Prompt-chain and file attestation</li>
+      <li>Right-click from any AI tool</li>
+      <li>No account required to start</li>
     </ul>
     <a href="/waitlist" style="display:block; text-align:center; padding:11px 16px; border-radius:10px; font-size:14px; font-weight:600; border:1px solid var(--border); color:var(--text); text-decoration:none;">Join the Waitlist</a>
   </div>
   <div style="background:#fff; border:2px solid var(--accent); border-radius:14px; padding:28px; display:flex; flex-direction:column; position:relative;">
     <span style="position:absolute; top:-11px; left:20px; background:var(--accent); color:#fff; font-size:11px; font-weight:700; letter-spacing:0.06em; text-transform:uppercase; padding:4px 10px; border-radius:999px;">Most Popular</span>
     <div style="font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--muted);">Team</div>
-    <div style="font-size:36px; font-weight:800; letter-spacing:-0.02em; margin-top:8px;">Contact</div>
-    <div style="font-size:13px; color:var(--muted); margin-top:4px;">5 &ndash; 25 seats</div>
+    <div style="font-size:36px; font-weight:800; letter-spacing:-0.02em; margin-top:8px;">From $8<span style="font-size:14px; font-weight:500; color:var(--muted); letter-spacing:0;"> / user / month</span></div>
+    <div style="font-size:13px; color:var(--muted); margin-top:4px;">5 &ndash; 25 users</div>
     <ul style="list-style:none; padding:0; margin:20px 0; flex:1; font-size:14px; line-height:1.65;">
-      <li>Shared team verification</li>
-      <li>Attestation &amp; review-rate dashboard</li>
-      <li>AI-tool breakdown</li>
-      <li>Priority email support</li>
+      <li>Everything in Free</li>
+      <li>Centralized compliance dashboard</li>
+      <li>Review-rate scorecards (A&ndash;F)</li>
+      <li>Shadow AI heatmap</li>
+      <li>Chain integrity monitoring</li>
+      <li>Email support</li>
     </ul>
     <a href="/contact?plan=team" style="display:block; text-align:center; padding:11px 16px; border-radius:10px; font-size:14px; font-weight:600; background:var(--accent); color:#fff; border:1px solid var(--accent); text-decoration:none;">Contact Sales</a>
   </div>
   <div style="background:#fff; border:1px solid var(--border); border-radius:14px; padding:28px; display:flex; flex-direction:column;">
     <div style="font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:0.07em; color:var(--muted);">Enterprise</div>
-    <div style="font-size:36px; font-weight:800; letter-spacing:-0.02em; margin-top:8px;">Custom</div>
-    <div style="font-size:13px; color:var(--muted); margin-top:4px;">Self-hosted · unlimited seats</div>
+    <div style="font-size:36px; font-weight:800; letter-spacing:-0.02em; margin-top:8px;">From $5,000<span style="font-size:14px; font-weight:500; color:var(--muted); letter-spacing:0;"> / year</span></div>
+    <div style="font-size:13px; color:var(--muted); margin-top:4px;">Self-hosted · unlimited users</div>
     <ul style="list-style:none; padding:0; margin:20px 0; flex:1; font-size:14px; line-height:1.65;">
-      <li>Self-hosted signing server</li>
-      <li>Full compliance dashboard</li>
-      <li>Policy engine &amp; DSAR tooling</li>
-      <li>Rubber-stamp detection</li>
-      <li>SSO/LDAP roadmap</li>
-      <li>Dedicated onboarding</li>
+      <li>Everything in Team</li>
+      <li>Runs on your infrastructure</li>
+      <li>DSAR tooling and audit exports</li>
+      <li>Custom policy engine</li>
+      <li>Managed-config for Workspace / Intune</li>
+      <li>Pilot report generator</li>
     </ul>
     <a href="/pilot" style="display:block; text-align:center; padding:11px 16px; border-radius:10px; font-size:14px; font-weight:600; border:1px solid var(--border); color:var(--text); text-decoration:none;">Request a Pilot</a>
   </div>
