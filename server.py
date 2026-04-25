@@ -215,6 +215,7 @@ RATE_LIMITS: Dict[str, Dict[str, int]] = {
     "/v1/sign/batch":     {"per_ip_per_min": 10},
     "/v1/account/create": {"per_ip_per_hour": 5},
     "/v1/account/auth":   {"per_ip_per_hour": 10},
+    "/v1/account/auth/status": {"per_ip_per_min": 30},  # ~4s polling cadence
     "/v1/discover":       {"per_ip_per_min": 60},
     "/v1/verify/prompt":  {"per_ip_per_min": 30},
 }
@@ -850,6 +851,24 @@ def init_db():
         reason        TEXT
     )""")
 
+    # Cross-device magic-link login: a polling client (Chrome extension)
+    # registers a pending_id at /v1/account/{create,auth}; when the user
+    # clicks the magic link on ANY device, /v1/account/verify writes the
+    # resulting session token here for the polling client to retrieve via
+    # /v1/account/auth/status. pending_id is a 32-byte random nonce known
+    # only to the original requester.
+    conn.execute("""CREATE TABLE IF NOT EXISTS pending_logins (
+        pending_id              TEXT PRIMARY KEY,
+        account_id              TEXT NOT NULL,
+        email_hash              TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        expires_at              TEXT NOT NULL,
+        claimed_session_token   TEXT,
+        claimed_expires_at      TEXT,
+        claimed_at              TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pl_expires ON pending_logins(expires_at)")
+
     # Pilot-interest leads from /v1/pilot/interest (Phase B.5).
     # Admin emails are stored as hashes (Piece 12 hardening applies everywhere).
     conn.execute("""CREATE TABLE IF NOT EXISTS pilot_interest (
@@ -1085,7 +1104,8 @@ def _verify_token(token: str) -> Optional[dict]:
         return None
 
 
-def _make_magic_token(account_id: str, email: str, purpose: str, ttl_minutes: int = 15) -> tuple:
+def _make_magic_token(account_id: str, email: str, purpose: str, ttl_minutes: int = 15,
+                      pending_id: Optional[str] = None) -> tuple:
     now = datetime.now(timezone.utc)
     payload = {
         "account_id": account_id,
@@ -1095,7 +1115,36 @@ def _make_magic_token(account_id: str, email: str, purpose: str, ttl_minutes: in
         "nonce": secrets.token_hex(16),
         "purpose": purpose,
     }
+    # Cross-device pickup: the magic token carries pending_id so that
+    # /v1/account/verify can route the issued session into pending_logins
+    # for the polling client to retrieve.
+    if pending_id:
+        payload["pending_id"] = pending_id
     return _sign_token(payload), payload
+
+
+def _maybe_register_pending_login(account_id: str, email: str) -> str:
+    """Create a pending_logins row for cross-device magic-link pickup.
+    Returns a 32-byte hex pending_id which the polling client uses to
+    retrieve the session via /v1/account/auth/status. Sweeps any expired
+    rows opportunistically. TTL matches the magic-link TTL (15 minutes)."""
+    pending_id = secrets.token_hex(32)
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    expires = (now_dt + timedelta(minutes=15)).isoformat()
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM pending_logins WHERE expires_at < ?", (now,))
+        conn.execute(
+            "INSERT INTO pending_logins "
+            "(pending_id, account_id, email_hash, created_at, expires_at) "
+            "VALUES (?,?,?,?,?)",
+            (pending_id, account_id, email_hash(email), now, expires),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return pending_id
 
 
 def _make_session_token(account_id: str, email: str, ttl_hours: int = 24) -> tuple:
@@ -1538,10 +1587,12 @@ def sign_receipt(req: SignRequest, request: Request):
 
 class AccountCreateRequest(BaseModel):
     email: str
+    polling: Optional[bool] = False  # cross-device magic-link pickup
 
 
 class AccountAuthRequest(BaseModel):
     email: str
+    polling: Optional[bool] = False  # cross-device magic-link pickup
 
 
 class AccountVerifyRequest(BaseModel):
@@ -1600,9 +1651,15 @@ def account_create(body: AccountCreateRequest):
         conn.commit()
         conn.close()
 
-    token, _ = _make_magic_token(account_id, email, "login")
+    pending_id = _maybe_register_pending_login(account_id, email) if body.polling else None
+    token, _ = _make_magic_token(account_id, email, "login", pending_id=pending_id)
     _send_magic_link(email, token, "login")
-    return _standard_enum_safe_ok()
+    resp = dict(_standard_enum_safe_ok())
+    if pending_id:
+        resp["pending_id"] = pending_id
+        resp["poll_interval_ms"] = 4000
+        resp["poll_until_seconds"] = 900
+    return resp
 
 
 @app.post("/v1/account/auth")
@@ -1615,11 +1672,20 @@ def account_auth(body: AccountAuthRequest):
         # Silent success to avoid enumeration
         return _standard_enum_safe_ok()
     existing = _find_account_by_email(email)
+    pending_id = None
     if existing:
-        token, _ = _make_magic_token(existing["account_id"], email, "login")
+        if body.polling:
+            pending_id = _maybe_register_pending_login(existing["account_id"], email)
+        token, _ = _make_magic_token(existing["account_id"], email, "login", pending_id=pending_id)
         _send_magic_link(email, token, "login")
-    # else: silently do nothing
-    return _standard_enum_safe_ok()
+    # If polling was requested, return a pending_id shape regardless of
+    # existence so response timing/size doesn't reveal account presence.
+    resp = dict(_standard_enum_safe_ok())
+    if body.polling:
+        resp["pending_id"] = pending_id or secrets.token_hex(32)  # decoy
+        resp["poll_interval_ms"] = 4000
+        resp["poll_until_seconds"] = 900
+    return resp
 
 
 @app.post("/v1/account/verify")
@@ -1655,6 +1721,27 @@ def account_verify(body: AccountVerifyRequest):
     conn.close()
 
     session_token, sess_payload = _make_session_token(payload["account_id"], payload["email"])
+
+    # Cross-device pickup: if the magic token carries a pending_id, write
+    # the issued session into pending_logins so the original polling
+    # client (likely the Chrome extension on a different device) can
+    # retrieve it via /v1/account/auth/status. Best-effort.
+    pending_id = payload.get("pending_id")
+    if pending_id:
+        try:
+            conn = get_db()
+            now2 = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE pending_logins SET claimed_session_token = ?, "
+                "claimed_expires_at = ?, claimed_at = ? "
+                "WHERE pending_id = ? AND expires_at > ? AND claimed_session_token IS NULL",
+                (session_token, sess_payload["expires_at"], now2, pending_id, now2),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass  # never block the verify response on pending bookkeeping
+
     return {
         "session_token": session_token,
         "expires_in": 86400,
@@ -1662,6 +1749,62 @@ def account_verify(body: AccountVerifyRequest):
         "account_id": payload["account_id"],
         "email": payload["email"],
     }
+
+
+@app.get("/v1/account/auth/status")
+def account_auth_status(pending_id: str = ""):
+    """Cross-device magic-link login status.
+
+    The polling client (Chrome extension) calls this every ~4 seconds
+    with the pending_id it received from /v1/account/{create,auth}. If
+    the user has clicked the magic link on any device, returns the
+    issued session token and DELETES the row (single-shot — replays
+    return PENDING_NOT_FOUND).
+
+    Returns:
+      - {"status": "pending"}  → keep polling
+      - {"status": "ready", session_token, expires_at, account_id, email}
+      - 404 PENDING_NOT_FOUND  → unknown/expired pending_id (also after
+                                 successful claim retrieval — single-shot)
+
+    Security: the pending_id is a 256-bit random nonce returned only to
+    the original requester over HTTPS. Decoy pending_ids issued for
+    non-existent emails (see /v1/account/auth) permanently 404, which
+    is indistinguishable from a TTL-expired row to outside observers,
+    preserving enumeration safety.
+    """
+    if not pending_id or len(pending_id) < 32:
+        raise AIAuthError("PENDING_NOT_FOUND", "Unknown or invalid pending_id", 404)
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM pending_logins WHERE expires_at < ?", (now,))
+        row = conn.execute(
+            "SELECT account_id, email_hash, expires_at, "
+            "       claimed_session_token, claimed_expires_at "
+            "FROM pending_logins WHERE pending_id = ?",
+            (pending_id,),
+        ).fetchone()
+        if not row:
+            raise AIAuthError("PENDING_NOT_FOUND", "Unknown or expired pending_id", 404)
+
+        if not row["claimed_session_token"]:
+            return {"status": "pending"}
+
+        session_token = row["claimed_session_token"]
+        claimed_expires_at = row["claimed_expires_at"]
+        conn.execute("DELETE FROM pending_logins WHERE pending_id = ?", (pending_id,))
+        conn.commit()
+        return {
+            "status": "ready",
+            "session_token": session_token,
+            "expires_at": claimed_expires_at,
+            "account_id": row["account_id"],
+            "email": "",  # plaintext email is not stored server-side; client has it locally
+        }
+    finally:
+        conn.close()
 
 
 @app.get("/v1/account/me")

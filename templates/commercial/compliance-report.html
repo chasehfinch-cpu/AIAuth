@@ -55,6 +55,28 @@
       vertical-align: middle;
       text-transform: none;
     }
+    *, *::before, *::after { box-sizing: border-box; }
+    td, th { word-break: break-word; overflow-wrap: anywhere; }
+    .kpi .n { overflow-wrap: anywhere; }
+
+    @media (max-width: 1024px) {
+      body { padding: 32px 20px; }
+      .kpi-row { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 768px) {
+      body { padding: 24px 16px; }
+      h1 { font-size: clamp(22px, 6vw, 28px); }
+      .kpi-row { grid-template-columns: repeat(2, 1fr); }
+      table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap; }
+      table td, table th { white-space: normal; }
+    }
+    @media (max-width: 480px) {
+      body { padding: 16px 12px; }
+      .kpi-row { grid-template-columns: 1fr; }
+      .signature-block { grid-template-columns: 1fr; gap: 12px; }
+      .kpi .n { font-size: 18px; }
+      .kpi .l { font-size: 9px; }
+    }
 
     @media print {
       body { padding: 24px 40px; background: white; }
