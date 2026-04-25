@@ -26,6 +26,30 @@
     .grid { display: grid; gap: 16px; }
     .grid-4 { grid-template-columns: repeat(4, 1fr); }
     .grid-3 { grid-template-columns: repeat(3, 1fr); }
+    *, *::before, *::after { box-sizing: border-box; }
+    td, th { word-break: break-word; overflow-wrap: anywhere; }
+    .kpi .n { overflow-wrap: anywhere; }
+    @media (max-width: 1024px) {
+      body { padding: 32px 20px; }
+      .grid-4 { grid-template-columns: repeat(2, 1fr); }
+      .grid-3 { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 768px) {
+      body { padding: 24px 16px; }
+      h1 { font-size: clamp(22px, 6vw, 28px); }
+      .grid-4 { grid-template-columns: repeat(2, 1fr); }
+      .grid-3 { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; white-space: nowrap; }
+      table td, table th { white-space: normal; }
+      .bar-label { width: 90px; }
+      .bar-val { width: 50px; }
+    }
+    @media (max-width: 480px) {
+      body { padding: 16px 12px; }
+      .grid-4 { grid-template-columns: 1fr; }
+      .kpi .n { font-size: 22px; }
+      .bar-label { width: 70px; font-size: 11px; }
+    }
     @media (max-width: 720px) { .grid-4 { grid-template-columns: repeat(2, 1fr); } .grid-3 { grid-template-columns: 1fr; } }
     .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
     .kpi .n { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
@@ -139,20 +163,14 @@
     </div>
 
     <h2>Start a 30-Day Free Pilot</h2>
-    <div class="card" style="background:linear-gradient(180deg,#eff6ff,#fff);">
-      <p style="font-size:14px;color:var(--muted);margin-bottom:14px;line-height:1.55;">
+    <div class="card" style="background:linear-gradient(180deg,#eff6ff,#fff);text-align:center;padding:28px 22px;">
+      <p style="font-size:14px;color:var(--muted);margin-bottom:18px;line-height:1.55;max-width:560px;margin-left:auto;margin-right:auto;">
         AIAuth Enterprise runs on your infrastructure — self-hosted only. No AIAuth access to your data.
         Get a license, spin up your own server in one command, point your extension at it. We'll send you
-        the install package and license key within 24 hours.
+        the install package and license key within one business day.
       </p>
-      <form id="pilotForm" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-        <input name="company" id="pilotCompany" required placeholder="Company name" style="padding:10px;border:1px solid var(--border);border-radius:8px;font:inherit;" />
-        <input name="admin_email" required type="email" placeholder="Admin email" style="padding:10px;border:1px solid var(--border);border-radius:8px;font:inherit;" />
-        <input name="user_count" required type="number" min="1" placeholder="Estimated users (e.g. 50)" style="padding:10px;border:1px solid var(--border);border-radius:8px;font:inherit;" />
-        <input name="industry" required placeholder="Industry (e.g. Financial Services)" style="padding:10px;border:1px solid var(--border);border-radius:8px;font:inherit;" />
-        <button type="submit" style="grid-column:1/-1;padding:12px;background:var(--blue);color:white;border:0;border-radius:8px;font:inherit;font-weight:600;cursor:pointer;">Request a Pilot →</button>
-      </form>
-      <div id="pilotStatus" style="margin-top:10px;font-size:13px;"></div>
+      <a href="/pilot" style="display:inline-block;padding:12px 24px;background:var(--blue);color:white;border-radius:8px;font:inherit;font-weight:600;text-decoration:none;">Request a Pilot →</a>
+      <div style="margin-top:10px;font-size:12px;color:var(--muted);">Opens our intake form on a focused page.</div>
     </div>
 
     <footer>
@@ -285,49 +303,7 @@
       input.addEventListener("keydown", e => { if (e.key === "Enter") apply.click(); });
     })();
 
-    // Pilot-request form submission -> POST /v1/pilot/interest
-    (function(){
-      const form = document.getElementById("pilotForm");
-      const status = document.getElementById("pilotStatus");
-      if (!form) return;
-      form.addEventListener("submit", async (e) => {
-        e.preventDefault();
-        const submitBtn = form.querySelector('button[type="submit"]');
-        if (submitBtn && submitBtn.disabled) return;  // debounce double-click / double-enter
-        if (submitBtn) { submitBtn.disabled = true; submitBtn.dataset.origText = submitBtn.textContent; submitBtn.textContent = "Submitting…"; }
-        status.textContent = "Submitting…";
-        status.style.color = "#64748b";
-        const fd = new FormData(form);
-        const payload = {
-          company: fd.get("company"),
-          admin_email: fd.get("admin_email"),
-          user_count: Number(fd.get("user_count")),
-          industry: fd.get("industry"),
-        };
-        try {
-          const res = await fetch("/v1/pilot/interest", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          });
-          const data = await res.json();
-          if (res.ok) {
-            status.textContent = "Thanks — we'll email you within 24 hours with your license key and install package.";
-            status.style.color = "#16a34a";
-            form.reset();
-            // Leave the submit button disabled after a successful submission to prevent accidental resubmits
-          } else {
-            status.textContent = "Couldn't submit: " + (data.error?.message || res.status);
-            status.style.color = "#dc2626";
-            if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = submitBtn.dataset.origText || "Submit"; }
-          }
-        } catch(err) {
-          status.textContent = "Network error: " + err.message;
-          status.style.color = "#dc2626";
-          if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = submitBtn.dataset.origText || "Submit"; }
-        }
-      });
-    })();
+    // Pilot intake moved to the standalone /pilot page — see footer CTA.
   </script>
 </body>
 </html>

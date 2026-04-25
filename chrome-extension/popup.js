@@ -204,10 +204,18 @@ async function callServerJson(path, opts = {}) {
 }
 
 async function sendMagicLink(email) {
+  // polling=true asks the server to register a pending_logins row so we
+  // can pick up the session automatically when the user clicks the link
+  // on any device (e.g. their phone). The server returns a pending_id
+  // we then poll /v1/account/auth/status with.
   return callServerJson("/v1/account/create", {
     method: "POST",
-    body: { email },
+    body: { email, polling: true },
   });
+}
+
+async function pollAuthStatus(pendingId) {
+  return callServerJson(`/v1/account/auth/status?pending_id=${encodeURIComponent(pendingId)}`);
 }
 
 async function verifyToken(token) {
@@ -253,15 +261,78 @@ async function onboardStart() {
   setStatus("Sending magic link…");
   const r = await sendMagicLink(email);
   if (r.ok) {
+    const pendingId = r.json?.pending_id || "";
     await chrome.storage.local.set({
       pendingEmail: email, userId: email, emailVerified: false,
+      pendingLoginId: pendingId,
     });
     setStatus("Check your email.", "ok");
     await render();
+    if (pendingId) startLoginPolling(pendingId);
   } else {
     const code = r.json?.error?.code || "UNKNOWN";
     setStatus(`Could not start: ${code}`, "err");
   }
+}
+
+// ---------- Cross-device login polling ----------
+//
+// When the user clicks the magic link on their phone, /v1/account/verify
+// stashes the issued session into pending_logins. We poll that endpoint
+// every ~4s for up to 15 min. On success, we promote to State 3 and
+// stop. Polling also stops on popup close (per-popup-instance var) or
+// if the user changes email / logs out.
+let _pollHandle = null;
+
+function stopLoginPolling() {
+  if (_pollHandle) {
+    clearInterval(_pollHandle);
+    _pollHandle = null;
+  }
+}
+
+async function startLoginPolling(pendingId) {
+  stopLoginPolling();
+  const startedAt = Date.now();
+  const POLL_MS = 4000;
+  const MAX_MS = 15 * 60 * 1000;
+  _pollHandle = setInterval(async () => {
+    if (Date.now() - startedAt > MAX_MS) {
+      stopLoginPolling();
+      await chrome.storage.local.remove("pendingLoginId");
+      return;
+    }
+    let r;
+    try { r = await pollAuthStatus(pendingId); } catch { return; }
+    if (!r.ok) {
+      // 404 PENDING_NOT_FOUND or 429 RATE_LIMITED — give up on 404.
+      if (r.status === 404) {
+        stopLoginPolling();
+        await chrome.storage.local.remove("pendingLoginId");
+      }
+      return;
+    }
+    if (r.json?.status === "ready" && r.json.session_token) {
+      stopLoginPolling();
+      const s = r.json;
+      const { pendingEmail } = await loadSessionState();
+      await chrome.storage.local.set({
+        userId: pendingEmail || s.email || "",
+        pendingEmail: "",
+        pendingLoginId: "",
+        emailVerified: true,
+        session: {
+          token: s.session_token,
+          expires_at: s.expires_at,
+          account_id: s.account_id,
+          email: pendingEmail || s.email || "",
+        },
+      });
+      await refreshMe();
+      setStatus("Verified — welcome back.", "ok");
+      await render();
+    }
+  }, POLL_MS);
 }
 
 async function startAttesting() {
@@ -345,22 +416,32 @@ async function resendLink() {
   const email = pendingEmail || userId;
   if (!email) { setStatus("No email on file.", "err"); return; }
   setStatus("Resending…");
-  const r = await callServerJson("/v1/account/auth", { method: "POST", body: { email } });
-  setStatus(r.ok ? "Link sent (if the email exists)." : "Rate-limited. Try again later.",
-            r.ok ? "ok" : "err");
+  const r = await callServerJson("/v1/account/auth", { method: "POST", body: { email, polling: true } });
+  if (r.ok) {
+    const pendingId = r.json?.pending_id || "";
+    if (pendingId) {
+      await chrome.storage.local.set({ pendingLoginId: pendingId });
+      startLoginPolling(pendingId);
+    }
+    setStatus("Link sent (if the email exists).", "ok");
+  } else {
+    setStatus("Rate-limited. Try again later.", "err");
+  }
 }
 
 async function changeEmail() {
-  await chrome.storage.local.remove(["pendingEmail", "session", "userId", "org"]);
+  stopLoginPolling();
+  await chrome.storage.local.remove(["pendingEmail", "session", "userId", "org", "pendingLoginId"]);
   await render();
 }
 
 async function onLogout() {
+  stopLoginPolling();
   const { session } = await loadSessionState();
   if (session && session.token) {
     await logout(session.token);
   }
-  await chrome.storage.local.remove(["session", "pendingEmail", "org"]);
+  await chrome.storage.local.remove(["session", "pendingEmail", "org", "pendingLoginId"]);
   setStatus("Logged out. Attestation still works.", "ok");
   await render();
 }
@@ -602,11 +683,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     const { userId } = await loadSessionState();
     if (!userId) { await changeEmail(); return; }
     setStatus("Sending login link…");
-    const r = await callServerJson("/v1/account/auth", { method: "POST", body: { email: userId } });
+    const r = await callServerJson("/v1/account/auth", { method: "POST", body: { email: userId, polling: true } });
     if (r.ok) {
-      await chrome.storage.local.set({ pendingEmail: userId });
+      const pendingId = r.json?.pending_id || "";
+      await chrome.storage.local.set({ pendingEmail: userId, pendingLoginId: pendingId });
       setStatus("Check your email.", "ok");
       await render();
+      if (pendingId) startLoginPolling(pendingId);
     } else {
       setStatus("Rate-limited. Try again later.", "err");
     }
@@ -614,6 +697,11 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   bindFileDrop();
   await render();
+
+  // Resume cross-device login polling if the popup was closed and re-opened
+  // mid-flow. The pending_id is server-scoped and survives popup teardown.
+  const { pendingLoginId } = await chrome.storage.local.get("pendingLoginId");
+  if (pendingLoginId) startLoginPolling(pendingLoginId);
 });
 
 // Live updates
