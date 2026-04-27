@@ -1,8 +1,8 @@
-# Microsoft Edge Add-ons Listing Copy — v1.5.0
+# Microsoft Edge Add-ons Listing Copy — v1.5.1
 
 **Purpose:** Exact text to paste into the Microsoft Partner Center developer dashboard for the AIAuth Edge extension listing. Companion to [STORE_LISTING.md](STORE_LISTING.md) (Chrome Web Store).
 
-**Same package, different store:** Edge runs Chromium and accepts Chrome MV3 extensions as-is. The same `dist/aiauth-extension-v1.5.0.zip` you upload to Chrome Web Store can be uploaded to Edge Add-ons unchanged.
+**Same package, different store:** Edge runs Chromium and accepts Chrome MV3 extensions as-is. The same `dist/aiauth-extension-v1.5.1.zip` you upload to Chrome Web Store can be uploaded to Edge Add-ons unchanged.
 
 **Field-by-field differences from the Chrome listing** are called out below where they matter. Where Edge fields don't exist in CWS (or vice versa), a note explains.
 
@@ -188,7 +188,7 @@ https://aiauth.app/privacy
 
 Before clicking "Submit for review":
 
-- [ ] Package uploaded matches `manifest.json` version (`1.5.0`).
+- [ ] Package uploaded matches `manifest.json` version (`1.5.1`).
 - [ ] Display name, short description, long description match this file.
 - [ ] Search terms entered (no brand-name enumeration).
 - [ ] Privacy policy URL set to `https://aiauth.app/privacy`.
@@ -203,4 +203,3 @@ Before clicking "Submit for review":
 
 - The Edge Add-ons URL becomes `https://microsoftedge.microsoft.com/addons/detail/<addon-id>` once published.
 - Add that URL to the AIAuth homepage browser-install matrix alongside the Chrome Web Store URL.
-- Update `chrome-extension/STORE_LISTING.md` line 119 — currently still says version `1.2.2` for the Chrome resubmission checklist; should be `1.5.0`.
