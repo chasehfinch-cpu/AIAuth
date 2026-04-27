@@ -57,22 +57,33 @@ INCLUDE = [
 ]
 
 # Firefox-specific manifest additions. Injected only when --firefox is
-# passed. The id is the AMO listing slug; strict_min_version 121 is the
-# first Firefox release with stable MV3 service-worker support.
+# passed.
 #
-# data_collection_permissions reflects Mozilla's new built-in
-# data-consent requirement (https://mzl.la/firefox-builtin-data-consent).
-# AIAuth only sends two things to a server: the user's email (magic-link
-# auth) and SHA-256 hashes of content the user explicitly attests. Email
-# is authenticationInfo. The hash is one-way and not user-specific
-# enough to fit any other category, so authenticationInfo is the sole
-# required category.
+# strict_min_version values: data_collection_permissions (Mozilla's
+# built-in data-consent UI, https://mzl.la/firefox-builtin-data-consent)
+# requires Firefox 140 desktop and Firefox for Android 142, so we set
+# both floors there. Users on older Firefox versions can't install,
+# but Firefox 140 was released mid-2025 — current releases as of early
+# 2026 are well past that.
+#
+# data_collection_permissions: AIAuth only sends two things to a server:
+# the user's email (magic-link auth) and SHA-256 hashes of content the
+# user explicitly attests. Email is authenticationInfo. The hash is
+# one-way and not user-specific enough to fit any other category, so
+# authenticationInfo is the sole required category.
 FIREFOX_GECKO_SETTINGS = {
     "id": "aiauth@aiauth.app",
-    "strict_min_version": "121.0",
+    "strict_min_version": "140.0",
     "data_collection_permissions": {
         "required": ["authenticationInfo"],
     },
+}
+
+# Android-only block; mirrors the desktop gecko settings but with the
+# Android-specific minimum version (142 is when data_collection_permissions
+# arrived on Firefox for Android).
+FIREFOX_GECKO_ANDROID_SETTINGS = {
+    "strict_min_version": "142.0",
 }
 
 
@@ -80,19 +91,22 @@ def build_manifest_for(target: str, base: dict) -> bytes:
     """Return the manifest bytes to write into the ZIP for the given target.
 
     Chrome/Edge: manifest is unmodified.
-    Firefox: inject browser_specific_settings.gecko AND pair the MV3
-    service_worker background with a `scripts` fallback so older Firefox
-    (and Firefox Android, which doesn't yet support MV3 service workers)
-    can still load the extension. Chrome MV3 rejects `scripts` in the
-    background block, so this is firefox-only.
+    Firefox: inject browser_specific_settings.gecko (and gecko_android),
+    AND replace the MV3 background block with the legacy `scripts: [...]`
+    form. Firefox does not honor `service_worker` and emits a warning if
+    it's present alongside `scripts`, so we drop service_worker entirely
+    in the Firefox build. The same JS file is used either way.
+    Chrome MV3 rejects `scripts` in the background block, so this is
+    firefox-only.
     """
     if target == "firefox":
         manifest = dict(base)
         bss = dict(manifest.get("browser_specific_settings", {}))
         bss["gecko"] = dict(FIREFOX_GECKO_SETTINGS)
+        bss["gecko_android"] = dict(FIREFOX_GECKO_ANDROID_SETTINGS)
         manifest["browser_specific_settings"] = bss
         bg = dict(manifest.get("background", {}))
-        sw = bg.get("service_worker")
+        sw = bg.pop("service_worker", None)
         if sw and "scripts" not in bg:
             bg["scripts"] = [sw]
         manifest["background"] = bg
