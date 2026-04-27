@@ -87,8 +87,33 @@ async function copy(text, label) {
   }
 }
 
+// v1.5.2: receipts are owned by the user that created them. Returns
+// the receipts the current user should see. Also performs a one-time
+// migration: any receipt without an `owner` field gets tagged with
+// the current userId on first read (so an existing extension that
+// upgrades into this fix doesn't lose its history). If no user is
+// signed in at the moment the migration runs, the legacy receipts
+// stay unowned and aren't shown until a user signs in. After that,
+// they're hidden from anyone else.
+async function getOwnedReceipts() {
+  const { receipts = [], userId = "" } = await chrome.storage.local.get(["receipts", "userId"]);
+  let mutated = false;
+  if (userId) {
+    for (const r of receipts) {
+      if (!("owner" in r)) {
+        r.owner = userId;
+        mutated = true;
+      }
+    }
+    if (mutated) {
+      await chrome.storage.local.set({ receipts });
+    }
+  }
+  return receipts.filter(r => (r.owner || "") === userId);
+}
+
 async function renderReceipts() {
-  const { receipts = [] } = await chrome.storage.local.get("receipts");
+  const receipts = await getOwnedReceipts();
   const list = $("receipts");
   if (!list) return;
   list.innerHTML = "";
@@ -160,7 +185,7 @@ async function renderReceipts() {
 }
 
 async function renderStats() {
-  const { receipts = [] } = await chrome.storage.local.get("receipts");
+  const receipts = await getOwnedReceipts();
   const today = new Date().toISOString().slice(0, 10);
   const todayCount = receipts.filter(r => (r.ts || "").startsWith(today)).length;
   const pending = receipts.filter(r => r.status === "pending").length;
@@ -612,7 +637,7 @@ async function renderReceiptsTo(targetId) {
 }
 
 async function renderStatsTo(ids) {
-  const { receipts = [] } = await chrome.storage.local.get("receipts");
+  const receipts = await getOwnedReceipts();
   const today = new Date().toISOString().slice(0, 10);
   const todayCount = receipts.filter(r => (r.ts || "").startsWith(today)).length;
   const pending = receipts.filter(r => r.status === "pending").length;

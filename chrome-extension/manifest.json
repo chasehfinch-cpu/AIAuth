@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "AIAuth — Chain of Custody for AI Work",
+  "name": "AIAuth \u2014 Chain of Custody for AI Work",
   "short_name": "AIAuth",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Tamper-proof chain-of-custody receipts for AI-generated work. Right-click to attest. Content never leaves your device.",
   "storage": {
     "managed_schema": "managed_schema.json"
@@ -47,8 +47,12 @@
         "https://gemini.google.com/*",
         "https://copilot.microsoft.com/*"
       ],
-      "js": ["content.js"],
-      "css": ["content.css"]
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ]
     }
   ]
 }
