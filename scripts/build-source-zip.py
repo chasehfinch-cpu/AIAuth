@@ -72,26 +72,70 @@ CHROME_EXTENSION_FILES = [
 def build_readme(version: str) -> str:
     return f"""# AIAuth Firefox Extension v{version} — Source Build Instructions
 
-This is the source-code archive that accompanies the submitted Firefox
-extension zip (`aiauth-extension-firefox-v{version}.zip`). A Mozilla
-AMO reviewer can use it to reproduce the submitted zip byte-for-byte
-and verify that no unexpected transformations are applied.
+This archive accompanies the submitted Firefox extension zip
+`aiauth-extension-firefox-v{version}.zip`. A Mozilla AMO reviewer can
+use it to reproduce the submitted extension and verify that no
+unexpected transformations are applied to the source.
 
-## Prerequisites
-- Python 3.10 or newer (no other dependencies — only the standard library
-  is used).
+---
 
-## Reproduce the submitted zip
+## 1. Operating system and build environment
 
-From the root of this archive:
+The build runs on any operating system that has a Python 3.10+
+interpreter. There are no other system dependencies. Verified on:
+
+- **Windows 11** (Python 3.13 from python.org, Git Bash for the shell)
+- **Ubuntu 24.04** (Python 3.12 from `apt install python3`)
+- **macOS 14+** (Python 3.13 from python.org or `brew install python@3.13`)
+
+The build script uses only the Python standard library — no `pip
+install` step is needed. There is no Node, no npm, no webpack, no
+bundler, no transpiler, no minifier.
+
+## 2. Required programs
+
+| Program | Required version | Where to get it |
+| ------- | ---------------- | --------------- |
+| Python  | 3.10 or newer    | https://www.python.org/downloads/ — pick the latest 3.x installer for your OS. On Linux, your distro's `python3` package (3.10+) works. On macOS, `brew install python@3.13`. |
+
+That is the entire prerequisite list.
+
+## 3. Step-by-step build
+
+From the root of this archive (the directory that contains
+`chrome-extension/`, `scripts/`, `LICENSE`, and this README):
 
 ```
 python scripts/build-extension-zip.py --firefox
 ```
 
-This produces `dist/aiauth-extension-firefox-v{version}.zip`.
+That single command produces `dist/aiauth-extension-firefox-v{version}.zip`.
 
-## What the build script does
+If `python` is not on your PATH, try `python3 scripts/build-extension-zip.py --firefox`
+on Linux/macOS, or `py -3 scripts\\build-extension-zip.py --firefox` on
+Windows.
+
+The script prints a list of every file it placed into the zip. Cross-check
+that list against the contents of the submitted extension zip — they
+should match exactly.
+
+## 4. Verify the rebuild matches the submission
+
+```
+python -c "import zipfile, json; print(json.dumps(json.loads(zipfile.ZipFile('dist/aiauth-extension-firefox-v{version}.zip').read('manifest.json')), indent=2))"
+```
+
+The printed manifest must show:
+
+- `manifest_version: 3`
+- `version: "{version}"`
+- `background.scripts: ["background.js"]` (no `service_worker` key)
+- `browser_specific_settings.gecko.id = "aiauth@aiauth.app"`
+- `browser_specific_settings.gecko.strict_min_version = "140.0"`
+- `browser_specific_settings.gecko.data_collection_permissions.required = ["authenticationInfo"]`
+- `browser_specific_settings.gecko_android.strict_min_version = "142.0"`
+
+## 5. What the build script does
 
 The packaging tool (`scripts/build-extension-zip.py`) does only two
 things:
@@ -103,30 +147,41 @@ things:
 2. **Generates the Firefox manifest** by reading
    `chrome-extension/manifest.json` and injecting:
 
-   - `browser_specific_settings.gecko` with the AMO add-on id
-     (`aiauth@aiauth.app`), `strict_min_version` 140.0, and
-     `data_collection_permissions.required = ["authenticationInfo"]`.
+   - `browser_specific_settings.gecko` (id, `strict_min_version` 140.0,
+     `data_collection_permissions.required = ["authenticationInfo"]`).
    - `browser_specific_settings.gecko_android.strict_min_version` 142.0.
    - Replaces `background.service_worker` with
      `background.scripts: ["background.js"]` (Firefox does not honor
      `service_worker`, so the legacy `scripts` form is used; the same
      `background.js` file runs either way).
 
-The Chrome/Edge zip variant (built without `--firefox`) does none of
-these manifest injections.
+The Chrome/Edge variant (built without `--firefox`) does none of those
+injections — that is the only target-specific divergence in the build.
 
-## What's in this archive
+## 6. Source files are not transpiled / concatenated / minified
+
+Every `.js`, `.html`, `.css`, `.json`, and `.png` file inside
+`chrome-extension/` is shipped exactly as it appears in this archive.
+No third-party libraries are bundled — there are no node_modules, no
+vendor/ directory, no `.min.js` files. Two small JS files in
+`chrome-extension/` are minimal hand-written implementations of common
+parsers (`cbor_decoder.js` for CBOR, `c2pa_parser.js` for C2PA JUMBF).
+They are deliberately self-contained and unminified.
+
+## 7. What's in this archive
 
 | Path                                | Purpose |
 | ----------------------------------- | ------- |
-| `chrome-extension/`                 | Canonical extension source — JS, HTML, CSS, manifest, icons, LICENSE. |
-| `scripts/build-extension-zip.py`    | The packaging tool. |
+| `chrome-extension/`                 | Canonical extension source (JS, HTML, CSS, manifest, icons, LICENSE). |
+| `scripts/build-extension-zip.py`    | The packaging tool. Pure Python stdlib. |
 | `LICENSE`                           | Apache 2.0 license for the entire archive. |
 | `SOURCE_BUILD.md`                   | This file. |
 
 The full upstream repository is at
-https://github.com/chasehfinch-cpu/AIAuth — this archive contains only
-the subset of files needed to build the Firefox extension.
+https://github.com/chasehfinch-cpu/AIAuth — this archive is a subset
+limited to the files needed to build the Firefox extension. Everything
+included here matches that repo's `main` branch verbatim at the time of
+submission.
 """
 
 
