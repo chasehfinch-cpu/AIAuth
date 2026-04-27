@@ -4994,17 +4994,10 @@ function aiauthPrint() { window.print(); }
 """
 
 
-@app.get("/pilot-playbook", response_class=HTMLResponse)
-def pilot_playbook_page():
-    """Pilot playbook — an internal-sell artifact a champion can forward
-    to their compliance officer and IT admin. Print-styled for
-    save-as-PDF."""
-    body = _PRINT_STYLE + """
-<div class="print-banner print-hide">
-  <span>Save as PDF: Ctrl+P (or Cmd+P) → Destination: Save as PDF.</span>
-  <button onclick="aiauthPrint()">Print / Save PDF</button>
-</div>
-
+# Body of /pilot-playbook, factored out so /pilot-playbook.pdf can render
+# the same content without the surrounding _site_shell.
+def _pilot_playbook_body() -> str:
+    return """
 <span class="eyebrow">Enterprise Pilot</span>
 <h1 class="page-title">AIAuth Pilot Playbook</h1>
 <p class="lead">A 30-day plan for evaluating AIAuth in your organization. Use this document to get internal buy-in from your compliance officer, IT admin, and a sponsoring department lead, then run the pilot and generate a decision-ready report.</p>
@@ -5113,19 +5106,48 @@ Thanks,
 [Your name]</code></pre>
 </div>
 """
+
+
+@app.get("/pilot-playbook", response_class=HTMLResponse)
+def pilot_playbook_page():
+    """Pilot playbook — an internal-sell artifact a champion can forward
+    to their compliance officer and IT admin. The polished PDF download
+    is at /pilot-playbook.pdf."""
+    body = (
+        _PRINT_STYLE
+        + _pdf_download_banner(
+            href="/pilot-playbook.pdf",
+            filename="aiauth-pilot-playbook.pdf",
+            lead="Get a polished PDF for your compliance officer or IT admin, or print this page directly.",
+        )
+        + _pilot_playbook_body()
+    )
     return HTMLResponse(_site_shell("Pilot Playbook", body, active="enterprise"))
 
 
-_ONE_PAGER_BANNER = """
-<div class="print-banner print-hide">
-  <span>Get a polished PDF for procurement, or print this page directly.</span>
-  <span style="display:flex;gap:8px;">
-    <a class="btn-pdf" href="/one-pager.pdf" download="aiauth-one-pager.pdf"
-       style="display:inline-block;padding:6px 12px;font-size:13px;font-weight:600;background:var(--accent);color:#fff;border-radius:8px;text-decoration:none;">Download PDF</a>
-    <button onclick="aiauthPrint()" style="background:#fff;color:var(--text);border:1px solid var(--border);">Print</button>
-  </span>
-</div>
-"""
+@app.get("/pilot-playbook.pdf")
+def pilot_playbook_pdf():
+    """Render the pilot playbook as a real PDF download."""
+    return _render_pdf(
+        title="AIAuth — Pilot Playbook",
+        body_html=_pilot_playbook_body(),
+        filename="aiauth-pilot-playbook.pdf",
+    )
+
+
+def _pdf_download_banner(href: str, filename: str, lead: str) -> str:
+    """Render the print-banner with both a Download-PDF link and a Print
+    button. Used by HTML pages that have a /<page>.pdf companion route."""
+    return (
+        '<div class="print-banner print-hide">\n'
+        f'  <span>{lead}</span>\n'
+        '  <span style="display:flex;gap:8px;">\n'
+        f'    <a class="btn-pdf" href="{href}" download="{filename}"\n'
+        '       style="display:inline-block;padding:6px 12px;font-size:13px;font-weight:600;background:var(--accent);color:#fff;border-radius:8px;text-decoration:none;">Download PDF</a>\n'
+        '    <button onclick="aiauthPrint()" style="background:#fff;color:var(--text);border:1px solid var(--border);">Print</button>\n'
+        '  </span>\n'
+        '</div>\n'
+    )
 
 # Body of /one-pager, factored out so /one-pager.pdf can render the same
 # content without the surrounding _site_shell (nav, footer, etc).
@@ -5226,38 +5248,26 @@ a[href^="http"]::after, a[href^="mailto:"]::after {{ content: " (" attr(href) ")
 </html>"""
 
 
-@app.get("/one-pager", response_class=HTMLResponse)
-def one_pager_page():
-    """Enterprise one-pager — a single-page summary designed to save as
-    PDF and circulate in procurement approval emails. The polished PDF
-    download is at /one-pager.pdf."""
-    body = _PRINT_STYLE + _ONE_PAGER_BANNER + _one_pager_body()
-    return HTMLResponse(_site_shell("Enterprise One-Pager", body, active="enterprise"))
+def _render_pdf(title: str, body_html: str, filename: str) -> Response:
+    """Render an HTML body fragment as a downloadable PDF using WeasyPrint.
 
+    Returns a FastAPI Response with application/pdf media type and a
+    Content-Disposition: attachment header. Returns 503 (raised as
+    HTTPException) if WeasyPrint can't import or fails at render time
+    — callers don't need their own try/except.
 
-@app.get("/one-pager.pdf")
-def one_pager_pdf():
-    """Render the enterprise one-pager as a real PDF download.
-
-    Uses WeasyPrint to render a standalone HTML document (no site nav or
-    footer) into a letter-sized PDF. Returns 503 with a helpful message
-    if WeasyPrint is not installed in this environment — in that case
-    /one-pager itself still works as the HTML fallback.
+    Single source of truth for all /*.pdf routes.
     """
     if not _WEASYPRINT_AVAILABLE:
         raise HTTPException(
             status_code=503,
             detail=(
                 "PDF rendering is not available in this environment. "
-                "Use /one-pager and Ctrl+P (Cmd+P) → Save as PDF, or "
+                "Use the HTML page and Ctrl+P (Cmd+P) → Save as PDF, or "
                 "install WeasyPrint on the server."
             ),
         )
-
-    html_doc = _PDF_DOC_TEMPLATE.format(
-        title="AIAuth — Enterprise One-Pager",
-        body=_one_pager_body(),
-    )
+    html_doc = _PDF_DOC_TEMPLATE.format(title=title, body=body_html)
     try:
         pdf_bytes = _WeasyHTML(string=html_doc).write_pdf()  # type: ignore[union-attr]
     except Exception as e:
@@ -5273,9 +5283,36 @@ def one_pager_pdf():
         content=pdf_bytes,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": 'attachment; filename="aiauth-one-pager.pdf"',
+            "Content-Disposition": f'attachment; filename="{filename}"',
             "Cache-Control": "public, max-age=300",
         },
+    )
+
+
+@app.get("/one-pager", response_class=HTMLResponse)
+def one_pager_page():
+    """Enterprise one-pager — a single-page summary designed to save as
+    PDF and circulate in procurement approval emails. The polished PDF
+    download is at /one-pager.pdf."""
+    body = (
+        _PRINT_STYLE
+        + _pdf_download_banner(
+            href="/one-pager.pdf",
+            filename="aiauth-one-pager.pdf",
+            lead="Get a polished PDF for procurement, or print this page directly.",
+        )
+        + _one_pager_body()
+    )
+    return HTMLResponse(_site_shell("Enterprise One-Pager", body, active="enterprise"))
+
+
+@app.get("/one-pager.pdf")
+def one_pager_pdf():
+    """Render the enterprise one-pager as a real PDF download."""
+    return _render_pdf(
+        title="AIAuth — Enterprise One-Pager",
+        body_html=_one_pager_body(),
+        filename="aiauth-one-pager.pdf",
     )
 
 
