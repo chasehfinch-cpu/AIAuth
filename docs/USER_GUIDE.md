@@ -105,35 +105,73 @@ tracks this automatically.
 
 ### Example: A financial report
 
-```
-  Monday 9:00 AM
-  ┌─────────────────────────────────────────────┐
-  │  Sarah drafts a forecast using Claude        │
-  │  She reviews it and presses the right-click menu     │
-  │  → Receipt #1: Sarah created this with AI    │
-  └──────────────────┬──────────────────────────┘
-                     │
-  Monday 2:00 PM     ▼
-  ┌─────────────────────────────────────────────┐
-  │  Mike receives it, changes the numbers       │
-  │  He reviews his version, the right-click menu        │
-  │  → Receipt #2: Mike modified Sarah's work    │
-  └──────────────────┬──────────────────────────┘
-                     │
-  Tuesday 10:00 AM   ▼
-  ┌─────────────────────────────────────────────┐
-  │  A consultant runs it through GPT-4o         │
-  │  for additional analysis, the right-click menu       │
-  │  → Receipt #3: AI-enhanced by consultant     │
-  └──────────────────┬──────────────────────────┘
-                     │
-  Tuesday 4:00 PM    ▼
-  ┌─────────────────────────────────────────────┐
-  │  The CFO reviews the final version           │
-  │  She approves it, the right-click menu               │
-  │  → Receipt #4: CFO approved the final        │
-  └─────────────────────────────────────────────┘
-```
+<style>
+.fr-chain { margin: 24px 0 28px; max-width: 640px; }
+.fr-step {
+  background: #f3f4f6;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 16px 20px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.fr-time {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #5b6573;
+  margin: 0 0 6px 0;
+}
+.fr-action {
+  color: #0f172a;
+  font-size: 14.5px;
+  line-height: 1.5;
+  margin: 0 0 12px 0;
+}
+.fr-receipt {
+  display: inline-block;
+  background: #16a34a;
+  color: #ffffff;
+  padding: 5px 11px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.fr-arrow {
+  margin: 0 0 0 38px;
+  padding: 4px 0;
+  color: #2563eb;
+  font-size: 22px;
+  line-height: 1;
+}
+</style>
+
+<div class="fr-chain">
+  <div class="fr-step">
+    <p class="fr-time">Monday 9:00 AM</p>
+    <p class="fr-action">Sarah drafts a forecast using Claude. She reviews it and presses the right-click menu.</p>
+    <span class="fr-receipt">Receipt #1 — Sarah created this with AI</span>
+  </div>
+  <div class="fr-arrow">▼</div>
+  <div class="fr-step">
+    <p class="fr-time">Monday 2:00 PM</p>
+    <p class="fr-action">Mike receives it, changes the numbers. He reviews his version with the right-click menu.</p>
+    <span class="fr-receipt">Receipt #2 — Mike modified Sarah's work</span>
+  </div>
+  <div class="fr-arrow">▼</div>
+  <div class="fr-step">
+    <p class="fr-time">Tuesday 10:00 AM</p>
+    <p class="fr-action">A consultant runs it through GPT-4o for additional analysis, then the right-click menu.</p>
+    <span class="fr-receipt">Receipt #3 — AI-enhanced by consultant</span>
+  </div>
+  <div class="fr-arrow">▼</div>
+  <div class="fr-step">
+    <p class="fr-time">Tuesday 4:00 PM</p>
+    <p class="fr-action">The CFO reviews the final version. She approves it with the right-click menu.</p>
+    <span class="fr-receipt">Receipt #4 — CFO approved the final</span>
+  </div>
+</div>
 
 Each receipt automatically links to the one before it. This creates 
 a **chain** — a complete history of who touched the content, what AI 
