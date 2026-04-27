@@ -1,6 +1,8 @@
-# Chrome Web Store Listing Copy — v1.5.2
+# Chrome Web Store Listing Copy — v1.5.3
 
 **Purpose:** Exact text to paste into the Chrome Web Store Developer Dashboard for the AIAuth extension listing.
+
+**v1.5.3 changes (hotfix on top of v1.5.2):** Fixes a service-worker registration failure introduced in v1.5.2. The receipt-isolation patch added a `userId` destructuring inside two background.js functions that already declared `userId` at function entry, causing an Identifier-already-declared SyntaxError that prevented the worker from loading at all. v1.5.3 reuses the existing in-scope variable. Same per-user receipt isolation behavior; no other change.
 
 **v1.5.2 changes (per-user receipt isolation):** Receipts are now tagged with the user that created them. Logging out and logging back in as a different user no longer exposes the prior user's receipts in the popup. A one-time migration on first render after upgrade tags any pre-existing receipts with the currently signed-in user (so an upgrading user doesn't lose their history). The badge counter is also scoped to the current user. Pure storage / UI fix; no new permissions, no new endpoints, no schema change to the signed receipt format itself.
 
@@ -120,5 +122,5 @@ Before clicking "Submit for review":
 - [ ] Single-purpose description matches.
 - [ ] Permissions justifications above are pasted into the dashboard.
 - [ ] Privacy practices certifications are re-confirmed.
-- [ ] Package version matches `manifest.json` (`1.5.2`).
+- [ ] Package version matches `manifest.json` (`1.5.3`).
 - [ ] No keyword lists of brand names anywhere in the listing copy.

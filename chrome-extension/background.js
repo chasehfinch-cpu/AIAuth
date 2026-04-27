@@ -458,7 +458,7 @@ async function signContent(text, sourceUrl, promptText, tta, tabId) {
 
   // Save receipt locally — includes the full signed receipt object, which
   // in v0.5.0 carries the extra fields (prompt_hash, etc.)
-  const { receipts = [], userId = "" } = await chrome.storage.local.get(["receipts", "userId"]);
+  const { receipts = [] } = await chrome.storage.local.get("receipts");
   receipts.unshift({
     id: data.receipt.id,
     code: data.receipt_code,
@@ -475,12 +475,13 @@ async function signContent(text, sourceUrl, promptText, tta, tabId) {
     receipt: data.receipt,
     signature: data.signature,
     // v1.5.2: tag with the user who created it so logout/login as a
-    // different user doesn't expose the prior user's history.
-    owner: userId,
+    // different user doesn't expose the prior user's history. Uses
+    // the userId already destructured from getConfig() above.
+    owner: userId || "",
   });
   const capped = receipts.slice(0, 500);
   await chrome.storage.local.set({ receipts: capped });
-  updateBadge(capped, userId);
+  updateBadge(capped, userId || "");
 
   return data;
 }
@@ -546,7 +547,7 @@ async function signHash(output_hash, source, note, imageBytes, fileDescriptor) {
   }
   const data = await res.json();
 
-  const { receipts = [], userId = "" } = await chrome.storage.local.get(["receipts", "userId"]);
+  const { receipts = [] } = await chrome.storage.local.get("receipts");
   receipts.unshift({
     id: data.receipt.id,
     code: data.receipt_code,
@@ -561,11 +562,12 @@ async function signHash(output_hash, source, note, imageBytes, fileDescriptor) {
     receipt: data.receipt,
     signature: data.signature,
     // v1.5.2: per-user receipt isolation; see the sign() handler.
-    owner: userId,
+    // Reuses the `userId` already destructured from getConfig() above.
+    owner: userId || "",
   });
   const capped = receipts.slice(0, 500);
   await chrome.storage.local.set({ receipts: capped });
-  updateBadge(capped, userId);
+  updateBadge(capped, userId || "");
 
   return data;
 }
