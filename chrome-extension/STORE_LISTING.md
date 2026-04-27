@@ -116,5 +116,5 @@ Before clicking "Submit for review":
 - [ ] Single-purpose description matches.
 - [ ] Permissions justifications above are pasted into the dashboard.
 - [ ] Privacy practices certifications are re-confirmed.
-- [ ] Package version matches `manifest.json` (`1.2.2`).
+- [ ] Package version matches `manifest.json` (`1.5.0`).
 - [ ] No keyword lists of brand names anywhere in the listing copy.
