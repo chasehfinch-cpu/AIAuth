@@ -441,7 +441,14 @@ async function onLogout() {
   if (session && session.token) {
     await logout(session.token);
   }
-  await chrome.storage.local.remove(["session", "pendingEmail", "org", "pendingLoginId"]);
+  // Clear every identity field. Without removing userId + emailVerified,
+  // determineState() falls through to State 3 (verified personal tier)
+  // and the popup keeps showing the prior user's receipts and a Logout
+  // button — the opposite of what Logout should do.
+  await chrome.storage.local.remove([
+    "session", "pendingEmail", "org", "pendingLoginId",
+    "userId", "emailVerified", "tier",
+  ]);
   setStatus("Logged out. Attestation still works.", "ok");
   await render();
 }

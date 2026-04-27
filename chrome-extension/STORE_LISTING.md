@@ -1,6 +1,8 @@
-# Chrome Web Store Listing Copy — v1.5.0
+# Chrome Web Store Listing Copy — v1.5.1
 
 **Purpose:** Exact text to paste into the Chrome Web Store Developer Dashboard for the AIAuth extension listing.
+
+**v1.5.1 changes (logout bug fix):** Logout now fully clears the user identity from the popup. Previously, clicking Logout would remove the active session token but leave the user-id and verified flag in place; the popup would reload, fall through to the verified-personal-tier state, and keep showing the prior user's receipts and a Logout button. Pure bug fix. No new permissions, no new endpoints, no schema change.
 
 **v1.5.0 changes (cross-format chain integrity):** Receipts for file attestations now carry a canonical-text hash alongside the raw-bytes hash, so the same logical document retains chain-of-custody across format conversions (Word → PDF, Excel → CSV, PowerPoint → PDF, etc.). Supported formats: plain text, Markdown, CSV/TSV, JSON, XML, HTML, DOCX, XLSX, PPTX, and common PDFs. Canonical extraction runs entirely on-device; the content still never leaves the user's machine. No new permissions, no new host permissions. Existing receipts remain valid; this change is purely additive.
 
@@ -116,5 +118,5 @@ Before clicking "Submit for review":
 - [ ] Single-purpose description matches.
 - [ ] Permissions justifications above are pasted into the dashboard.
 - [ ] Privacy practices certifications are re-confirmed.
-- [ ] Package version matches `manifest.json` (`1.5.0`).
+- [ ] Package version matches `manifest.json` (`1.5.1`).
 - [ ] No keyword lists of brand names anywhere in the listing copy.

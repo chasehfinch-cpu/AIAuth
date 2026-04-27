@@ -1,10 +1,10 @@
-# Firefox Add-ons (AMO) Listing Copy — v1.5.0
+# Firefox Add-ons (AMO) Listing Copy — v1.5.1
 
 **Purpose:** Exact text to paste into the Mozilla Add-on Developer Hub (`addons.mozilla.org/developers/`) for the AIAuth Firefox listing. Companion to [STORE_LISTING.md](STORE_LISTING.md) (Chrome) and [STORE_LISTING_EDGE.md](STORE_LISTING_EDGE.md) (Edge).
 
 **Same source, Firefox-specific build:** the Firefox zip is built from the same `chrome-extension/` source via `python scripts/build-extension-zip.py --firefox`. The build script injects a `browser_specific_settings.gecko` block (id `aiauth@aiauth.app`, strict_min_version 121.0) into the manifest at zip time. The JS is shared verbatim — Firefox 109+ supports the `chrome.*` namespace as an alias for `browser.*`, and Firefox 121+ supports MV3 service-worker backgrounds.
 
-**Upload artifact:** `dist/aiauth-extension-firefox-v1.5.0.zip` (52 KB).
+**Upload artifact:** `dist/aiauth-extension-firefox-v1.5.1.zip` (52 KB).
 
 ---
 
@@ -157,7 +157,7 @@ https://aiauth.app/privacy
 
 Before clicking "Submit version":
 
-- [ ] Add-on package: `dist/aiauth-extension-firefox-v1.5.0.zip` (rebuild fresh with `python scripts/build-extension-zip.py --firefox` if there's any doubt).
+- [ ] Add-on package: `dist/aiauth-extension-firefox-v1.5.1.zip` (rebuild fresh with `python scripts/build-extension-zip.py --firefox` if there's any doubt).
 - [ ] Add-on name, summary, description, categories match this file.
 - [ ] License set to Apache 2.0.
 - [ ] Privacy policy URL set to `https://aiauth.app/privacy`.
