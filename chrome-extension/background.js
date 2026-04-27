@@ -458,7 +458,7 @@ async function signContent(text, sourceUrl, promptText, tta, tabId) {
 
   // Save receipt locally — includes the full signed receipt object, which
   // in v0.5.0 carries the extra fields (prompt_hash, etc.)
-  const { receipts = [] } = await chrome.storage.local.get("receipts");
+  const { receipts = [], userId = "" } = await chrome.storage.local.get(["receipts", "userId"]);
   receipts.unshift({
     id: data.receipt.id,
     code: data.receipt_code,
@@ -474,10 +474,13 @@ async function signContent(text, sourceUrl, promptText, tta, tabId) {
     status: "signed",          // Piece 4+ will use "pending" for offline queueing
     receipt: data.receipt,
     signature: data.signature,
+    // v1.5.2: tag with the user who created it so logout/login as a
+    // different user doesn't expose the prior user's history.
+    owner: userId,
   });
   const capped = receipts.slice(0, 500);
   await chrome.storage.local.set({ receipts: capped });
-  updateBadge(capped);
+  updateBadge(capped, userId);
 
   return data;
 }
@@ -543,7 +546,7 @@ async function signHash(output_hash, source, note, imageBytes, fileDescriptor) {
   }
   const data = await res.json();
 
-  const { receipts = [] } = await chrome.storage.local.get("receipts");
+  const { receipts = [], userId = "" } = await chrome.storage.local.get(["receipts", "userId"]);
   receipts.unshift({
     id: data.receipt.id,
     code: data.receipt_code,
@@ -557,29 +560,45 @@ async function signHash(output_hash, source, note, imageBytes, fileDescriptor) {
     status: "signed",
     receipt: data.receipt,
     signature: data.signature,
+    // v1.5.2: per-user receipt isolation; see the sign() handler.
+    owner: userId,
   });
   const capped = receipts.slice(0, 500);
   await chrome.storage.local.set({ receipts: capped });
-  updateBadge(capped);
+  updateBadge(capped, userId);
 
   return data;
 }
 
-function updateBadge(receipts) {
+function updateBadge(receipts, currentOwner) {
   const todayPrefix = new Date().toISOString().slice(0, 10);
-  const todayCount = (receipts || []).filter(r => (r.ts || "").startsWith(todayPrefix)).length;
+  // v1.5.2: only count receipts owned by the current user. A receipt
+  // with no `owner` field (legacy, pre-isolation) is treated as
+  // belonging to the current user only when the caller passes "" — the
+  // popup-side migration in renderReceipts will tag legacy receipts
+  // with the active userId on first read.
+  const owner = currentOwner == null ? "" : currentOwner;
+  const todayCount = (receipts || []).filter(r =>
+    (r.ts || "").startsWith(todayPrefix) && (r.owner || "") === owner
+  ).length;
   const text = todayCount > 0 ? String(todayCount) : "";
   chrome.action.setBadgeText({ text });
   if (text) chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
 }
 
-chrome.runtime.onStartup?.addListener(async () => {
-  const { receipts = [] } = await chrome.storage.local.get("receipts");
-  updateBadge(receipts);
-});
-chrome.runtime.onInstalled.addListener(async () => {
-  const { receipts = [] } = await chrome.storage.local.get("receipts");
-  updateBadge(receipts);
+async function refreshBadgeFromStorage() {
+  const { receipts = [], userId = "" } = await chrome.storage.local.get(["receipts", "userId"]);
+  updateBadge(receipts, userId);
+}
+
+chrome.runtime.onStartup?.addListener(refreshBadgeFromStorage);
+chrome.runtime.onInstalled.addListener(refreshBadgeFromStorage);
+// Keep the badge in sync if the popup mutates receipts (e.g. legacy
+// migration on first render after upgrade) or if userId changes.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && (changes.receipts || changes.userId)) {
+    refreshBadgeFromStorage();
+  }
 });
 
 async function notify(title, message) {
