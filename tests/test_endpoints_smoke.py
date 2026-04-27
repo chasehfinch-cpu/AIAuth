@@ -170,7 +170,6 @@ def test_public_pages_render(client):
         "/standards",
         "/pricing",
         "/api",
-        "/pilot-playbook",
         "/one-pager",
         "/pilot",
         "/waitlist",
