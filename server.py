@@ -32,7 +32,17 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
+
+# Optional dep for server-side PDF rendering of /one-pager.pdf etc.
+# WeasyPrint requires libpango on Linux; we treat its absence as
+# non-fatal and let the .pdf routes return 503 with a helpful message.
+try:
+    from weasyprint import HTML as _WeasyHTML  # type: ignore
+    _WEASYPRINT_AVAILABLE = True
+except Exception:  # pragma: no cover - environment-dependent import
+    _WeasyHTML = None  # type: ignore
+    _WEASYPRINT_AVAILABLE = False
 from pydantic import BaseModel, Field
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -5106,16 +5116,21 @@ Thanks,
     return HTMLResponse(_site_shell("Pilot Playbook", body, active="enterprise"))
 
 
-@app.get("/one-pager", response_class=HTMLResponse)
-def one_pager_page():
-    """Enterprise one-pager — a single-page summary designed to save as
-    PDF and circulate in procurement approval emails."""
-    body = _PRINT_STYLE + """
+_ONE_PAGER_BANNER = """
 <div class="print-banner print-hide">
-  <span>Save as PDF: Ctrl+P (or Cmd+P) → Destination: Save as PDF.</span>
-  <button onclick="aiauthPrint()">Print / Save PDF</button>
+  <span>Get a polished PDF for procurement, or print this page directly.</span>
+  <span style="display:flex;gap:8px;">
+    <a class="btn-pdf" href="/one-pager.pdf" download="aiauth-one-pager.pdf"
+       style="display:inline-block;padding:6px 12px;font-size:13px;font-weight:600;background:var(--accent);color:#fff;border-radius:8px;text-decoration:none;">Download PDF</a>
+    <button onclick="aiauthPrint()" style="background:#fff;color:var(--text);border:1px solid var(--border);">Print</button>
+  </span>
 </div>
+"""
 
+# Body of /one-pager, factored out so /one-pager.pdf can render the same
+# content without the surrounding _site_shell (nav, footer, etc).
+def _one_pager_body() -> str:
+    return """
 <span class="eyebrow">Enterprise</span>
 <h1 class="page-title">AIAuth — Chain of Custody for AI Work</h1>
 <p class="lead">A tamper-proof record that a human reviewed AI-generated content, without ever transmitting the content itself.</p>
@@ -5174,7 +5189,94 @@ def one_pager_page():
   <p style="margin-top:24px; font-size:12px; color:var(--muted);">© 2026 Finch Business Services LLC · AIAuth · aiauth.app</p>
 </div>
 """
+
+
+# Standalone HTML used by /one-pager.pdf — no nav, no footer, just the
+# one-pager content with the print-friendly stylesheet inlined. WeasyPrint
+# renders @media print rules by default, so the existing _PRINT_STYLE
+# already produces a clean letter-sized layout.
+_PDF_DOC_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>
+:root {{
+  --text: #0b1220; --muted: #5b6573; --accent: #2563eb;
+  --accent-soft: #eff6ff; --panel: #f7f8fa; --border: #e5e7eb;
+}}
+body {{ font: 11pt/1.55 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; color: var(--text); margin: 0; padding: 0.5in 0.6in; }}
+h1.page-title {{ font-size: 26px; margin: 4px 0 6px; letter-spacing: -0.4px; }}
+.eyebrow {{ font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent); }}
+.lead {{ font-size: 12.5pt; color: var(--muted); margin: 6px 0 18px; }}
+.prose h2 {{ font-size: 17px; margin: 18px 0 8px; }}
+.prose h3 {{ font-size: 14px; margin: 14px 0 6px; }}
+.prose p, .prose li {{ font-size: 11pt; }}
+ul, ol {{ margin: 6px 0 10px 22px; padding: 0; }}
+li {{ margin: 3px 0; }}
+a {{ color: var(--text); text-decoration: none; }}
+a[href^="http"]::after, a[href^="mailto:"]::after {{ content: " (" attr(href) ")"; font-size: 9pt; color: var(--muted); }}
+.print-hide {{ display: none; }}
+@page {{ size: letter; margin: 0; }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
+
+
+@app.get("/one-pager", response_class=HTMLResponse)
+def one_pager_page():
+    """Enterprise one-pager — a single-page summary designed to save as
+    PDF and circulate in procurement approval emails. The polished PDF
+    download is at /one-pager.pdf."""
+    body = _PRINT_STYLE + _ONE_PAGER_BANNER + _one_pager_body()
     return HTMLResponse(_site_shell("Enterprise One-Pager", body, active="enterprise"))
+
+
+@app.get("/one-pager.pdf")
+def one_pager_pdf():
+    """Render the enterprise one-pager as a real PDF download.
+
+    Uses WeasyPrint to render a standalone HTML document (no site nav or
+    footer) into a letter-sized PDF. Returns 503 with a helpful message
+    if WeasyPrint is not installed in this environment — in that case
+    /one-pager itself still works as the HTML fallback.
+    """
+    if not _WEASYPRINT_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "PDF rendering is not available in this environment. "
+                "Use /one-pager and Ctrl+P (Cmd+P) → Save as PDF, or "
+                "install WeasyPrint on the server."
+            ),
+        )
+
+    html_doc = _PDF_DOC_TEMPLATE.format(
+        title="AIAuth — Enterprise One-Pager",
+        body=_one_pager_body(),
+    )
+    try:
+        pdf_bytes = _WeasyHTML(string=html_doc).write_pdf()  # type: ignore[union-attr]
+    except Exception as e:
+        # WeasyPrint can import successfully but fail to link its GTK
+        # dependencies at render time (common on Windows dev boxes
+        # without libpango installed). Surface as 503 so callers can
+        # fall back to the HTML page rather than a generic 500.
+        raise HTTPException(
+            status_code=503,
+            detail=f"PDF rendering unavailable: {type(e).__name__}: {e}",
+        )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": 'attachment; filename="aiauth-one-pager.pdf"',
+            "Cache-Control": "public, max-age=300",
+        },
+    )
 
 
 @app.get("/api", response_class=HTMLResponse)
